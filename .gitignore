@@ -3,5 +3,14 @@ __pycache__/
 *.py[cod]
 .venv/
 
-# Vendored SearXNG checkout/runtime
+# Vendored SearXNG checkout/runtime (bootstrapped by scripts/local-search)
 searxng/src/
+
+# Operator logs
+.logs/
+
+# pytest
+.pytest_cache/
+
+# uv lock is tracked for reproducible installs
+!uv.lock

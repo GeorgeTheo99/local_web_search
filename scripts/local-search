@@ -1,0 +1,409 @@
+#!/usr/bin/env bash
+# local-search — operator CLI for the shared local search stack.
+#
+# Manages SearXNG + the FastMCP websearch wrapper as launchd services on this
+# machine. Self-contained: only depends on bash, uv, python3, git, curl, and
+# macOS launchd. Safe to run repeatedly (idempotent).
+#
+# Usage:
+#   local-search install [--no-start]   bootstrap venvs + plists + start + verify
+#   local-search uninstall             stop services, remove plists (keeps src/venvs)
+#   local-search start | stop | restart
+#   local-search status                launchd state + /health probes
+#   local-search verify                health + tools/list smoke
+#   local-search logs [searxng|mcp] [-f]
+#   local-search update                git pull + rebuild + restart
+#   local-search update-searxng-ref <sha>
+#   local-search mcp-stdio             run MCP in stdio mode (for client config)
+#   local-search env                   print resolved config
+set -euo pipefail
+
+# --------------------------------------------------------------------------- #
+# Config resolution.
+# --------------------------------------------------------------------------- #
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+SEARXNG_SRC_DIR="$ROOT_DIR/searxng/src"
+SEARXNG_SETTINGS="$ROOT_DIR/searxng/settings.yml"
+SEARXNG_REF_FILE="$ROOT_DIR/searxng/SEARXNG_REF"
+SEARXNG_REPO="https://github.com/searxng/searxng.git"
+
+MCP_DIR="$ROOT_DIR/mcp-websearch"
+
+SEARXNG_URL="${SEARXNG_URL:-http://localhost:8888}"
+MCP_PORT="${MCP_PORT:-8889}"
+
+SEARXNG_LABEL="com.local.searxng"
+MCP_LABEL="com.local.mcp-websearch"
+PLIST_DIR="$HOME/Library/LaunchAgents"
+LOG_DIR="${LOCAL_SEARCH_LOG_DIR:-$HOME/Library/Logs/local-search}"
+
+SEARXNG_VENV="$SEARXNG_SRC_DIR/.venv"
+MCP_VENV="$MCP_DIR/.venv"
+
+# Colors (disabled when not a TTY).
+if [ -t 1 ]; then
+  C_RESET=$'\033[0m'; C_BOLD=$'\033[1m'; C_GREEN=$'\033[32m'; C_YELLOW=$'\033[33m'; C_RED=$'\033[31m'; C_DIM=$'\033[2m'
+else
+  C_RESET=""; C_BOLD=""; C_GREEN=""; C_YELLOW=""; C_RED=""; C_DIM=""
+fi
+
+log()  { printf '%s▶%s %s\n' "$C_BOLD" "$C_RESET" "$*"; }
+ok()   { printf '%s✓%s %s\n' "$C_GREEN" "$C_RESET" "$*"; }
+warn() { printf '%s!%s %s\n' "$C_YELLOW" "$C_RESET" "$*" >&2; }
+die()  { printf '%s✗%s %s\n' "$C_RED" "$C_RESET" "$*" >&2; exit 1; }
+
+require_cmd() { command -v "$1" >/dev/null 2>&1 || die "required command not found: $1 (install it and retry)"; }
+
+# --------------------------------------------------------------------------- #
+# Prerequisites.
+# --------------------------------------------------------------------------- #
+check_prereqs() {
+  require_cmd git
+  require_cmd curl
+  require_cmd python3
+  require_cmd uv
+  require_cmd launchctl
+}
+
+searxng_ref() {
+  [ -f "$SEARXNG_REF_FILE" ] || die "missing $SEARXNG_REF_FILE"
+  grep -E '^[0-9a-f]{7,40}' "$SEARXNG_REF_FILE" | head -1 | awk '{print $1}'
+}
+
+# --------------------------------------------------------------------------- #
+# SearXNG source bootstrap.
+# --------------------------------------------------------------------------- #
+ensure_searxng_src() {
+  local ref
+  ref="$(searxng_ref)"
+  log "Ensuring SearXNG source at ref ${ref}"
+
+  if [ -d "$SEARXNG_SRC_DIR/.git" ]; then
+    log "SearXNG checkout exists; fetching ${ref}"
+    git -C "$SEARXNG_SRC_DIR" fetch --quiet origin
+    git -C "$SEARXNG_SRC_DIR" checkout -q "$ref" \
+      || die "could not check out ref $ref (update searxng/SEARXNG_REF)"
+    git -C "$SEARXNG_SRC_DIR" submodule update --init --quiet || true
+  elif [ -d "$SEARXNG_SRC_DIR" ]; then
+    # Source present but no .git (legacy unpacked checkout). Re-clone over it.
+    warn "searxng/src exists without .git; re-cloning to enable updates"
+    rm -rf "$SEARXNG_SRC_DIR"
+    git clone --quiet --no-checkout "$SEARXNG_REPO" "$SEARXNG_SRC_DIR"
+    git -C "$SEARXNG_SRC_DIR" checkout -q "$ref" \
+      || die "could not check out ref $ref"
+    git -C "$SEARXNG_SRC_DIR" submodule update --init --quiet || true
+  else
+    log "Cloning SearXNG at ${ref}"
+    git clone --quiet --no-checkout "$SEARXNG_REPO" "$SEARXNG_SRC_DIR"
+    git -C "$SEARXNG_SRC_DIR" checkout -q "$ref" \
+      || die "could not check out ref $ref"
+    git -C "$SEARXNG_SRC_DIR" submodule update --init --quiet || true
+  fi
+  ok "SearXNG source at $(git -C "$SEARXNG_SRC_DIR" rev-parse --short HEAD)"
+}
+
+ensure_searxng_venv() {
+  if [ -x "$SEARXNG_VENV/bin/python" ] && [ "${FORCE_REBUILD:-0}" != "1" ] \
+     && "$SEARXNG_VENV/bin/python" -c 'import searx' 2>/dev/null; then
+    log "SearXNG venv exists and imports searx"
+  else
+    log "Building SearXNG venv"
+    rm -rf "$SEARXNG_VENV"
+    uv venv --python 3.12 "$SEARXNG_VENV" >/dev/null
+    # SearXNG's setup.py reads requirements.txt into install_requires, but its
+    # package __init__ imports msgspec at build time. Install requirements first,
+    # then do a non-isolated editable install so the build sees those deps.
+    uv pip install --python "$SEARXNG_VENV/bin/python" \
+      -r "$SEARXNG_SRC_DIR/requirements.txt" >/dev/null
+    # Non-isolated editable build needs setuptools/wheel present in the venv.
+    uv pip install --python "$SEARXNG_VENV/bin/python" setuptools wheel >/dev/null
+    SEARXNG_SETTINGS_PATH="$SEARXNG_SETTINGS" \
+      uv pip install --python "$SEARXNG_VENV/bin/python" \
+      --no-build-isolation -e "$SEARXNG_SRC_DIR" >/dev/null
+  fi
+  ok "SearXNG venv ready"
+}
+
+ensure_mcp_venv() {
+  if [ -x "$MCP_VENV/bin/python" ] && [ "${FORCE_REBUILD:-0}" != "1" ]; then
+    log "MCP venv exists"
+  else
+    log "Building MCP websearch venv"
+    uv sync --project "$MCP_DIR" >/dev/null
+  fi
+  ok "MCP venv ready"
+}
+
+# --------------------------------------------------------------------------- #
+# Launchd plist management.
+# --------------------------------------------------------------------------- #
+write_plist() {
+  local label="$1" plist="$2"
+  mkdir -p "$PLIST_DIR"
+  printf '%s' "$plist" >"$PLIST_DIR/$label.plist"
+  ok "Wrote $PLIST_DIR/$label.plist"
+}
+
+searxng_plist() {
+  cat <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>Label</key><string>${SEARXNG_LABEL}</string>
+<key>ProgramArguments</key><array>
+  <string>${SEARXNG_VENV}/bin/python</string><string>-m</string><string>searx.webapp</string>
+</array>
+<key>WorkingDirectory</key><string>${SEARXNG_SRC_DIR}</string>
+<key>EnvironmentVariables</key><dict>
+  <key>SEARXNG_SETTINGS_PATH</key><string>${SEARXNG_SETTINGS}</string>
+</dict>
+<key>StandardOutPath</key><string>${LOG_DIR}/searxng.log</string>
+<key>StandardErrorPath</key><string>${LOG_DIR}/searxng.log</string>
+<key>KeepAlive</key><true/>
+<key>RunAtLoad</key><true/>
+<key>ThrottleInterval</key><integer>5</integer>
+</dict></plist>
+EOF
+}
+
+mcp_plist() {
+  cat <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>Label</key><string>${MCP_LABEL}</string>
+<key>ProgramArguments</key><array>
+  <string>${MCP_VENV}/bin/python</string><string>${MCP_DIR}/http_server.py</string>
+</array>
+<key>WorkingDirectory</key><string>${MCP_DIR}</string>
+<key>EnvironmentVariables</key><dict>
+  <key>SEARXNG_URL</key><string>${SEARXNG_URL}</string>
+  <key>MCP_PORT</key><string>${MCP_PORT}</string>
+  <key>FASTMCP_SHOW_SERVER_BANNER</key><string>false</string>
+</dict>
+<key>StandardOutPath</key><string>${LOG_DIR}/mcp-websearch.log</string>
+<key>StandardErrorPath</key><string>${LOG_DIR}/mcp-websearch.log</string>
+<key>KeepAlive</key><true/>
+<key>RunAtLoad</key><true/>
+<key>ThrottleInterval</key><integer>5</integer>
+</dict></plist>
+EOF
+}
+
+install_plists() {
+  mkdir -p "$LOG_DIR"
+  write_plist "$SEARXNG_LABEL" "$(searxng_plist)"
+  write_plist "$MCP_LABEL" "$(mcp_plist)"
+}
+
+remove_plists() {
+  launchctl bootout "gui/$(id -u)/$SEARXNG_LABEL" >/dev/null 2>&1 || true
+  launchctl bootout "gui/$(id -u)/$MCP_LABEL" >/dev/null 2>&1 || true
+  rm -f "$PLIST_DIR/$SEARXNG_LABEL.plist" "$PLIST_DIR/$MCP_LABEL.plist"
+  ok "Removed launchd plists"
+}
+
+# --------------------------------------------------------------------------- #
+# Service control.
+# --------------------------------------------------------------------------- #
+# bootout blocks until the process has actually terminated, which avoids the
+# EADDRINUSE race where a new spawn tries to bind before the old socket closes.
+bootout_service() { launchctl bootout "gui/$(id -u)/$1" >/dev/null 2>&1 || true; }
+bootstrap_service() {
+  launchctl bootstrap "gui/$(id -u)" "$PLIST_DIR/$1.plist" 2>/dev/null \
+    || launchctl load "$PLIST_DIR/$1.plist" 2>/dev/null || true
+}
+
+start_services() {
+  bootstrap_service "$SEARXNG_LABEL"
+  bootstrap_service "$MCP_LABEL"
+  launchctl enable "gui/$(id -u)/$SEARXNG_LABEL" 2>/dev/null || true
+  launchctl enable "gui/$(id -u)/$MCP_LABEL" 2>/dev/null || true
+}
+
+stop_services() {
+  bootout_service "$MCP_LABEL"
+  bootout_service "$SEARXNG_LABEL"
+}
+
+restart_services() {
+  # Stop mcp first (depends on searxng), wait for ports to free, then start
+  # searxng first and wait for it before starting mcp.
+  stop_services
+  _wait_port_free "$MCP_PORT"
+  bootstrap_service "$SEARXNG_LABEL"
+  wait_http "$SEARXNG_URL/healthz" "OK" 30 || warn "searxng did not come up"
+  bootstrap_service "$MCP_LABEL"
+}
+
+_wait_port_free() { # port [timeout]
+  local port="$1" t="${2:-15}" i=0
+  while [ $i -lt $t ]; do
+    lsof -nP -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1 || return 0
+    sleep 1; i=$((i+1))
+  done
+  warn "port $port still bound after ${t}s"
+}
+
+# --------------------------------------------------------------------------- #
+# Health / verification.
+# --------------------------------------------------------------------------- #
+wait_http() { # url expected_substr timeout
+  local url="$1" want="$2" t="${3:-20}" i=0 body
+  while [ $i -lt $t ]; do
+    body="$(curl -fsS --max-time 3 "$url" 2>/dev/null || true)"
+    if [ -n "$body" ] && echo "$body" | grep -q "$want"; then ok "$url → $want"; return 0; fi
+    sleep 1; i=$((i+1))
+  done
+  warn "timeout waiting for $url (wanted '$want')"
+  return 1
+}
+
+verify() {
+  local rc=0
+  wait_http "$SEARXNG_URL/healthz" "OK" 30 || rc=1
+  sleep 2
+  wait_http "http://127.0.0.1:${MCP_PORT}/health" '"status"' 30 || rc=1
+  log "MCP tools/list"
+  local tools
+  tools="$(curl -fsS --max-time 5 -X POST "http://127.0.0.1:${MCP_PORT}/mcp" \
+    -H 'content-type: application/json' -H 'accept: application/json' \
+    -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' 2>/dev/null \
+    | python3 -c 'import sys,json;d=json.load(sys.stdin);print(",".join(t["name"] for t in d.get("result",{}).get("tools",[])))' 2>/dev/null || true)"
+  if [ "$tools" = "web_search,web_fetch" ]; then ok "MCP tools: $tools"; else warn "MCP tools/list unexpected: '$tools'"; rc=1; fi
+  return $rc
+}
+
+status() {
+  local s_state m_state
+  s_state="$(launchctl print "gui/$(id -u)/$SEARXNG_LABEL" 2>/dev/null | awk -F' = ' '/^[[:space:]]*state/ {print $2; exit}' || echo 'not-loaded')"
+  m_state="$(launchctl print "gui/$(id -u)/$MCP_LABEL" 2>/dev/null | awk -F' = ' '/^[[:space:]]*state/ {print $2; exit}' || echo 'not-loaded')"
+  printf '%-22s %s\n' "searxng launchd:" "${s_state:-unknown}"
+  printf '%-22s %s\n' "mcp-websearch launchd:" "${m_state:-unknown}"
+  printf '%-22s %s\n' "searxng health:" "$(curl -fsS --max-time 3 "$SEARXNG_URL/healthz" 2>/dev/null || echo 'DOWN')"
+  local h
+  h="$(curl -fsS --max-time 3 "http://127.0.0.1:${MCP_PORT}/health" 2>/dev/null || echo 'DOWN')"
+  printf '%-22s %s\n' "mcp /health:" "$(echo "$h" | python3 -c 'import sys,json;d=json.load(sys.stdin);print(d.get("status","?"),"searxng_reachable="+str(d.get("searxng",{}).get("reachable","?")))' 2>/dev/null || echo "$h")"
+}
+
+# --------------------------------------------------------------------------- #
+# Subcommands.
+# --------------------------------------------------------------------------- #
+cmd_install() {
+  local start=1
+  [ "${1:-}" = "--no-start" ] && start=0
+  check_prereqs
+  log "Installing local-search into $ROOT_DIR"
+  ensure_searxng_src
+  ensure_searxng_venv
+  ensure_mcp_venv
+  install_plists
+  if [ $start -eq 1 ]; then
+    # Pick up (possibly rewritten) plists: stop any old registration, then
+    # bootstrap fresh. Ordering: searxng up first, then mcp.
+    stop_services
+    _wait_port_free "$MCP_PORT"
+    start_services
+    log "Waiting for services to come up..."
+    wait_http "$SEARXNG_URL/healthz" "OK" 30 || true
+    sleep 2
+    verify || die "verification failed; check 'local-search logs'"
+  fi
+  ok "local-search installed"
+}
+
+cmd_uninstall() {
+  log "Uninstalling local-search services"
+  stop_services
+  remove_plists
+  ok "Uninstalled (src and venvs retained; rerun 'install' to restore)"
+}
+
+cmd_update() {
+  check_prereqs
+  log "Pulling local-search repo"
+  git -C "$ROOT_DIR" pull --ff-only
+  FORCE_REBUILD=1 ensure_searxng_src
+  FORCE_REBUILD=1 ensure_searxng_venv
+  FORCE_REBUILD=1 ensure_mcp_venv
+  install_plists
+  restart_services
+  sleep 3
+  verify || die "verification failed after update"
+  ok "local-search updated"
+}
+
+cmd_update_ref() {
+  local sha="${1:-}"
+  [ -n "$sha" ] || die "usage: local-search update-searxng-ref <commit-sha>"
+  local date subj
+  date="$(curl -fsS "https://api.github.com/repos/searxng/searxng/commits/$sha" \
+    | python3 -c 'import sys,json;d=json.load(sys.stdin);print(d["commit"]["author"]["date"][:10])' 2>/dev/null || echo 'unknown-date')"
+  subj="$(curl -fsS "https://api.github.com/repos/searxng/searxng/commits/$sha" \
+    | python3 -c 'import sys,json;d=json.load(sys.stdin);print(d["commit"]["message"].splitlines()[0][:40])' 2>/dev/null || echo 'updated')"
+  printf '%s  # %s %s\n' "$sha" "$date" "$subj" > "$SEARXNG_REF_FILE"
+  ok "Pinned searxng/SEARXNG_REF → $sha"
+}
+
+cmd_env() {
+  cat <<EOF
+ROOT_DIR=$ROOT_DIR
+SEARXNG_SRC_DIR=$SEARXNG_SRC_DIR
+SEARXNG_SETTINGS=$SEARXNG_SETTINGS
+SEARXNG_REF=$(searxng_ref)
+SEARXNG_URL=$SEARXNG_URL
+SEARXNG_LABEL=$SEARXNG_LABEL
+MCP_DIR=$MCP_DIR
+MCP_VENV=$MCP_VENV
+MCP_PORT=$MCP_PORT
+MCP_LABEL=$MCP_LABEL
+LOG_DIR=$LOG_DIR
+EOF
+}
+
+cmd_logs() {
+  local which="${1:-all}"
+  mkdir -p "$LOG_DIR"
+  case "$which" in
+    searxng) tail "${2:--50}" "$LOG_DIR/searxng.log" 2>/dev/null || warn "no searxng log yet" ;;
+    mcp|mcp-websearch) tail "${2:--50}" "$LOG_DIR/mcp-websearch.log" 2>/dev/null || warn "no mcp log yet" ;;
+    all|"") tail "${2:--50}" "$LOG_DIR/searxng.log" "$LOG_DIR/mcp-websearch.log" 2>/dev/null || warn "no logs yet" ;;
+    *) die "usage: local-search logs [searxng|mcp] [lines]" ;;
+  esac
+}
+
+cmd_mcp_stdio() {
+  exec "$MCP_VENV/bin/python" "$MCP_DIR/server.py"
+}
+
+usage() {
+  sed -n '2,/^set -euo/p' "$0" | grep -E '^#   ' | sed 's/^#   /  /'
+  exit 1
+}
+
+# --------------------------------------------------------------------------- #
+# Dispatch.
+# --------------------------------------------------------------------------- #
+main() {
+  [ $# -ge 1 ] || usage
+  case "$1" in
+    install|bootstrap) shift; cmd_install "$@" ;;
+    uninstall) cmd_uninstall ;;
+    start) check_prereqs; start_services; ok "started" ;;
+    stop) stop_services; ok "stopped" ;;
+    restart) check_prereqs; restart_services; ok "restarted" ;;
+    status) status ;;
+    verify) verify ;;
+    logs) shift; cmd_logs "$@" ;;
+    update) cmd_update ;;
+    update-searxng-ref) shift; cmd_update_ref "$@" ;;
+    mcp-stdio) cmd_mcp_stdio ;;
+    env) cmd_env ;;
+    -h|--help|help) usage ;;
+    *) die "unknown command: $1"; usage ;;
+  esac
+}
+
+main "$@"
