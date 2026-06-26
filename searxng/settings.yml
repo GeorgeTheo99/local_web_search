@@ -1,0 +1,64 @@
+use_default_settings: true
+
+general:
+  instance_name: "Local SearXNG"
+
+search:
+  safe_search: 0
+  autocomplete: ""
+  default_lang: "en"
+  formats:
+    - html
+    - json
+
+server:
+  secret_key: "searxng-local-secret-key-change-me"
+  bind_address: "0.0.0.0"
+  port: 8888
+  limiter: false
+  image_proxy: true
+
+engines:
+  # Primary engines — reliable for self-hosted instances
+  - name: brave
+    engine: brave
+    shortcut: br
+    disabled: false
+  - name: qwant
+    engine: qwant
+    shortcut: qw
+    disabled: false
+  - name: startpage
+    engine: startpage
+    shortcut: sp
+    disabled: false
+  - name: mojeek
+    engine: mojeek
+    shortcut: mj
+    disabled: false
+  # Failing engines — disabled due to persistent blocks
+  - name: google
+    engine: google
+    shortcut: g
+    disabled: true
+  - name: duckduckgo
+    engine: duckduckgo
+    shortcut: ddg
+    disabled: true
+  - name: bing
+    engine: bing
+    shortcut: b
+    disabled: true
+  # Knowledge/research engines — still working
+  - name: wikipedia
+    engine: wikipedia
+    shortcut: wp
+    disabled: false
+  - name: github
+    engine: github
+    shortcut: gh
+    disabled: false
+  - name: arxiv
+    engine: arxiv
+    shortcut: arx
+    disabled: false

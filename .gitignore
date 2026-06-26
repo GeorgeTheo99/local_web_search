@@ -1,0 +1,7 @@
+# Python/runtime
+__pycache__/
+*.py[cod]
+.venv/
+
+# Vendored SearXNG checkout/runtime
+searxng/src/

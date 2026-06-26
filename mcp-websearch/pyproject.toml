@@ -1,0 +1,12 @@
+[project]
+name = "local-mcp-websearch"
+version = "0.1.0"
+description = "Local FastMCP websearch wrapper around SearXNG"
+requires-python = ">=3.12"
+dependencies = [
+  "fastmcp>=2.0",
+  "httpx>=0.27",
+]
+
+[tool.uv]
+package = false
