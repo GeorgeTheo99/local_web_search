@@ -297,18 +297,26 @@ async def _validate_public_http_url(url: str) -> None:
 # --------------------------------------------------------------------------- #
 
 def _resolve_tavily_key() -> str:
-    """Return the Tavily API key from the current HTTP request's Authorization
-    header, falling back to the TAVILY_API_KEY env var. Empty if neither."""
+    """Return the Tavily API key from the current HTTP request, falling back to
+    the TAVILY_API_KEY env var. Empty if neither.
+
+    Header precedence (custom headers pass through to tools; the standard
+    `Authorization` header is consumed by the MCP transport and does NOT reach
+    tool code, so we use a custom header that Home Server's McpSearchProvider
+    sends alongside its Authorization header):
+      1. X-Tavily-Key   (preferred, custom)
+      2. X-Api-Key      (generic fallback)
+    Then env var TAVILY_API_KEY (pi-shared/agent stdio consumers).
+    """
     try:
         headers = get_http_headers()
-        auth = headers.get("authorization") or headers.get("Authorization") or ""
     except LookupError:
         # stdio transport / no HTTP context — env var only.
         return TAVILY_API_KEY_ENV
-    if auth.lower().startswith("bearer "):
-        key = auth[7:].strip()
-        if key:
-            return key
+    for name in ("x-tavily-key", "x-api-key"):
+        value = headers.get(name)
+        if value and value.strip():
+            return value.strip()
     return TAVILY_API_KEY_ENV
 
 

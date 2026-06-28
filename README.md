@@ -2,7 +2,9 @@
 
 A self-contained, installable local web-search stack for developer/agent
 tooling and Home Automation. Runs SearXNG (metasearch) and a FastMCP wrapper
-that exposes `web_search` / `web_fetch` tools over MCP (HTTP and stdio).
+that exposes `web_search` / `web_fetch` tools over MCP (HTTP and stdio), with
+**Tavily failover** for reliability when SearXNG's scraped engines block or
+rate-limit.
 
 This is its own component. It is a **dependency** of:
 
@@ -22,6 +24,34 @@ opt-in for machines that want a local search backend.
 | MCP websearch (HTTP) | `http://127.0.0.1:8889/mcp` | MCP streamable-http transport |
 | MCP websearch (stdio) | `mcp-websearch/server.py` | MCP stdio transport |
 | MCP health | `GET http://127.0.0.1:8889/health` | Liveness + SearXNG reachability probe |
+
+## Search backends & Tavily failover
+
+`web_search` is a multi-backend aggregator: **SearXNG first (free, always-on),
+Tavily failover (optional, paid) when SearXNG returns empty or errors.** This
+keeps Tavily spend minimal while guaranteeing results when SearXNG's scraped
+engines (Brave, Mojeek, etc.) are rate-limited or blocked.
+
+- Results are normalized and deduped by URL across backends.
+- A per-backend circuit breaker trips after N consecutive failures, skipping
+  that backend for a cooldown.
+- With no Tavily key configured, the stack runs SearXNG-only (the free default).
+
+### Tavily key
+
+The Tavily API key is read at runtime (no config file on disk):
+
+1. **Per-call HTTP header** (preferred): `X-Tavily-Key: <key>` — Home Server's
+   `McpSearchProvider` forwards the stored Tavily key on every call. (The
+   standard `Authorization` header is consumed by the MCP transport and does
+   not reach tool code, so a custom header is used.)
+2. **`X-Api-Key: <key>`** — generic fallback header.
+3. **`TAVILY_API_KEY` env var** — for pi-shared/agent stdio consumers that
+   don't send headers, and for the launchd plist.
+
+Home Server stores the key in its existing `FileCredentialStore` (entered via
+the setup UI) and forwards it to local-search per-call — local-search never
+persists the key. See the [Consumer wiring](#consumer-wiring) section.
 
 ## Requirements
 

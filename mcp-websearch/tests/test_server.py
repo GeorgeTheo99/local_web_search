@@ -372,10 +372,19 @@ async def test_resolve_tavily_key_env_fallback(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_resolve_tavily_key_header_precedence(monkeypatch):
-    """Per-call Authorization: Bearer header takes precedence over env var."""
+    """Per-call X-Tavily-Key header takes precedence over env var.
+    (The standard Authorization header is consumed by the MCP transport and
+    does not reach tool code, so a custom header is used.)"""
     monkeypatch.setattr(srv, "TAVILY_API_KEY_ENV", "tvly-env")
-    monkeypatch.setattr(srv, "get_http_headers", lambda: {"authorization": "Bearer tvly-header"})
+    monkeypatch.setattr(srv, "get_http_headers", lambda: {"x-tavily-key": "tvly-header"})
     assert srv._resolve_tavily_key() == "tvly-header"
+
+@pytest.mark.asyncio
+async def test_resolve_tavily_key_x_api_key_fallback(monkeypatch):
+    """X-Api-Key is used when X-Tavily-Key is absent."""
+    monkeypatch.setattr(srv, "TAVILY_API_KEY_ENV", "tvly-env")
+    monkeypatch.setattr(srv, "get_http_headers", lambda: {"x-api-key": "tvly-generic"})
+    assert srv._resolve_tavily_key() == "tvly-generic"
 
 @pytest.mark.asyncio
 async def test_resolve_tavily_key_empty_when_neither(monkeypatch):
@@ -385,9 +394,9 @@ async def test_resolve_tavily_key_empty_when_neither(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_tavily_failover_uses_per_call_header_key(monkeypatch):
-    """End-to-end: a per-call header key triggers Tavily failover even with no env key."""
+    """End-to-end: a per-call X-Tavily-Key header triggers Tavily failover even with no env key."""
     monkeypatch.setattr(srv, "TAVILY_API_KEY_ENV", "")
-    monkeypatch.setattr(srv, "get_http_headers", lambda: {"authorization": "Bearer tvly-header"})
+    monkeypatch.setattr(srv, "get_http_headers", lambda: {"x-tavily-key": "tvly-header"})
     async def fake_searxng(path, params, timeout=None):
         return {"results": [], "suggestions": []}
     monkeypatch.setattr(srv, "_searxng_request", fake_searxng)
