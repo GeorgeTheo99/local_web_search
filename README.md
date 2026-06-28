@@ -28,29 +28,36 @@ opt-in for machines that want a local search backend.
 ## Search backends & Tavily failover
 
 `web_search` is a multi-backend aggregator: **SearXNG first (free, always-on),
-Tavily failover (optional, paid) when SearXNG returns empty or errors.** This
-keeps Tavily spend minimal while guaranteeing results when SearXNG's scraped
-engines (Brave, Mojeek, etc.) are rate-limited or blocked.
+Tavily failover when SearXNG returns empty or errors.** This guarantees
+results even when SearXNG's scraped engines (Brave, Mojeek, etc.) are
+rate-limited or blocked.
 
 - Results are normalized and deduped by URL across backends.
 - A per-backend circuit breaker trips after N consecutive failures, skipping
   that backend for a cooldown.
-- With no Tavily key configured, the stack runs SearXNG-only (the free default).
 
-### Tavily key
+### Tavily: keyless by default, optional key upgrade
 
-The Tavily API key is read at runtime (no config file on disk):
+Tavily failover works **with zero setup** via Tavily's free keyless tier
+(`X-Tavily-Access-Mode: keyless` — no account, no API key, no signup). Every
+install gets reliable search out of the box. The keyless tier uses a shared
+anonymous rate limit; for higher limits, swap in a free API key
+(1,000 credits/month, no credit card) — same code path, no changes needed.
+
+Tavily key resolution (precedence):
 
 1. **Per-call HTTP header** (preferred): `X-Tavily-Key: <key>` — Home Server's
-   `McpSearchProvider` forwards the stored Tavily key on every call. (The
+   `McpSearchProvider` forwards a stored Tavily key on every call. (The
    standard `Authorization` header is consumed by the MCP transport and does
    not reach tool code, so a custom header is used.)
 2. **`X-Api-Key: <key>`** — generic fallback header.
 3. **`TAVILY_API_KEY` env var** — for pi-shared/agent stdio consumers that
    don't send headers, and for the launchd plist.
+4. **None of the above** → keyless mode (free, no account, shared rate limit).
 
-Home Server stores the key in its existing `FileCredentialStore` (entered via
-the setup UI) and forwards it to local-search per-call — local-search never
+When a key is present, it takes precedence over keyless (uses the caller's
+account quota). Home Server stores an optional key in its `FileCredentialStore`
+(entered via the setup UI) and forwards it per-call — local-search never
 persists the key. See the [Consumer wiring](#consumer-wiring) section.
 
 ## Requirements

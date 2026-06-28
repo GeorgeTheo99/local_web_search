@@ -376,12 +376,17 @@ async def _searxng_search(query: str, num_results: int) -> tuple[list[dict], lis
 # --------------------------------------------------------------------------- #
 
 async def _tavily_search(query: str, num_results: int, api_key: str) -> tuple[list[dict], bool]:
-    """Return (normalized_results, ok). ok=False means backend failure."""
+    """Return (normalized_results, ok). ok=False means backend failure.
+
+    If api_key is present, uses the caller's account quota (Authorization:
+    Bearer). If absent, uses Tavily's free keyless tier
+    (X-Tavily-Access-Mode: keyless) — no account or signup required, with a
+    shared anonymous rate limit. Either way Tavily failover is always
+    available as a SearXNG backup."""
     if not _breaker.allow("tavily"):
         logger.info("Tavily circuit open; skipping")
         return [], False
     payload = {
-        "api_key": api_key,
         "query": query,
         "max_results": num_results,
         "search_depth": "basic",
@@ -389,13 +394,20 @@ async def _tavily_search(query: str, num_results: int, api_key: str) -> tuple[li
         "include_raw_content": False,
         "topic": "general",
     }
+    # Keyless when no key: free, no account, shared rate-limited budget.
+    # Keyed when present: uses the caller's 1,000/mo free quota or paid plan.
+    if api_key:
+        headers = {"Authorization": f"Bearer {api_key}"}
+    else:
+        headers = {"X-Tavily-Access-Mode": "keyless"}
     try:
         client = await _client()
-        resp = await client.post(f"{TAVILY_BASE_URL}/search", json=payload, timeout=TAVILY_TIMEOUT)
+        resp = await client.post(f"{TAVILY_BASE_URL}/search", json=payload, headers=headers, timeout=TAVILY_TIMEOUT)
         resp.raise_for_status()
         data = resp.json()
     except Exception as e:
-        logger.warning("Tavily search failed: %s: %s", type(e).__name__, e)
+        logger.warning("Tavily search failed (%s): %s: %s",
+                       "keyed" if api_key else "keyless", type(e).__name__, e)
         _breaker.record_failure("tavily")
         return [], False
     _breaker.record_success("tavily")
@@ -431,15 +443,17 @@ async def health(request: Request) -> JSONResponse:
     """Liveness + SearXNG reachability. Always 200; inspect `status`."""
     searxng = await _probe_searxng()
     status = "ok" if searxng.get("reachable") else "degraded"
-    tavily_configured = bool(TAVILY_API_KEY_ENV)
+    tavily_key_configured = bool(TAVILY_API_KEY_ENV)
     return JSONResponse({
         "status": status,
         "service": "mcp-websearch",
         "searxng_url": SEARXNG_URL,
         "searxng": searxng,
         "tavily": {
-            "env_key_configured": tavily_configured,
+            "env_key_configured": tavily_key_configured,
+            "keyless_available": True,
             "base_url": TAVILY_BASE_URL,
+            "mode": "keyed" if tavily_key_configured else "keyless",
         },
     })
 
@@ -452,9 +466,11 @@ async def health(request: Request) -> JSONResponse:
 async def web_search(query: str, num_results: int = 8) -> str:
     """Search the web via local SearXNG with Tavily failover. Use this for ANY question about current events, news, facts, people, places, or any topic that requires up-to-date information. Returns ranked results with titles, URLs, and snippets.
 
-    Strategy: SearXNG first (free); if SearXNG returns no results or errors and
-    a Tavily key is available (per-call Authorization header or TAVILY_API_KEY
-    env var), Tavily is queried as failover. Results are deduped by URL."""
+    Strategy: SearXNG first (free); if SearXNG returns no results or errors,
+    Tavily is queried as failover. Tavily runs keyless (free, no account) by
+    default, or keyed (caller's account quota) when a Tavily key is provided
+    via the X-Tavily-Key header or TAVILY_API_KEY env var. Results are deduped
+    by URL."""
     tavily_key = _resolve_tavily_key()
 
     # Tier 1: SearXNG.
@@ -465,33 +481,13 @@ async def web_search(query: str, num_results: int = 8) -> str:
         ranked = _dedupe_and_rank(searxng_results, num_results)
         return _format_results(query, ranked, suggestions)
 
-    # SearXNG empty or failed — attempt Tavily failover if a key is available.
-    if not tavily_key:
-        # No key: return the SearXNG outcome (free default). Distinguish
-        # backend-failure from genuine empty results for the caller.
-        if not searxng_ok:
-            return _search_error_payload(
-                query,
-                f"Search error: SearXNG unreachable at {SEARXNG_URL} and no Tavily key configured. "
-                "Check that SearXNG is running or set a Tavily API key.",
-            )
-        # SearXNG reachable but empty — surface unresponsive engines if any.
-        engine_msg = ""
-        if unresponsive:
-            names = [e.get("name", str(e)) if isinstance(e, dict) else str(e)
-                     for e in unresponsive]
-            engine_msg = f" (unresponsive engines: {', '.join(names)})"
-        return json.dumps({
-            "query": query,
-            "results": [],
-            "suggestions": suggestions[:5],
-            "text": f"No results found for: {query}{engine_msg}",
-        })
-
+    # SearXNG empty or failed — fail over to Tavily (keyless when no key).
     if not _breaker.allow("tavily"):
         # Tavily breaker open — return SearXNG's empty/error result.
-        return _format_results(query, [], suggestions) if searxng_ok else _search_error_payload(
-            query, f"Search error: SearXNG unreachable and Tavily circuit open. Try again shortly.")
+        if searxng_ok:
+            return _format_results(query, [], suggestions)
+        return _search_error_payload(
+            query, "Search error: SearXNG unreachable and Tavily circuit open. Try again shortly.")
 
     tavily_results, tavily_ok = await _tavily_search(query, num_results, tavily_key)
 
@@ -503,7 +499,8 @@ async def web_search(query: str, num_results: int = 8) -> str:
     if not searxng_ok and not tavily_ok:
         return _search_error_payload(
             query,
-            f"Search error: SearXNG unreachable and Tavily failed. Check services and Tavily key.",
+            "Search error: SearXNG unreachable and Tavily failed. "
+            "Check services and Tavily reachability.",
         )
     # Both reachable but empty.
     return _format_results(query, [], suggestions)

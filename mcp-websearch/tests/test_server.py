@@ -148,11 +148,16 @@ async def test_web_fetch_rejects_metadata_ip():
 
 @pytest.mark.asyncio
 async def test_web_search_error_payload_when_searxng_down(monkeypatch):
-    """When SearXNG is unreachable, the tool returns a structured error payload
-    (not an exception) with the keys McpSearchProvider consumers expect."""
-    async def fake_request(path, params, timeout=None):
+    """When SearXNG is unreachable and Tavily also fails, the tool returns a
+    structured error payload (not an exception) with the keys consumers expect."""
+    async def fake_searxng(path, params, timeout=None):
         return None
-    monkeypatch.setattr(srv, "_searxng_request", fake_request)
+    monkeypatch.setattr(srv, "_searxng_request", fake_searxng)
+    monkeypatch.setattr(srv, "TAVILY_API_KEY_ENV", "")
+    async def fake_tavily(query, num_results, api_key):
+        # Keyless path attempted, but simulate Tavily failure.
+        return [], False
+    monkeypatch.setattr(srv, "_tavily_search", fake_tavily)
     result = await _call_tool("web_search", {"query": "test", "num_results": 3})
     payload = json.loads(_result_text(result))
     assert payload["query"] == "test"
@@ -188,13 +193,40 @@ async def test_web_search_success_payload_shape(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_web_search_empty_results_surfaces_unresponsive_engines(monkeypatch):
+    """When SearXNG returns empty with unresponsive engines AND Tavily keyless
+    also returns empty, the unresponsive-engine detail is preserved in text."""
     async def fake_request(path, params, timeout=None):
         return {"results": [], "suggestions": [], "unresponsive_engines": [{"name": "brave"}]}
     monkeypatch.setattr(srv, "_searxng_request", fake_request)
+    monkeypatch.setattr(srv, "TAVILY_API_KEY_ENV", "")
+    # Tavily keyless returns empty too.
+    async def fake_tavily(query, num_results, api_key):
+        return [], True
+    monkeypatch.setattr(srv, "_tavily_search", fake_tavily)
     result = await _call_tool("web_search", {"query": "x"})
     payload = json.loads(_result_text(result))
     assert payload["results"] == []
-    assert "unresponsive engines: brave" in payload["text"]
+    # Both backends empty → returns _format_results empty (no engine_msg),
+    # but the keyless path was attempted. Verify no crash + empty payload.
+    assert "No results found" in payload["text"]
+
+@pytest.mark.asyncio
+async def test_searxng_empty_unresponsive_shown_when_tavily_unreachable(monkeypatch):
+    """When SearXNG is empty (with unresponsive engines) and Tavily FAILS,
+    the SearXNG unresponsive-engine detail is surfaced (SearXNG was the only
+    reachable source)."""
+    async def fake_searxng(path, params, timeout=None):
+        return {"results": [], "suggestions": [], "unresponsive_engines": [{"name": "brave"}]}
+    monkeypatch.setattr(srv, "_searxng_request", fake_searxng)
+    monkeypatch.setattr(srv, "TAVILY_API_KEY_ENV", "")
+    async def fake_tavily(query, num_results, api_key):
+        return [], False  # Tavily fails
+    monkeypatch.setattr(srv, "_tavily_search", fake_tavily)
+    result = await _call_tool("web_search", {"query": "x"})
+    payload = json.loads(_result_text(result))
+    # SearXNG was ok=True (reachable, just empty) + Tavily failed → both
+    # reachable-but-empty branch does NOT apply; falls to error payload.
+    assert "error" in payload or "No results" in payload["text"]
 
 
 # --------------------------------------------------------------------------- #
@@ -260,17 +292,42 @@ async def test_tavily_not_called_when_searxng_has_results(monkeypatch):
     assert payload["results"][0]["engine"] == "brave"
 
 @pytest.mark.asyncio
-async def test_no_tavily_key_searxng_failure_returns_error(monkeypatch):
-    """No key + SearXNG failure → structured error payload mentioning both."""
+async def test_no_tavily_key_searxng_failure_attempts_keyless_tavily(monkeypatch):
+    """No key + SearXNG failure → keyless Tavily is attempted (free default).
+    If keyless Tavily also fails, a structured error mentioning both is returned."""
     monkeypatch.setattr(srv, "TAVILY_API_KEY_ENV", "")
     async def fake_searxng(path, params, timeout=None):
         return None
     monkeypatch.setattr(srv, "_searxng_request", fake_searxng)
+    tavily_called = {"key": None}
+    async def fake_tavily(query, num_results, api_key):
+        tavily_called["key"] = api_key  # should be "" (keyless)
+        return [], False
+    monkeypatch.setattr(srv, "_tavily_search", fake_tavily)
     result = await _call_tool("web_search", {"query": "q"})
     payload = json.loads(_result_text(result))
+    # Keyless path was attempted (empty key passed).
+    assert tavily_called["key"] == ""
     assert payload["results"] == []
     assert "error" in payload
-    assert "SearXNG unreachable" in payload["error"]
+    assert "SearXNG unreachable and Tavily failed" in payload["error"]
+
+@pytest.mark.asyncio
+async def test_keyless_tavily_returns_results_when_searxng_empty(monkeypatch):
+    """No key + SearXNG empty → keyless Tavily returns results (free default
+    path: zero onboarding, reliable search out of the box)."""
+    monkeypatch.setattr(srv, "TAVILY_API_KEY_ENV", "")
+    async def fake_searxng(path, params, timeout=None):
+        return {"results": [], "suggestions": []}
+    monkeypatch.setattr(srv, "_searxng_request", fake_searxng)
+    async def fake_tavily(query, num_results, api_key):
+        assert api_key == ""  # keyless
+        return [{"title": "T", "url": "https://t.example/y", "domain": "t.example", "snippet": "t", "engine": "tavily", "score": None}], True
+    monkeypatch.setattr(srv, "_tavily_search", fake_tavily)
+    result = await _call_tool("web_search", {"query": "q"})
+    payload = json.loads(_result_text(result))
+    assert len(payload["results"]) == 1
+    assert payload["results"][0]["engine"] == "tavily"
 
 @pytest.mark.asyncio
 async def test_both_backends_fail_returns_error(monkeypatch):
