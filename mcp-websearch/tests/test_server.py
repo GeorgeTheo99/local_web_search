@@ -208,3 +208,195 @@ async def test_tools_list_exposes_expected_tools():
         tools = await client.list_tools()
     names = {t.name for t in tools}
     assert names == {"web_search", "web_fetch"}
+
+
+# --------------------------------------------------------------------------- #
+# Tavily failover.
+# --------------------------------------------------------------------------- #
+
+@pytest.mark.asyncio
+async def test_no_tavily_key_searxng_only_returns_searxng_results(monkeypatch):
+    """With no Tavily key (env or header), SearXNG results are returned directly."""
+    monkeypatch.setattr(srv, "TAVILY_API_KEY_ENV", "")
+    async def fake_request(path, params, timeout=None):
+        return {"results": [{"title": "S", "url": "https://s.example/x", "content": "s", "engine": "brave"}], "suggestions": []}
+    monkeypatch.setattr(srv, "_searxng_request", fake_request)
+    result = await _call_tool("web_search", {"query": "q"})
+    payload = json.loads(_result_text(result))
+    assert len(payload["results"]) == 1
+    assert payload["results"][0]["engine"] == "brave"
+
+@pytest.mark.asyncio
+async def test_tavily_failover_when_searxng_empty(monkeypatch):
+    """SearXNG returns empty + Tavily key present → Tavily is queried and returned."""
+    monkeypatch.setattr(srv, "TAVILY_API_KEY_ENV", "tvly-test")
+    async def fake_searxng(path, params, timeout=None):
+        return {"results": [], "suggestions": []}
+    monkeypatch.setattr(srv, "_searxng_request", fake_searxng)
+    tavily_called = {"n": 0}
+    async def fake_tavily(query, num_results, api_key):
+        tavily_called["n"] += 1
+        assert api_key == "tvly-test"
+        return [{"title": "T", "url": "https://t.example/y", "domain": "t.example", "snippet": "t", "engine": "tavily", "score": None}], True
+    monkeypatch.setattr(srv, "_tavily_search", fake_tavily)
+    result = await _call_tool("web_search", {"query": "q"})
+    payload = json.loads(_result_text(result))
+    assert tavily_called["n"] == 1
+    assert len(payload["results"]) == 1
+    assert payload["results"][0]["engine"] == "tavily"
+
+@pytest.mark.asyncio
+async def test_tavily_not_called_when_searxng_has_results(monkeypatch):
+    """Credit-conserving: Tavily is NOT queried when SearXNG already returned results."""
+    monkeypatch.setattr(srv, "TAVILY_API_KEY_ENV", "tvly-test")
+    async def fake_searxng(path, params, timeout=None):
+        return {"results": [{"title": "S", "url": "https://s.example/x", "content": "s", "engine": "brave"}], "suggestions": []}
+    monkeypatch.setattr(srv, "_searxng_request", fake_searxng)
+    async def fake_tavily(query, num_results, api_key):
+        raise AssertionError("Tavily must not be called when SearXNG has results")
+    monkeypatch.setattr(srv, "_tavily_search", fake_tavily)
+    result = await _call_tool("web_search", {"query": "q"})
+    payload = json.loads(_result_text(result))
+    assert payload["results"][0]["engine"] == "brave"
+
+@pytest.mark.asyncio
+async def test_no_tavily_key_searxng_failure_returns_error(monkeypatch):
+    """No key + SearXNG failure → structured error payload mentioning both."""
+    monkeypatch.setattr(srv, "TAVILY_API_KEY_ENV", "")
+    async def fake_searxng(path, params, timeout=None):
+        return None
+    monkeypatch.setattr(srv, "_searxng_request", fake_searxng)
+    result = await _call_tool("web_search", {"query": "q"})
+    payload = json.loads(_result_text(result))
+    assert payload["results"] == []
+    assert "error" in payload
+    assert "SearXNG unreachable" in payload["error"]
+
+@pytest.mark.asyncio
+async def test_both_backends_fail_returns_error(monkeypatch):
+    """SearXNG fails + Tavily fails → error payload mentioning both."""
+    monkeypatch.setattr(srv, "TAVILY_API_KEY_ENV", "tvly-test")
+    async def fake_searxng(path, params, timeout=None):
+        return None
+    monkeypatch.setattr(srv, "_searxng_request", fake_searxng)
+    async def fake_tavily(query, num_results, api_key):
+        return [], False
+    monkeypatch.setattr(srv, "_tavily_search", fake_tavily)
+    result = await _call_tool("web_search", {"query": "q"})
+    payload = json.loads(_result_text(result))
+    assert "error" in payload
+    assert "SearXNG unreachable and Tavily failed" in payload["error"]
+
+
+# --------------------------------------------------------------------------- #
+# Dedupe by URL.
+# --------------------------------------------------------------------------- #
+
+@pytest.mark.asyncio
+async def test_dedupe_by_url_searxng_results(monkeypatch):
+    """Duplicate URLs (same URL, different fragments) collapse to one."""
+    async def fake_request(path, params, timeout=None):
+        return {"results": [
+            {"title": "A", "url": "https://example.com/page", "content": "a", "engine": "brave"},
+            {"title": "A2", "url": "https://example.com/page#frag", "content": "a2", "engine": "qwant"},
+            {"title": "B", "url": "https://other.com/", "content": "b", "engine": "brave"},
+        ], "suggestions": []}
+    monkeypatch.setattr(srv, "_searxng_request", fake_request)
+    monkeypatch.setattr(srv, "TAVILY_API_KEY_ENV", "")
+    result = await _call_tool("web_search", {"query": "q"})
+    payload = json.loads(_result_text(result))
+    assert len(payload["results"]) == 2  # page + page#frag deduped, other.com kept
+    assert payload["results"][0]["rank"] == 1
+    assert payload["results"][1]["rank"] == 2
+
+
+# --------------------------------------------------------------------------- #
+# Circuit breaker.
+# --------------------------------------------------------------------------- #
+
+@pytest.mark.asyncio
+async def test_circuit_breaker_trips_after_threshold(monkeypatch):
+    """After N consecutive SearXNG failures, the breaker skips SearXNG."""
+    monkeypatch.setattr(srv, "BREAKER_FAIL_THRESHOLD", 2)
+    monkeypatch.setattr(srv, "BREAKER_COOLDOWN", 60)
+    # Fresh breaker.
+    monkeypatch.setattr(srv, "_breaker", srv._CircuitBreaker())
+    calls = {"n": 0}
+    async def fake_searxng(path, params, timeout=None):
+        calls["n"] += 1
+        return None
+    monkeypatch.setattr(srv, "_searxng_request", fake_searxng)
+    monkeypatch.setattr(srv, "TAVILY_API_KEY_ENV", "")
+    # Two failures to trip.
+    await _call_tool("web_search", {"query": "q1"})
+    await _call_tool("web_search", {"query": "q2"})
+    assert calls["n"] == 2
+    # Third call: breaker open → SearXNG not contacted.
+    await _call_tool("web_search", {"query": "q3"})
+    assert calls["n"] == 2  # not incremented
+
+@pytest.mark.asyncio
+async def test_circuit_breaker_resets_on_success(monkeypatch):
+    """A success resets the failure counter."""
+    monkeypatch.setattr(srv, "BREAKER_FAIL_THRESHOLD", 3)
+    monkeypatch.setattr(srv, "_breaker", srv._CircuitBreaker())
+    state = {"fail": True}
+    async def fake_searxng(path, params, timeout=None):
+        if state["fail"]:
+            return None
+        return {"results": [{"title": "ok", "url": "https://x.example/", "content": "", "engine": "brave"}], "suggestions": []}
+    monkeypatch.setattr(srv, "_searxng_request", fake_searxng)
+    monkeypatch.setattr(srv, "TAVILY_API_KEY_ENV", "")
+    breaker = srv._breaker
+    await _call_tool("web_search", {"query": "q"})  # fail 1
+    assert breaker._fails.get("searxng") == 1
+    state["fail"] = False
+    await _call_tool("web_search", {"query": "q"})  # success resets
+    assert "searxng" not in breaker._fails
+
+
+# --------------------------------------------------------------------------- #
+# Tavily key resolution (per-call header > env var).
+# --------------------------------------------------------------------------- #
+
+@pytest.mark.asyncio
+async def test_resolve_tavily_key_env_fallback(monkeypatch):
+    """No HTTP context (stdio) → env var is used."""
+    monkeypatch.setattr(srv, "TAVILY_API_KEY_ENV", "tvly-env")
+    # get_http_headers raises LookupError in stdio/no-request context.
+    import server as s
+    def raise_lookup():
+        raise LookupError("no request")
+    monkeypatch.setattr(s, "get_http_headers", raise_lookup)
+    assert s._resolve_tavily_key() == "tvly-env"
+
+@pytest.mark.asyncio
+async def test_resolve_tavily_key_header_precedence(monkeypatch):
+    """Per-call Authorization: Bearer header takes precedence over env var."""
+    monkeypatch.setattr(srv, "TAVILY_API_KEY_ENV", "tvly-env")
+    monkeypatch.setattr(srv, "get_http_headers", lambda: {"authorization": "Bearer tvly-header"})
+    assert srv._resolve_tavily_key() == "tvly-header"
+
+@pytest.mark.asyncio
+async def test_resolve_tavily_key_empty_when_neither(monkeypatch):
+    monkeypatch.setattr(srv, "TAVILY_API_KEY_ENV", "")
+    monkeypatch.setattr(srv, "get_http_headers", lambda: {})
+    assert srv._resolve_tavily_key() == ""
+
+@pytest.mark.asyncio
+async def test_tavily_failover_uses_per_call_header_key(monkeypatch):
+    """End-to-end: a per-call header key triggers Tavily failover even with no env key."""
+    monkeypatch.setattr(srv, "TAVILY_API_KEY_ENV", "")
+    monkeypatch.setattr(srv, "get_http_headers", lambda: {"authorization": "Bearer tvly-header"})
+    async def fake_searxng(path, params, timeout=None):
+        return {"results": [], "suggestions": []}
+    monkeypatch.setattr(srv, "_searxng_request", fake_searxng)
+    seen_key = {}
+    async def fake_tavily(query, num_results, api_key):
+        seen_key["k"] = api_key
+        return [{"title": "T", "url": "https://t.example/y", "domain": "t.example", "snippet": "t", "engine": "tavily", "score": None}], True
+    monkeypatch.setattr(srv, "_tavily_search", fake_tavily)
+    result = await _call_tool("web_search", {"query": "q"})
+    payload = json.loads(_result_text(result))
+    assert seen_key.get("k") == "tvly-header"
+    assert payload["results"][0]["engine"] == "tavily"

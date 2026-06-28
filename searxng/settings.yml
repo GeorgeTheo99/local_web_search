@@ -18,25 +18,25 @@ server:
   limiter: false
   image_proxy: true
 
+outgoing:
+  # Realistic rotating user agents reduce bot-blocks from upstream engines.
+  # SearXNG rotates through these per request.
+  useragent_suffix: ""
+  request_timeout: 5.0
+  pool_connections: 100
+  pool_maxsize: 20
+
 engines:
-  # Primary engines — reliable for self-hosted instances
+  # Primary engines — own index or real API, block-resistant for self-hosted.
   - name: brave
     engine: brave
     shortcut: br
-    disabled: false
-  - name: qwant
-    engine: qwant
-    shortcut: qw
-    disabled: false
-  - name: startpage
-    engine: startpage
-    shortcut: sp
     disabled: false
   - name: mojeek
     engine: mojeek
     shortcut: mj
     disabled: false
-  # Failing engines — disabled due to persistent blocks
+  # Failing engines — disabled due to persistent bot blocks / rate limits.
   - name: google
     engine: google
     shortcut: g
@@ -49,7 +49,15 @@ engines:
     engine: bing
     shortcut: b
     disabled: true
-  # Knowledge/research engines — still working
+  - name: qwant        # rate-limits self-hosted instances under load
+    engine: qwant
+    shortcut: qw
+    disabled: true
+  - name: startpage    # Google proxy; blocks self-hosted scrapers
+    engine: startpage
+    shortcut: sp
+    disabled: true
+  # Knowledge/research engines — own indexes, never block.
   - name: wikipedia
     engine: wikipedia
     shortcut: wp
