@@ -26,13 +26,19 @@ ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 SEARXNG_SRC_DIR="$ROOT_DIR/searxng/src"
 SEARXNG_SETTINGS="$ROOT_DIR/searxng/settings.yml"
+SEARXNG_RUNNER="$ROOT_DIR/searxng/run.py"
 SEARXNG_REF_FILE="$ROOT_DIR/searxng/SEARXNG_REF"
 SEARXNG_REPO="https://github.com/searxng/searxng.git"
 
 MCP_DIR="$ROOT_DIR/mcp-websearch"
 
-SEARXNG_URL="${SEARXNG_URL:-http://localhost:8888}"
+SEARXNG_URL="${SEARXNG_URL:-http://127.0.0.1:8888}"
 MCP_PORT="${MCP_PORT:-8889}"
+WEBSEARCH_TAVILY_MODE="${WEBSEARCH_TAVILY_MODE:-fallback}"
+WEBSEARCH_TOTAL_TIMEOUT="${WEBSEARCH_TOTAL_TIMEOUT:-18}"
+WEBSEARCH_SEARXNG_TIMEOUT="${WEBSEARCH_SEARXNG_TIMEOUT:-7}"
+WEBSEARCH_TAVILY_TIMEOUT="${WEBSEARCH_TAVILY_TIMEOUT:-8}"
+WEBSEARCH_SUPPLEMENT_MIN_RESULTS="${WEBSEARCH_SUPPLEMENT_MIN_RESULTS:-5}"
 
 SEARXNG_LABEL="com.local.searxng"
 MCP_LABEL="com.local.mcp-websearch"
@@ -153,7 +159,7 @@ searxng_plist() {
 <plist version="1.0"><dict>
 <key>Label</key><string>${SEARXNG_LABEL}</string>
 <key>ProgramArguments</key><array>
-  <string>${SEARXNG_VENV}/bin/python</string><string>-m</string><string>searx.webapp</string>
+  <string>${SEARXNG_VENV}/bin/python</string><string>${SEARXNG_RUNNER}</string>
 </array>
 <key>WorkingDirectory</key><string>${SEARXNG_SRC_DIR}</string>
 <key>EnvironmentVariables</key><dict>
@@ -181,6 +187,11 @@ mcp_plist() {
 <key>EnvironmentVariables</key><dict>
   <key>SEARXNG_URL</key><string>${SEARXNG_URL}</string>
   <key>MCP_PORT</key><string>${MCP_PORT}</string>
+  <key>WEBSEARCH_TAVILY_MODE</key><string>${WEBSEARCH_TAVILY_MODE}</string>
+  <key>WEBSEARCH_TOTAL_TIMEOUT</key><string>${WEBSEARCH_TOTAL_TIMEOUT}</string>
+  <key>WEBSEARCH_SEARXNG_TIMEOUT</key><string>${WEBSEARCH_SEARXNG_TIMEOUT}</string>
+  <key>WEBSEARCH_TAVILY_TIMEOUT</key><string>${WEBSEARCH_TAVILY_TIMEOUT}</string>
+  <key>WEBSEARCH_SUPPLEMENT_MIN_RESULTS</key><string>${WEBSEARCH_SUPPLEMENT_MIN_RESULTS}</string>
   <key>FASTMCP_SHOW_SERVER_BANNER</key><string>false</string>
 </dict>
 <key>StandardOutPath</key><string>${LOG_DIR}/mcp-websearch.log</string>
@@ -212,8 +223,23 @@ remove_plists() {
 # EADDRINUSE race where a new spawn tries to bind before the old socket closes.
 bootout_service() { launchctl bootout "gui/$(id -u)/$1" >/dev/null 2>&1 || true; }
 bootstrap_service() {
-  launchctl bootstrap "gui/$(id -u)" "$PLIST_DIR/$1.plist" 2>/dev/null \
-    || launchctl load "$PLIST_DIR/$1.plist" 2>/dev/null || true
+  local label="$1" target="gui/$(id -u)/$1" attempt
+  if launchctl print "$target" >/dev/null 2>&1; then
+    if launchctl kickstart -k "$target" >/dev/null 2>&1; then
+      return
+    fi
+    # A stale registration can survive briefly after bootout.
+    bootout_service "$label"
+    sleep 1
+  fi
+  # launchd may briefly reject a bootstrap immediately after bootout; retry
+  # instead of swallowing the failure and reporting a later health timeout.
+  for attempt in 1 2 3; do
+    launchctl bootstrap "gui/$(id -u)" "$PLIST_DIR/$label.plist" >/dev/null 2>&1 && return
+    sleep 1
+  done
+  warn "could not bootstrap $label"
+  return 1
 }
 
 start_services() {
@@ -265,7 +291,8 @@ verify() {
   local rc=0
   wait_http "$SEARXNG_URL/healthz" "OK" 30 || rc=1
   sleep 2
-  wait_http "http://127.0.0.1:${MCP_PORT}/health" '"status"' 30 || rc=1
+  wait_http "http://127.0.0.1:${MCP_PORT}/live" '"status":"ok"' 30 || rc=1
+  wait_http "http://127.0.0.1:${MCP_PORT}/ready" '"ready":true' 30 || rc=1
   log "MCP tools/list"
   local tools
   tools="$(curl -fsS --max-time 5 -X POST "http://127.0.0.1:${MCP_PORT}/mcp" \
@@ -285,7 +312,7 @@ status() {
   printf '%-22s %s\n' "searxng health:" "$(curl -fsS --max-time 3 "$SEARXNG_URL/healthz" 2>/dev/null || echo 'DOWN')"
   local h
   h="$(curl -fsS --max-time 3 "http://127.0.0.1:${MCP_PORT}/health" 2>/dev/null || echo 'DOWN')"
-  printf '%-22s %s\n' "mcp /health:" "$(echo "$h" | python3 -c 'import sys,json;d=json.load(sys.stdin);print(d.get("status","?"),"searxng_reachable="+str(d.get("searxng",{}).get("reachable","?")))' 2>/dev/null || echo "$h")"
+  printf '%-22s %s\n' "mcp /health:" "$(echo "$h" | python3 -c 'import sys,json;d=json.load(sys.stdin);last=d.get("last_search") or {};print(d.get("status","?"),"ready="+str(d.get("ready","?")),"mode="+str(d.get("policy",{}).get("tavily_mode","?")),"last_backend="+str(last.get("backend","none")))' 2>/dev/null || echo "$h")"
 }
 
 # --------------------------------------------------------------------------- #
@@ -352,6 +379,7 @@ cmd_env() {
 ROOT_DIR=$ROOT_DIR
 SEARXNG_SRC_DIR=$SEARXNG_SRC_DIR
 SEARXNG_SETTINGS=$SEARXNG_SETTINGS
+SEARXNG_RUNNER=$SEARXNG_RUNNER
 SEARXNG_REF=$(searxng_ref)
 SEARXNG_URL=$SEARXNG_URL
 SEARXNG_LABEL=$SEARXNG_LABEL
@@ -359,6 +387,11 @@ MCP_DIR=$MCP_DIR
 MCP_VENV=$MCP_VENV
 MCP_PORT=$MCP_PORT
 MCP_LABEL=$MCP_LABEL
+WEBSEARCH_TAVILY_MODE=$WEBSEARCH_TAVILY_MODE
+WEBSEARCH_TOTAL_TIMEOUT=$WEBSEARCH_TOTAL_TIMEOUT
+WEBSEARCH_SEARXNG_TIMEOUT=$WEBSEARCH_SEARXNG_TIMEOUT
+WEBSEARCH_TAVILY_TIMEOUT=$WEBSEARCH_TAVILY_TIMEOUT
+WEBSEARCH_SUPPLEMENT_MIN_RESULTS=$WEBSEARCH_SUPPLEMENT_MIN_RESULTS
 LOG_DIR=$LOG_DIR
 EOF
 }

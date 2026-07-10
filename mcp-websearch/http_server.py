@@ -3,10 +3,12 @@
 
 Serves:
   POST /mcp    — MCP streamable-http transport (tools/list, tools/call)
-  GET  /health — liveness + SearXNG reachability probe
+  GET  /live   — dependency-free process liveness
+  GET  /ready  — backend readiness (503 when unavailable)
+  GET  /health — compatibility diagnostics (always HTTP 200)
 
 Configuration via environment:
-  SEARXNG_URL   default http://localhost:8888
+  SEARXNG_URL   default http://127.0.0.1:8888
   MCP_PORT      default 8889
   LOG_LEVEL     default INFO
 """
@@ -16,7 +18,7 @@ import os
 
 from server import mcp
 
-SEARXNG_URL = os.environ.get("SEARXNG_URL", "http://localhost:8888").rstrip("/")
+SEARXNG_URL = os.environ.get("SEARXNG_URL", "http://127.0.0.1:8888").rstrip("/")
 MCP_PORT = int(os.environ.get("MCP_PORT", "8889"))
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
 
@@ -24,6 +26,10 @@ logging.basicConfig(
     level=LOG_LEVEL,
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
+# httpx logs full GET URLs at INFO, including SearXNG's `q` query parameter.
+# Keep operational logs from retaining search text.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 if __name__ == "__main__":
     app = mcp.http_app(

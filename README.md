@@ -23,18 +23,33 @@ opt-in for machines that want a local search backend.
 | SearXNG | `http://127.0.0.1:8888` | Metasearch engine (`/healthz`, `/search?format=json`) |
 | MCP websearch (HTTP) | `http://127.0.0.1:8889/mcp` | MCP streamable-http transport |
 | MCP websearch (stdio) | `mcp-websearch/server.py` | MCP stdio transport |
-| MCP health | `GET http://127.0.0.1:8889/health` | Liveness + SearXNG reachability probe |
+| MCP liveness | `GET http://127.0.0.1:8889/live` | Dependency-free process check |
+| MCP readiness | `GET http://127.0.0.1:8889/ready` | Provider readiness; HTTP 503 when unavailable |
+| MCP diagnostics | `GET http://127.0.0.1:8889/health` | Compatibility endpoint; policy, circuits, and last-search quality |
 
-## Search backends & Tavily failover
+## Search backends and Tavily policy
 
-`web_search` is a multi-backend aggregator: **SearXNG first (free, always-on),
-Tavily failover when SearXNG returns empty or errors.** This guarantees
-results even when SearXNG's scraped engines (Brave, Mojeek, etc.) are
-rate-limited or blocked.
+`web_search` always tries the loopback SearXNG service first. External Tavily
+egress is explicit and controlled by `WEBSEARCH_TAVILY_MODE`:
 
-- Results are normalized and deduped by URL across backends.
-- A per-backend circuit breaker trips after N consecutive failures, skipping
-  that backend for a cooldown.
+| Mode | Behavior |
+|---|---|
+| `disabled` | Never contact Tavily; return SearXNG results, empty, or error state |
+| `fallback` (default) | Use Tavily only when SearXNG has no usable results |
+| `supplement` | Add Tavily when deduped SearXNG results are below `WEBSEARCH_SUPPLEMENT_MIN_RESULTS` |
+
+The SearXNG layer uses Brave plus a tracked, defensive Mwmbl JSON adapter so a
+rate-limited scraper does not leave local search without a second broad index.
+The broker overfetches candidates before removing URL fragments and tracking
+parameters, dedupes with SearXNG precedence, then truncates to the requested
+count. A thread-safe per-backend circuit breaker admits only one half-open
+recovery probe after cooldown.
+
+Every payload preserves the legacy `query` / `results` / `suggestions` / `text`
+contract and adds `status`, `backend`, `attempted`, `fallback_reason`,
+`timings_ms`, `provider_states`, `mode`, and `unresponsive_engines`. `status` distinguishes
+`ok`, `empty`, `degraded`, and terminal `error`; only terminal errors carry the
+legacy `error` key.
 
 ### Tavily: keyless by default, optional key upgrade
 
@@ -46,19 +61,17 @@ anonymous rate limit; for higher limits, swap in a free API key
 
 Tavily key resolution (precedence):
 
-1. **Per-call HTTP header** (preferred): `X-Tavily-Key: <key>` — Home Server's
-   `McpSearchProvider` forwards a stored Tavily key on every call. (The
-   standard `Authorization` header is consumed by the MCP transport and does
-   not reach tool code, so a custom header is used.)
-2. **`X-Api-Key: <key>`** — generic fallback header.
-3. **`TAVILY_API_KEY` env var** — for pi-shared/agent stdio consumers that
-   don't send headers, and for the launchd plist.
-4. **None of the above** → keyless mode (free, no account, shared rate limit).
+1. **Per-call `X-Tavily-Key` header** — explicitly identifies a Tavily credential.
+2. **`TAVILY_API_KEY` environment variable** — intended for stdio/server-side consumers.
+3. **Neither** → keyless mode (free, no account, shared rate limit).
 
-When a key is present, it takes precedence over keyless (uses the caller's
-account quota). Home Server stores an optional key in its `FileCredentialStore`
-(entered via the setup UI) and forwards it per-call — local-search never
-persists the key. See the [Consumer wiring](#consumer-wiring) section.
+`Authorization` and generic `X-Api-Key` values are never repurposed as Tavily
+credentials. The installer deliberately does not persist secrets in launchd
+plists; HTTP clients should forward Tavily keys explicitly, and stdio users
+should inject `TAVILY_API_KEY` through their process environment.
+
+When a key is present, it takes precedence over keyless and uses the caller's
+account quota. Local-search never persists per-call keys.
 
 ## Requirements
 
@@ -88,13 +101,20 @@ What `install.sh` does (delegates to `scripts/local-search install`):
    `~/Library/LaunchAgents/` with logs under `~/Library/Logs/local-search/`.
 5. Starts services (SearXNG first, then MCP) and runs health verification.
 
-Flags / overrides:
+Flags / non-secret policy overrides:
 
 ```bash
-./install.sh --no-start                       # bootstrap without starting
-LOCAL_SEARCH_LOG_DIR=~/logs ./install.sh      # custom log dir
-SEARXNG_URL=http://localhost:8888 ./install.sh
+./install.sh --no-start                          # bootstrap without starting
+LOCAL_SEARCH_LOG_DIR=~/logs ./install.sh         # custom log dir
+WEBSEARCH_TAVILY_MODE=disabled ./install.sh      # SearXNG-only privacy mode
+WEBSEARCH_TAVILY_MODE=supplement \
+  WEBSEARCH_SUPPLEMENT_MIN_RESULTS=5 ./install.sh
 ```
+
+Installed policy defaults are `18s` total, `7s` SearXNG, and `8s` Tavily.
+`WEBSEARCH_TOTAL_TIMEOUT` is hard-capped at 18 seconds so Pi's 20-second MCP
+budget retains transport/serialization margin. `WEBSEARCH_SEARCH_TIMEOUT`
+remains a deprecated alias for `WEBSEARCH_SEARXNG_TIMEOUT`.
 
 ## Operator CLI
 
@@ -187,12 +207,18 @@ installed separately on machines that want a local search backend.
 - **SSRF guard**: `web_fetch` rejects loopback, RFC1918, link-local, multicast,
   reserved, unspecified IPs and `localhost`/`.localhost` domains, including
   hostnames that resolve to private IPs and redirect chains to private IPs.
-- **Retries**: `web_search` retries SearXNG once with backoff; `_searxng_request`
-  never raises — backend outages surface as structured error payloads.
-- **Consistent error payloads**: search errors return JSON with `error` + `text`;
-  fetch errors return `Fetch error: <message>` (stable prefix for callers/tests).
-- **Health probe**: `GET /health` reports `ok` / `degraded` (MCP up but SearXNG
-  unreachable) plus SearXNG latency — always HTTP 200 so naive probes don't alarm.
+- **Bounded search**: one total deadline contains SearXNG retries and Tavily
+  fallback; timeout and circuit states remain visible in result metadata.
+- **Consistent states**: searches distinguish `ok`, `empty`, `degraded`, and
+  terminal `error`; fetch errors retain the stable `Fetch error:` prefix.
+- **Health separation**: `/live` is dependency-free; `/ready` returns 503 only
+  when no policy-allowed backend is usable; `/health` remains HTTP 200 for
+  compatibility and exposes safe breaker/policy/last-search metadata, including
+  recent per-provider outcomes, without retaining query text, URLs, headers, or keys.
+- **Local binding**: SearXNG and the MCP HTTP broker listen on loopback only.
+- **Query-log hygiene**: broker HTTP client logging suppresses full request
+  URLs, and the tracked SearXNG runner redacts `q`/`query`/`s` parameters from
+  operational log messages before they are written.
 - **Dependency-ordered restart**: MCP is stopped before SearXNG and started after
   SearXNG is healthy; ports are checked free to avoid bind races.
 - **KeepAlive**: both services auto-restart on crash (`ThrottleInterval` 5s).
@@ -203,10 +229,10 @@ installed separately on machines that want a local search backend.
 cd mcp-websearch && uv run pytest -q
 ```
 
-Covers the SSRF rejection matrix (loopback, RFC1918, link-local, IPv6 local,
-localhost domains, DNS-resolves-to-private, non-http schemes, public allow
-cases), `web_fetch` error contract, `web_search` error/empty/success payload
-shapes vs the `McpSearchProvider` contract, and `tools/list`.
+Covers the SSRF rejection matrix, `web_fetch` errors, compatibility payloads,
+Tavily disabled/fallback/supplement policy, overfetch/dedupe, bounded stage
+timeouts, distinct empty/degraded/error states, readiness, safe last-search
+metadata, single-probe half-open circuits, key separation, and `tools/list`.
 
 ## Layout
 
@@ -216,11 +242,13 @@ local-search/
 ├── scripts/
 │   └── local-search              # operator CLI (install/uninstall/start/stop/...)
 ├── mcp-websearch/
-│   ├── server.py                 # FastMCP tools web_search/web_fetch + /health route
+│   ├── server.py                 # MCP tools, provider policy, and health routes
 │   ├── http_server.py            # HTTP transport entrypoint (uvicorn)
 │   ├── pyproject.toml            # uv project (fastmcp, httpx; dev: pytest)
 │   └── tests/test_server.py
 └── searxng/
+    ├── engines/mwmbl_safe.py     # Defensive keyless Mwmbl JSON adapter
+    ├── run.py                    # SearXNG entry point with local engines + log redaction
     ├── settings.yml              # SearXNG config (engines, bind, json format)
     ├── SEARXNG_REF               # pinned SearXNG commit for reproducible installs
     └── src/                      # SearXNG checkout + venv (gitignored, bootstrapped)

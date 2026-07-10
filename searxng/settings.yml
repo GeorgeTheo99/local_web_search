@@ -13,7 +13,7 @@ search:
 
 server:
   secret_key: "searxng-local-secret-key-change-me"
-  bind_address: "0.0.0.0"
+  bind_address: "127.0.0.1"
   port: 8888
   limiter: false
   image_proxy: true
@@ -32,11 +32,17 @@ engines:
     engine: brave
     shortcut: br
     disabled: false
-  - name: mojeek
-    engine: mojeek
-    shortcut: mj
+  - name: mwmbl
+    engine: mwmbl_safe
+    shortcut: mwm
+    weight: 0.7
+    timeout: 5.0
     disabled: false
   # Failing engines — disabled due to persistent bot blocks / rate limits.
+  - name: mojeek      # persistent HTTP 403 from this host
+    engine: mojeek
+    shortcut: mj
+    disabled: true
   - name: google
     engine: google
     shortcut: g
