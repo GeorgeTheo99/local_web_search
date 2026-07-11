@@ -1,4 +1,4 @@
 # Pinned SearXNG source ref for reproducible installs.
 # Format: <commit-sha>  # <date> <subject>
 # Update with: ./scripts/local-search update-searxng-ref <sha>
-0716de6bc89748d1823fc61460d85cf4ba7393a9  # 2026-03-06 [upd] github-actions bump
+4abac08de56545f30c56439eb887d3a7668d6467  # 2026-07-10 [l10n] update translations from Weblate

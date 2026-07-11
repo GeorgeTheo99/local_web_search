@@ -1,4 +1,14 @@
-use_default_settings: true
+use_default_settings:
+  engines:
+    keep_only:
+      - google cse
+      - duckduckgo
+      - bing
+      - startpage
+      - mwmbl
+      - wikipedia
+      - github
+      - arxiv
 
 general:
   instance_name: "Local SearXNG"
@@ -7,6 +17,13 @@ search:
   safe_search: 0
   autocomplete: ""
   default_lang: "en"
+  suspended_times:
+    SearxEngineAccessDenied: 86400
+    SearxEngineCaptcha: 86400
+    SearxEngineTooManyRequests: 3600
+    cf_SearxEngineCaptcha: 1296000
+    cf_SearxEngineAccessDenied: 86400
+    recaptcha_SearxEngineCaptcha: 604800
   formats:
     - html
     - json
@@ -23,14 +40,20 @@ outgoing:
   # SearXNG rotates through these per request.
   useragent_suffix: ""
   request_timeout: 5.0
+  retries: 0
   pool_connections: 100
   pool_maxsize: 20
 
 engines:
-  # Primary engines — own index or real API, block-resistant for self-hosted.
-  - name: brave
-    engine: brave
-    shortcut: br
+  # Broad indexes verified from this host. Keep the custom defensive Mwmbl
+  # adapter; upstream defaults provide the other implementations.
+  - name: google cse
+    disabled: false
+  - name: duckduckgo
+    disabled: false
+  - name: bing
+    disabled: false
+  - name: startpage
     disabled: false
   - name: mwmbl
     engine: mwmbl_safe
@@ -38,41 +61,10 @@ engines:
     weight: 0.7
     timeout: 5.0
     disabled: false
-  # Failing engines — disabled due to persistent bot blocks / rate limits.
-  - name: mojeek      # persistent HTTP 403 from this host
-    engine: mojeek
-    shortcut: mj
-    disabled: true
-  - name: google
-    engine: google
-    shortcut: g
-    disabled: true
-  - name: duckduckgo
-    engine: duckduckgo
-    shortcut: ddg
-    disabled: true
-  - name: bing
-    engine: bing
-    shortcut: b
-    disabled: true
-  - name: qwant        # rate-limits self-hosted instances under load
-    engine: qwant
-    shortcut: qw
-    disabled: true
-  - name: startpage    # Google proxy; blocks self-hosted scrapers
-    engine: startpage
-    shortcut: sp
-    disabled: true
-  # Knowledge/research engines — own indexes, never block.
+  # Focused knowledge and research indexes.
   - name: wikipedia
-    engine: wikipedia
-    shortcut: wp
     disabled: false
   - name: github
-    engine: github
-    shortcut: gh
     disabled: false
   - name: arxiv
-    engine: arxiv
-    shortcut: arx
     disabled: false

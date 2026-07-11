@@ -38,8 +38,15 @@ egress is explicit and controlled by `WEBSEARCH_TAVILY_MODE`:
 | `fallback` (default) | Use Tavily only when SearXNG has no usable results |
 | `supplement` | Add Tavily when deduped SearXNG results are below `WEBSEARCH_SUPPLEMENT_MIN_RESULTS` |
 
-The SearXNG layer uses Brave plus a tracked, defensive Mwmbl JSON adapter so a
-rate-limited scraper does not leave local search without a second broad index.
+The SearXNG layer deliberately keeps only a tested engine set: Google CSE,
+DuckDuckGo, Bing, Startpage, the tracked defensive Mwmbl JSON adapter, and the
+focused Wikipedia/GitHub/arXiv engines. HTML Google, Qwant, Mojeek, and the
+rate-limited Brave web scraper stay excluded. The `keep_only` policy prevents
+new upstream defaults from silently joining every brokered search. Google CSE
+is upstream's temporary replacement for its blocked HTML Google adapter and is
+expected to require replacement when Google retires the current CSE path in
+2027.
+
 The broker overfetches candidates before removing URL fragments and tracking
 parameters, dedupes with SearXNG precedence, then truncates to the requested
 count. A thread-safe per-backend circuit breaker admits only one half-open
