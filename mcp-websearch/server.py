@@ -119,8 +119,14 @@ PDF_MIN_TEXT_CHARS = _bounded_int("WEBSEARCH_PDF_MIN_TEXT_CHARS", 200, minimum=2
 PDF_TEXT_MAX_BYTES = _bounded_int("WEBSEARCH_PDF_TEXT_MAX_BYTES", 2 * 1024 * 1024, minimum=65536, maximum=10 * 1024 * 1024)
 PDF_RENDER_MAX_BYTES = _bounded_int("WEBSEARCH_PDF_RENDER_MAX_BYTES", 64 * 1024 * 1024, minimum=1024 * 1024, maximum=256 * 1024 * 1024)
 PDF_STDERR_MAX_BYTES = 256 * 1024
-PDFTOTEXT = shutil.which("pdftotext")
-PDFTOPPM = shutil.which("pdftoppm")
+PDFTOTEXT = shutil.which("pdftotext") or next(
+    (path for path in ("/opt/homebrew/bin/pdftotext", "/usr/local/bin/pdftotext") if Path(path).is_file()),
+    None,
+)
+PDFTOPPM = shutil.which("pdftoppm") or next(
+    (path for path in ("/opt/homebrew/bin/pdftoppm", "/usr/local/bin/pdftoppm") if Path(path).is_file()),
+    None,
+)
 SWIFT = "/usr/bin/swift" if Path("/usr/bin/swift").is_file() else None
 MACOS_VISION_OCR = Path(__file__).with_name("macos_vision_ocr.swift")
 SEARCH_MAX_RETRIES = _bounded_int("WEBSEARCH_SEARCH_MAX_RETRIES", 1, minimum=0, maximum=3)
