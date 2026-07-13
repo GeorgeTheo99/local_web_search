@@ -313,6 +313,7 @@ restart_services() {
   bootstrap_service "$SEARXNG_LABEL"
   wait_http "$SEARXNG_URL/healthz" "OK" 30 || warn "searxng did not come up"
   bootstrap_service "$MCP_LABEL"
+  wait_http "http://127.0.0.1:${MCP_PORT}/live" '"status":"ok"' 30
 }
 
 _wait_port_free() { # port [timeout]
