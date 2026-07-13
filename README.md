@@ -35,7 +35,7 @@ egress is explicit and controlled by `WEBSEARCH_TAVILY_MODE`:
 | Mode | Behavior |
 |---|---|
 | `disabled` | Never contact Tavily; return SearXNG results, empty, or error state |
-| `fallback` (default) | Use Tavily only when SearXNG has no usable results |
+| `fallback` (default) | Use Tavily when SearXNG has no results or reports degraded engines; degraded nonempty results are retained and supplemented |
 | `supplement` | Add Tavily when deduped SearXNG results are below `WEBSEARCH_SUPPLEMENT_MIN_RESULTS` |
 
 The SearXNG layer deliberately keeps only a tested engine set: Google CSE,
@@ -85,6 +85,7 @@ account quota. Local-search never persists per-call keys.
 - macOS (launchd-managed)
 - `uv` ([astral-sh/uv](https://github.com/astral-sh/uv)) — `brew install uv`
 - `git`, `python3`, `curl`
+- Optional but recommended for PDF reading: Poppler (`brew install poppler`). On macOS, scanned PDFs then fall back to bounded Apple Vision OCR through `/usr/bin/swift`; without these tools, `web_fetch` returns a clear extraction error instead of binary PDF bytes.
 - SearXNG source is cloned from `https://github.com/searxng/searxng.git` at the
   pinned ref in [`searxng/SEARXNG_REF`](searxng/SEARXNG_REF).
 
@@ -214,6 +215,7 @@ installed separately on machines that want a local search backend.
 - **SSRF guard**: `web_fetch` rejects loopback, RFC1918, link-local, multicast,
   reserved, unspecified IPs and `localhost`/`.localhost` domains, including
   hostnames that resolve to private IPs and redirect chains to private IPs.
+- **Readable bounded fetches**: responses are byte-capped; HTML preserves links to attachments; text PDFs use Poppler; scanned PDFs use bounded macOS Vision OCR when available. Unsupported binary data is never presented as successfully read text.
 - **Bounded search**: one total deadline contains SearXNG retries and Tavily
   fallback; timeout and circuit states remain visible in result metadata.
 - **Consistent states**: searches distinguish `ok`, `empty`, `degraded`, and
@@ -249,7 +251,8 @@ local-search/
 ├── scripts/
 │   └── local-search              # operator CLI (install/uninstall/start/stop/...)
 ├── mcp-websearch/
-│   ├── server.py                 # MCP tools, provider policy, and health routes
+│   ├── server.py                 # MCP tools, provider policy, PDF extraction, and health routes
+│   ├── macos_vision_ocr.swift    # optional scanned-PDF OCR helper
 │   ├── http_server.py            # HTTP transport entrypoint (uvicorn)
 │   ├── pyproject.toml            # uv project (fastmcp, httpx; dev: pytest)
 │   └── tests/test_server.py

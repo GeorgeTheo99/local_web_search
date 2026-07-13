@@ -155,6 +155,216 @@ async def test_web_fetch_rejects_metadata_ip():
     assert text.startswith("Fetch error:")
 
 
+def test_html_extractor_preserves_safe_attachment_links_and_base_href():
+    parser = srv._TextExtractor("https://example.com/code/")
+    parser.feed(
+        '<base href="https://cdn.example.com/current/">'
+        '<p>Schedule <a href="rules.pdf"><span>Attachment 1</span></a></p>'
+        '<a href="javascript:alert(1)">unsafe</a>'
+        '<script><a href="/bad.pdf">ignore me</a></script>'
+    )
+    text = parser.get_text()
+    assert "Schedule" in text
+    assert "[Attachment 1](https://cdn.example.com/current/rules.pdf)" in text
+    assert "javascript:" not in text
+    assert "bad.pdf" not in text
+
+
+class _FakeStream:
+    def __init__(self, response):
+        self.response = response
+
+    async def __aenter__(self):
+        return self.response
+
+    async def __aexit__(self, *args):
+        return None
+
+
+class _StaticResponse:
+    is_redirect = False
+
+    def __init__(self, url: str, body: bytes, content_type: str):
+        self.url = srv.httpx.URL(url)
+        self.body = body
+        self.headers = {"content-type": content_type}
+
+    def raise_for_status(self):
+        return None
+
+    async def aiter_raw(self):
+        yield self.body
+
+
+@pytest.mark.asyncio
+async def test_web_fetch_pdf_returns_plain_extracted_text(monkeypatch):
+    class FakeClient:
+        def stream(self, method, url, **kwargs):
+            return _FakeStream(_StaticResponse(url, b"%PDF-1.7 fake fixture", "application/pdf"))
+
+    async def allow_url(url):
+        return None
+
+    async def fake_client():
+        return FakeClient()
+
+    async def fake_extract(body):
+        return "AC district Lot Size: 10 acres", "macos_vision_ocr"
+
+    monkeypatch.setattr(srv, "_validate_public_http_url", allow_url)
+    monkeypatch.setattr(srv, "_client", fake_client)
+    monkeypatch.setattr(srv, "_extract_pdf_text", fake_extract)
+    result = await _call_tool(
+        "web_fetch",
+        {"url": "https://example.com/Schedule.pdf", "max_chars": 5000},
+    )
+    text = _result_text(result)
+    assert text.startswith("PDF: Schedule.pdf\nSource: https://example.com/Schedule.pdf")
+    assert "Extraction: macos_vision_ocr" in text
+    assert "AC district Lot Size: 10 acres" in text
+
+
+@pytest.mark.asyncio
+async def test_web_fetch_pdf_output_limit_uses_error_contract(monkeypatch):
+    class FakeClient:
+        def stream(self, method, url, **kwargs):
+            return _FakeStream(_StaticResponse(url, b"%PDF-1.7 fake fixture", "application/pdf"))
+
+    async def allow_url(url):
+        return None
+
+    async def fake_client():
+        return FakeClient()
+
+    async def limited_extract(body):
+        raise srv._OutputLimitExceeded("PDF command output exceeds limit")
+
+    monkeypatch.setattr(srv, "_validate_public_http_url", allow_url)
+    monkeypatch.setattr(srv, "_client", fake_client)
+    monkeypatch.setattr(srv, "_extract_pdf_text", limited_extract)
+    result = await _call_tool("web_fetch", {"url": "https://example.com/Schedule.pdf"})
+    assert _result_text(result).startswith("Fetch error: PDF extraction failed: PDF command output exceeds limit")
+
+
+def test_truncation_helpers_never_exceed_requested_length():
+    assert len(srv._truncate_text("x" * 2000, 1000, "\n... (truncated)")) == 1000
+    assert len(srv._pdf_fetch_text("https://example.com/a.pdf", "x" * 2000, "ocr", 1000)) == 1000
+
+
+@pytest.mark.asyncio
+async def test_web_fetch_never_decodes_unreadable_pdf_as_binary_text(monkeypatch):
+    class FakeClient:
+        def stream(self, method, url, **kwargs):
+            return _FakeStream(_StaticResponse(url, b"%PDF-1.4\x00binary stream", "application/octet-stream"))
+
+    async def allow_url(url):
+        return None
+
+    async def fake_client():
+        return FakeClient()
+
+    async def fake_extract(body):
+        return None, "PDF OCR produced no meaningful text"
+
+    monkeypatch.setattr(srv, "_validate_public_http_url", allow_url)
+    monkeypatch.setattr(srv, "_client", fake_client)
+    monkeypatch.setattr(srv, "_extract_pdf_text", fake_extract)
+    result = await _call_tool("web_fetch", {"url": "https://example.com/scan.pdf"})
+    text = _result_text(result)
+    assert text.startswith("Fetch error: PDF OCR produced no meaningful text")
+    assert "%PDF" not in text
+
+
+@pytest.mark.asyncio
+async def test_pdf_command_output_limit_terminates_process():
+    with pytest.raises(srv._OutputLimitExceeded):
+        await srv._run_pdf_command(
+            [srv.sys.executable, "-c", "import sys; sys.stdout.write('x' * 10000)"],
+            srv.time.monotonic() + 5,
+            stdout_limit=100,
+        )
+
+
+@pytest.mark.asyncio
+async def test_short_pdftotext_output_is_preserved_when_ocr_unavailable(monkeypatch):
+    async def fake_command(args, deadline, **kwargs):
+        return 0, b"Lot Size: 10 acres", b""
+
+    monkeypatch.setattr(srv, "PDFTOTEXT", "/fake/pdftotext")
+    monkeypatch.setattr(srv, "PDFTOPPM", None)
+    monkeypatch.setattr(srv, "_run_pdf_command", fake_command)
+    text, method = await srv._extract_pdf_text(b"%PDF-1.4 fixture")
+    assert text == "Lot Size: 10 acres"
+    assert method == "pdftotext_partial"
+
+
+@pytest.mark.asyncio
+async def test_web_fetch_stops_stream_at_byte_limit(monkeypatch):
+    class ChunkedResponse:
+        is_redirect = False
+        headers = {"content-type": "text/plain"}
+        url = srv.httpx.URL("https://example.com/large")
+
+        def raise_for_status(self):
+            return None
+
+        async def aiter_raw(self):
+            yield b"a" * 6
+            yield b"b" * 6
+
+    class FakeClient:
+        def stream(self, method, url, **kwargs):
+            return _FakeStream(ChunkedResponse())
+
+    async def allow_url(url):
+        return None
+
+    async def fake_client():
+        return FakeClient()
+
+    monkeypatch.setattr(srv, "FETCH_MAX_BYTES", 10)
+    monkeypatch.setattr(srv, "_validate_public_http_url", allow_url)
+    monkeypatch.setattr(srv, "_client", fake_client)
+    result = await _call_tool("web_fetch", {"url": "https://example.com/large"})
+    assert _result_text(result) == "Fetch error: response exceeds 10 byte limit"
+
+
+@pytest.mark.asyncio
+async def test_web_fetch_honors_small_max_chars(monkeypatch):
+    class FakeClient:
+        def stream(self, method, url, **kwargs):
+            return _FakeStream(_StaticResponse(url, b"abcdefghijklmnopqrstuvwxyz", "text/plain"))
+
+    async def allow_url(url):
+        return None
+
+    async def fake_client():
+        return FakeClient()
+
+    monkeypatch.setattr(srv, "_validate_public_http_url", allow_url)
+    monkeypatch.setattr(srv, "_client", fake_client)
+    result = await _call_tool("web_fetch", {"url": "https://example.com/text", "max_chars": 10})
+    assert len(_result_text(result)) == 10
+
+
+@pytest.mark.asyncio
+async def test_web_fetch_rejects_binary_mislabeled_as_text(monkeypatch):
+    class FakeClient:
+        def stream(self, method, url, **kwargs):
+            return _FakeStream(_StaticResponse(url, b"PNG\x00\x01\x02binary", "text/plain"))
+
+    async def allow_url(url):
+        return None
+
+    async def fake_client():
+        return FakeClient()
+
+    monkeypatch.setattr(srv, "_validate_public_http_url", allow_url)
+    monkeypatch.setattr(srv, "_client", fake_client)
+    result = await _call_tool("web_fetch", {"url": "https://example.com/fake.txt"})
+    assert _result_text(result) == "Fetch error: unsupported binary content type: text/plain"
+
+
 # --------------------------------------------------------------------------- #
 # web_search payload contract.
 # --------------------------------------------------------------------------- #
@@ -296,6 +506,36 @@ async def test_tavily_disabled_surfaces_searxng_degradation(monkeypatch):
     assert payload["status"] == "degraded"
     assert payload["attempted"] == ["searxng"]
     assert payload["fallback_reason"] == "searxng_degraded"
+
+
+@pytest.mark.asyncio
+async def test_fallback_mode_supplements_degraded_nonempty_results(monkeypatch):
+    monkeypatch.setattr(srv, "TAVILY_MODE", "fallback")
+
+    async def fake_request(path, params, timeout=None):
+        return {
+            "results": [
+                {"title": f"Wrong town {index}", "url": f"https://wrong.example/{index}", "content": "irrelevant", "engine": "bing"}
+                for index in range(10)
+            ],
+            "suggestions": [],
+            "unresponsive_engines": [["duckduckgo", "blocked"]],
+        }
+
+    async def fake_tavily(query, num_results, api_key):
+        return [
+            {"title": "Primary source", "url": "https://town.example/code", "domain": "town.example", "snippet": "code", "engine": "tavily", "score": 0.9},
+        ], True
+
+    monkeypatch.setattr(srv, "_searxng_request", fake_request)
+    monkeypatch.setattr(srv, "_tavily_search", fake_tavily)
+    result = await _call_tool("web_search", {"query": "town zoning", "num_results": 5})
+    payload = json.loads(_result_text(result))
+    assert payload["attempted"] == ["searxng", "tavily"]
+    assert payload["fallback_reason"] == "searxng_degraded"
+    assert payload["backend"] == "searxng+tavily"
+    assert len(payload["results"]) == 5
+    assert payload["results"][-1]["url"] == "https://town.example/code"
 
 
 @pytest.mark.asyncio
