@@ -10,6 +10,8 @@
 #   local-search uninstall             stop services, remove plists (keeps src/venvs)
 #   local-search start | stop | restart
 #   local-search status                launchd state + /health probes
+#   local-search stats [24h|7d|30d]    query-free aggregate telemetry
+#   local-search telemetry-reset --yes explicitly erase telemetry events
 #   local-search verify                health + tools/list smoke
 #   local-search logs [searxng|mcp] [-f]
 #   local-search update                git pull + rebuild + restart
@@ -32,6 +34,23 @@ SEARXNG_REPO="https://github.com/searxng/searxng.git"
 
 MCP_DIR="$ROOT_DIR/mcp-websearch"
 
+SEARXNG_LABEL="com.local.searxng"
+MCP_LABEL="com.local.mcp-websearch"
+PLIST_DIR="$HOME/Library/LaunchAgents"
+MCP_PLIST="$PLIST_DIR/$MCP_LABEL.plist"
+INSTALL_CONFIG="$ROOT_DIR/data/install.env"
+
+installed_config_value() {
+  [ -f "$INSTALL_CONFIG" ] || return 0
+  awk -v prefix="$1=" 'index($0, prefix) == 1 {print substr($0, length(prefix) + 1); exit}' \
+    "$INSTALL_CONFIG"
+}
+
+installed_mcp_env() {
+  [ -f "$MCP_PLIST" ] || return 0
+  /usr/libexec/PlistBuddy -c "Print :EnvironmentVariables:$1" "$MCP_PLIST" 2>/dev/null || true
+}
+
 SEARXNG_URL="${SEARXNG_URL:-http://127.0.0.1:8888}"
 MCP_PORT="${MCP_PORT:-8889}"
 WEBSEARCH_TAVILY_MODE="${WEBSEARCH_TAVILY_MODE:-fallback}"
@@ -39,11 +58,22 @@ WEBSEARCH_TOTAL_TIMEOUT="${WEBSEARCH_TOTAL_TIMEOUT:-18}"
 WEBSEARCH_SEARXNG_TIMEOUT="${WEBSEARCH_SEARXNG_TIMEOUT:-7}"
 WEBSEARCH_TAVILY_TIMEOUT="${WEBSEARCH_TAVILY_TIMEOUT:-8}"
 WEBSEARCH_SUPPLEMENT_MIN_RESULTS="${WEBSEARCH_SUPPLEMENT_MIN_RESULTS:-5}"
+LOCAL_SEARCH_TELEMETRY_ENABLED="${LOCAL_SEARCH_TELEMETRY_ENABLED:-$(installed_config_value LOCAL_SEARCH_TELEMETRY_ENABLED)}"
+LOCAL_SEARCH_TELEMETRY_ENABLED="${LOCAL_SEARCH_TELEMETRY_ENABLED:-$(installed_mcp_env LOCAL_SEARCH_TELEMETRY_ENABLED)}"
+LOCAL_SEARCH_TELEMETRY_ENABLED="${LOCAL_SEARCH_TELEMETRY_ENABLED:-true}"
 
-SEARXNG_LABEL="com.local.searxng"
-MCP_LABEL="com.local.mcp-websearch"
-PLIST_DIR="$HOME/Library/LaunchAgents"
 LOG_DIR="${LOCAL_SEARCH_LOG_DIR:-$HOME/Library/Logs/local-search}"
+LOCAL_SEARCH_DATA_DIR="${LOCAL_SEARCH_DATA_DIR:-$(installed_config_value LOCAL_SEARCH_DATA_DIR)}"
+LOCAL_SEARCH_DATA_DIR="${LOCAL_SEARCH_DATA_DIR:-$(installed_mcp_env LOCAL_SEARCH_DATA_DIR)}"
+LOCAL_SEARCH_DATA_DIR="${LOCAL_SEARCH_DATA_DIR:-$ROOT_DIR/data}"
+case "$LOCAL_SEARCH_DATA_DIR" in
+  /*) ;;
+  *) LOCAL_SEARCH_DATA_DIR="$ROOT_DIR/$LOCAL_SEARCH_DATA_DIR" ;;
+esac
+case "$(printf '%s' "$LOCAL_SEARCH_TELEMETRY_ENABLED" | tr '[:upper:]' '[:lower:]' | xargs)" in
+  0|false|no|off) LOCAL_SEARCH_TELEMETRY_ENABLED=false ;;
+  *) LOCAL_SEARCH_TELEMETRY_ENABLED=true ;;
+esac
 
 SEARXNG_VENV="$SEARXNG_SRC_DIR/.venv"
 MCP_VENV="$MCP_DIR/.venv"
@@ -61,6 +91,23 @@ warn() { printf '%s!%s %s\n' "$C_YELLOW" "$C_RESET" "$*" >&2; }
 die()  { printf '%s✗%s %s\n' "$C_RED" "$C_RESET" "$*" >&2; exit 1; }
 
 require_cmd() { command -v "$1" >/dev/null 2>&1 || die "required command not found: $1 (install it and retry)"; }
+
+ensure_data_dir() {
+  mkdir -p "$LOCAL_SEARCH_DATA_DIR"
+  chmod 700 "$LOCAL_SEARCH_DATA_DIR"
+}
+
+persist_install_config() {
+  mkdir -p "$(dirname "$INSTALL_CONFIG")"
+  chmod 700 "$(dirname "$INSTALL_CONFIG")"
+  (umask 077; printf 'LOCAL_SEARCH_DATA_DIR=%s\nLOCAL_SEARCH_TELEMETRY_ENABLED=%s\n' \
+    "$LOCAL_SEARCH_DATA_DIR" "$LOCAL_SEARCH_TELEMETRY_ENABLED" >"$INSTALL_CONFIG")
+  chmod 600 "$INSTALL_CONFIG"
+}
+
+telemetry_enabled() {
+  [ "$LOCAL_SEARCH_TELEMETRY_ENABLED" = "true" ]
+}
 
 # --------------------------------------------------------------------------- #
 # Prerequisites.
@@ -192,6 +239,8 @@ mcp_plist() {
   <key>WEBSEARCH_SEARXNG_TIMEOUT</key><string>${WEBSEARCH_SEARXNG_TIMEOUT}</string>
   <key>WEBSEARCH_TAVILY_TIMEOUT</key><string>${WEBSEARCH_TAVILY_TIMEOUT}</string>
   <key>WEBSEARCH_SUPPLEMENT_MIN_RESULTS</key><string>${WEBSEARCH_SUPPLEMENT_MIN_RESULTS}</string>
+  <key>LOCAL_SEARCH_DATA_DIR</key><string>${LOCAL_SEARCH_DATA_DIR}</string>
+  <key>LOCAL_SEARCH_TELEMETRY_ENABLED</key><string>${LOCAL_SEARCH_TELEMETRY_ENABLED}</string>
   <key>FASTMCP_SHOW_SERVER_BANNER</key><string>false</string>
 </dict>
 <key>StandardOutPath</key><string>${LOG_DIR}/mcp-websearch.log</string>
@@ -205,6 +254,8 @@ EOF
 
 install_plists() {
   mkdir -p "$LOG_DIR"
+  ensure_data_dir
+  persist_install_config
   write_plist "$SEARXNG_LABEL" "$(searxng_plist)"
   write_plist "$MCP_LABEL" "$(mcp_plist)"
 }
@@ -271,6 +322,7 @@ _wait_port_free() { # port [timeout]
     sleep 1; i=$((i+1))
   done
   warn "port $port still bound after ${t}s"
+  return 1
 }
 
 # --------------------------------------------------------------------------- #
@@ -293,6 +345,9 @@ verify() {
   sleep 2
   wait_http "http://127.0.0.1:${MCP_PORT}/live" '"status":"ok"' 30 || rc=1
   wait_http "http://127.0.0.1:${MCP_PORT}/ready" '"ready":true' 30 || rc=1
+  if telemetry_enabled; then
+    wait_http "http://127.0.0.1:${MCP_PORT}/stats?window=24h" '"available":true' 30 || rc=1
+  fi
   log "MCP tools/list"
   local tools
   tools="$(curl -fsS --max-time 5 -X POST "http://127.0.0.1:${MCP_PORT}/mcp" \
@@ -312,7 +367,7 @@ status() {
   printf '%-22s %s\n' "searxng health:" "$(curl -fsS --max-time 3 "$SEARXNG_URL/healthz" 2>/dev/null || echo 'DOWN')"
   local h
   h="$(curl -fsS --max-time 3 "http://127.0.0.1:${MCP_PORT}/health" 2>/dev/null || echo 'DOWN')"
-  printf '%-22s %s\n' "mcp /health:" "$(echo "$h" | python3 -c 'import sys,json;d=json.load(sys.stdin);last=d.get("last_search") or {};print(d.get("status","?"),"ready="+str(d.get("ready","?")),"mode="+str(d.get("policy",{}).get("tavily_mode","?")),"last_backend="+str(last.get("backend","none")))' 2>/dev/null || echo "$h")"
+  printf '%-22s %s\n' "mcp /health:" "$(echo "$h" | python3 -c 'import sys,json;d=json.load(sys.stdin);last=d.get("last_search") or {};telemetry=d.get("telemetry") or {};print(d.get("status","?"),"ready="+str(d.get("ready","?")),"mode="+str(d.get("policy",{}).get("tavily_mode","?")),"telemetry="+str(telemetry.get("available","?")),"last_backend="+str(last.get("backend","none")))' 2>/dev/null || echo "$h")"
 }
 
 # --------------------------------------------------------------------------- #
@@ -345,7 +400,7 @@ cmd_uninstall() {
   log "Uninstalling local-search services"
   stop_services
   remove_plists
-  ok "Uninstalled (src and venvs retained; rerun 'install' to restore)"
+  ok "Uninstalled (src, venvs, and telemetry retained; rerun 'install' to restore)"
 }
 
 cmd_update() {
@@ -392,8 +447,48 @@ WEBSEARCH_TOTAL_TIMEOUT=$WEBSEARCH_TOTAL_TIMEOUT
 WEBSEARCH_SEARXNG_TIMEOUT=$WEBSEARCH_SEARXNG_TIMEOUT
 WEBSEARCH_TAVILY_TIMEOUT=$WEBSEARCH_TAVILY_TIMEOUT
 WEBSEARCH_SUPPLEMENT_MIN_RESULTS=$WEBSEARCH_SUPPLEMENT_MIN_RESULTS
+LOCAL_SEARCH_DATA_DIR=$LOCAL_SEARCH_DATA_DIR
+LOCAL_SEARCH_TELEMETRY_ENABLED=$LOCAL_SEARCH_TELEMETRY_ENABLED
 LOG_DIR=$LOG_DIR
 EOF
+}
+
+cmd_stats() {
+  local window="${1:-24h}"
+  case "$window" in
+    24h|7d|30d) ;;
+    *) die "usage: local-search stats [24h|7d|30d]" ;;
+  esac
+  curl -fsS --max-time 10 "http://127.0.0.1:${MCP_PORT}/stats?window=${window}" \
+    | python3 -m json.tool
+}
+
+cmd_telemetry_reset() {
+  [ "${1:-}" = "--yes" ] || die "usage: local-search telemetry-reset --yes"
+  [ -x "$MCP_VENV/bin/python" ] || die "MCP venv missing; run 'local-search install' first"
+  ensure_data_dir
+
+  # The running process owns an asynchronous writer queue. Stop it cleanly so
+  # a pre-reset event cannot be written back after the database is cleared.
+  local was_loaded=0 rc=0
+  if [ -f "$MCP_PLIST" ] && launchctl print "gui/$(id -u)/$MCP_LABEL" >/dev/null 2>&1; then
+    was_loaded=1
+    bootout_service "$MCP_LABEL"
+    if launchctl print "gui/$(id -u)/$MCP_LABEL" >/dev/null 2>&1; then
+      die "could not stop $MCP_LABEL; telemetry was not reset"
+    fi
+    _wait_port_free "$MCP_PORT" || die "MCP port still active; telemetry was not reset"
+  fi
+
+  "$MCP_VENV/bin/python" "$MCP_DIR/telemetry.py" reset \
+    --data-dir "$LOCAL_SEARCH_DATA_DIR" || rc=$?
+
+  if [ "$was_loaded" -eq 1 ]; then
+    bootstrap_service "$MCP_LABEL"
+    wait_http "http://127.0.0.1:${MCP_PORT}/live" '"status":"ok"' 30 \
+      || rc=1
+  fi
+  return "$rc"
 }
 
 cmd_logs() {
@@ -408,6 +503,7 @@ cmd_logs() {
 }
 
 cmd_mcp_stdio() {
+  export LOCAL_SEARCH_DATA_DIR LOCAL_SEARCH_TELEMETRY_ENABLED
   exec "$MCP_VENV/bin/python" "$MCP_DIR/server.py"
 }
 
@@ -428,6 +524,8 @@ main() {
     stop) stop_services; ok "stopped" ;;
     restart) check_prereqs; restart_services; ok "restarted" ;;
     status) status ;;
+    stats) shift; cmd_stats "$@" ;;
+    telemetry-reset) shift; cmd_telemetry_reset "$@" ;;
     verify) verify ;;
     logs) shift; cmd_logs "$@" ;;
     update) cmd_update ;;

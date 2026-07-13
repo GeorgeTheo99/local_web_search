@@ -63,10 +63,14 @@ def _result_text(result: Any) -> str:
 
 
 @pytest.fixture(autouse=True)
-def _reset_runtime_state(monkeypatch):
-    """Keep breaker and last-search diagnostics isolated between tests."""
+def _reset_runtime_state(monkeypatch, tmp_path):
+    """Keep breaker, diagnostics, and telemetry isolated between tests."""
+    telemetry = srv.TelemetryStore(tmp_path / "telemetry")
     monkeypatch.setattr(srv, "_breaker", srv._CircuitBreaker())
     monkeypatch.setattr(srv, "_last_search", None)
+    monkeypatch.setattr(srv, "_telemetry", telemetry)
+    yield
+    telemetry.close()
 
 
 def test_http_transport_does_not_info_log_search_urls():
@@ -650,6 +654,146 @@ async def test_circuit_breaker_admits_one_half_open_probe(monkeypatch):
     assert breaker.allow("searxng") is True
     assert breaker.allow("searxng") is False
     assert breaker.snapshot("searxng")["state"] == "half_open"
+
+
+def test_circuit_breaker_reports_one_atomic_open_transition(monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+
+    monkeypatch.setattr(srv, "BREAKER_FAIL_THRESHOLD", 2)
+    breaker = srv._CircuitBreaker()
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        transitions = list(executor.map(lambda _: breaker.record_failure("tavily"), range(20)))
+    assert transitions.count("opened") == 1
+    assert transitions.count("reopened") == 0
+    assert breaker.snapshot("tavily")["state"] == "open"
+
+
+# --------------------------------------------------------------------------- #
+# Query-free telemetry and aggregate endpoint.
+# --------------------------------------------------------------------------- #
+
+@pytest.mark.asyncio
+async def test_search_telemetry_never_persists_query_or_result_content(monkeypatch):
+    import sqlite3
+
+    secret_query = "SECRET_QUERY_4cb09b"
+    secret_result = "SECRET_RESULT_78a2f1"
+
+    async def fake_request(path, params, timeout=None):
+        return {
+            "results": [
+                {
+                    "title": secret_result,
+                    "url": f"https://example.com/{secret_result}",
+                    "content": secret_result,
+                    "engine": "brave",
+                }
+            ],
+            "suggestions": [secret_result],
+        }
+
+    monkeypatch.setattr(srv, "_searxng_request", fake_request)
+    result = await _call_tool("web_search", {"query": secret_query, "num_results": 3})
+    assert secret_query in _result_text(result)
+    assert srv._telemetry.flush()
+
+    with sqlite3.connect(srv._telemetry.db_path) as conn:
+        schema = "\n".join(
+            str(row[0])
+            for row in conn.execute(
+                "SELECT sql FROM sqlite_master WHERE sql IS NOT NULL ORDER BY name"
+            )
+        )
+        values = "\n".join(
+            str(value)
+            for table in ("search_events", "provider_events", "engine_failures")
+            for row in conn.execute(f"SELECT * FROM {table}")
+            for value in row
+        )
+    persisted = f"{schema}\n{values}"
+    assert secret_query not in persisted
+    assert secret_result not in persisted
+    lowered_schema = schema.lower()
+    for forbidden in ("query", "url", "title", "snippet", "content", "api_key", "credential_value"):
+        assert forbidden not in lowered_schema
+
+
+@pytest.mark.asyncio
+async def test_stats_aggregates_degradation_tavily_429_and_fallback(monkeypatch):
+    from types import SimpleNamespace
+
+    async def fake_request(path, params, timeout=None):
+        return {
+            "results": [],
+            "suggestions": [],
+            "unresponsive_engines": [["bing", "too many requests"]],
+        }
+
+    async def fake_tavily(query, num_results, api_key):
+        return srv._BackendOutcome(
+            backend="tavily",
+            state="error",
+            attempts=1,
+            elapsed_ms=4.0,
+            error="HTTP 429",
+            http_status=429,
+            credential_mode="keyless",
+            circuit_before="closed",
+            circuit_after="open",
+            circuit_transition="opened",
+            circuit_failures=3,
+        )
+
+    monkeypatch.setattr(srv, "_searxng_request", fake_request)
+    monkeypatch.setattr(srv, "_tavily_search", fake_tavily)
+    await _call_tool("web_search", {"query": "not stored"})
+
+    response = await srv.stats(SimpleNamespace(query_params={"window": "24h"}))
+    payload = json.loads(response.body)
+    assert response.status_code == 200
+    assert payload["searches"]["total"] == 1
+    assert payload["fallback"]["searches"] == 1
+    assert payload["providers"]["searxng"]["states"] == {"degraded": 1}
+    assert payload["providers"]["tavily"]["attempts"] == 1
+    assert payload["providers"]["tavily"]["errors"] == 1
+    assert payload["providers"]["tavily"]["rate_limited_429s"] == 1
+    assert payload["providers"]["tavily"]["circuit_trips"] == 1
+    assert payload["searxng_engine_failures"] == [
+        {"engine": "bing", "reason": "rate_limited", "count": 1}
+    ]
+    assert payload["providers"]["tavily"]["credit_usage"]["available"] is False
+
+
+@pytest.mark.asyncio
+async def test_stats_rejects_invalid_window():
+    from types import SimpleNamespace
+
+    response = await srv.stats(SimpleNamespace(query_params={"window": "1h"}))
+    assert response.status_code == 400
+    assert "24h, 7d, 30d" in json.loads(response.body)["error"]
+
+
+@pytest.mark.asyncio
+async def test_unavailable_telemetry_never_breaks_search(monkeypatch, tmp_path):
+    from types import SimpleNamespace
+
+    unavailable = srv.TelemetryStore(tmp_path / "disabled", enabled=False)
+    monkeypatch.setattr(srv, "_telemetry", unavailable)
+
+    async def fake_request(path, params, timeout=None):
+        return {
+            "results": [
+                {"title": "S", "url": "https://example.com/", "content": "ok", "engine": "brave"}
+            ],
+            "suggestions": [],
+        }
+
+    monkeypatch.setattr(srv, "_searxng_request", fake_request)
+    result = await _call_tool("web_search", {"query": "still works"})
+    assert json.loads(_result_text(result))["status"] == "ok"
+    response = await srv.stats(SimpleNamespace(query_params={"window": "24h"}))
+    assert response.status_code == 503
+    assert json.loads(response.body)["available"] is False
 
 
 # --------------------------------------------------------------------------- #

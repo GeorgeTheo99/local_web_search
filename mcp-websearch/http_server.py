@@ -6,17 +6,19 @@ Serves:
   GET  /live   — dependency-free process liveness
   GET  /ready  — backend readiness (503 when unavailable)
   GET  /health — compatibility diagnostics (always HTTP 200)
+  GET  /stats  — query-free telemetry aggregates (`window=24h|7d|30d`)
 
 Configuration via environment:
-  SEARXNG_URL   default http://127.0.0.1:8888
-  MCP_PORT      default 8889
-  LOG_LEVEL     default INFO
+  SEARXNG_URL             default http://127.0.0.1:8888
+  MCP_PORT                default 8889
+  LOCAL_SEARCH_DATA_DIR   default repository data directory
+  LOG_LEVEL               default INFO
 """
 
 import logging
 import os
 
-from server import mcp
+from server import _get_telemetry, mcp
 
 SEARXNG_URL = os.environ.get("SEARXNG_URL", "http://127.0.0.1:8888").rstrip("/")
 MCP_PORT = int(os.environ.get("MCP_PORT", "8889"))
@@ -32,6 +34,8 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 if __name__ == "__main__":
+    # Initialize private SQLite state before accepting search requests.
+    _get_telemetry()
     app = mcp.http_app(
         transport="streamable-http",
         json_response=True,

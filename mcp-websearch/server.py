@@ -9,6 +9,7 @@ HTTP diagnostics:
   - GET /live    dependency-free process liveness
   - GET /ready   provider readiness (503 when no backend is usable)
   - GET /health  compatibility diagnostics (always HTTP 200)
+  - GET /stats   query-free aggregate telemetry (24h, 7d, or 30d)
 
 WEBSEARCH_TAVILY_MODE controls external Tavily egress:
   - disabled:   SearXNG only
@@ -30,6 +31,8 @@ Key configuration:
   WEBSEARCH_SEARXNG_TIMEOUT           default 7 seconds
   WEBSEARCH_TAVILY_TIMEOUT            default 8 seconds
   WEBSEARCH_SUPPLEMENT_MIN_RESULTS    default 5
+  LOCAL_SEARCH_DATA_DIR               default ../data beside this package
+  LOCAL_SEARCH_TELEMETRY_ENABLED      default true
   TAVILY_API_KEY                      optional stdio/server fallback key
   TAVILY_BASE_URL                     default https://api.tavily.com
   MCP_PORT                            default 8889 (HTTP transport only)
@@ -38,6 +41,7 @@ Key configuration:
 from __future__ import annotations
 
 import asyncio
+import atexit
 import ipaddress
 import json
 import logging
@@ -62,6 +66,16 @@ from fastmcp.server.dependencies import get_http_headers
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
+from telemetry import (
+    InvalidWindow,
+    ProviderEvent,
+    SearchEvent,
+    TelemetryStore,
+    TelemetryUnavailable,
+    classify_error,
+    normalize_engine_failures,
+)
+
 logger = logging.getLogger("websearch-mcp")
 
 SEARXNG_URL = os.environ.get("SEARXNG_URL", "http://127.0.0.1:8888").rstrip("/")
@@ -69,6 +83,16 @@ TAVILY_BASE_URL = os.environ.get("TAVILY_BASE_URL", "https://api.tavily.com").rs
 # Environment fallback for stdio clients. HTTP clients should forward a Tavily
 # key only through X-Tavily-Key; broker authentication is a separate concern.
 TAVILY_API_KEY_ENV = os.environ.get("TAVILY_API_KEY", "").strip()
+_DEFAULT_DATA_DIR = Path(__file__).resolve().parent.parent / "data"
+LOCAL_SEARCH_DATA_DIR = Path(
+    os.environ.get("LOCAL_SEARCH_DATA_DIR", str(_DEFAULT_DATA_DIR))
+).expanduser()
+TELEMETRY_ENABLED = os.environ.get("LOCAL_SEARCH_TELEMETRY_ENABLED", "true").strip().lower() not in {
+    "0",
+    "false",
+    "no",
+    "off",
+}
 
 
 def _bounded_float(name: str, default: float | str, *, minimum: float, maximum: float) -> float:
@@ -189,26 +213,36 @@ class _CircuitBreaker:
             self._half_open.add(backend)
             return True
 
-    def record_success(self, backend: str) -> None:
+    def record_success(self, backend: str) -> str:
         with self._lock:
+            recovered = backend in self._tripped
             self._fails.pop(backend, None)
             self._tripped.pop(backend, None)
             self._half_open.discard(backend)
+            return "recovered" if recovered else "none"
 
-    def record_failure(self, backend: str) -> None:
+    def record_failure(self, backend: str) -> str:
         with self._lock:
+            was_tripped = backend in self._tripped
             was_half_open = backend in self._half_open
             self._half_open.discard(backend)
             fails = self._fails.get(backend, 0) + 1
             self._fails[backend] = fails
-            if was_half_open or fails >= BREAKER_FAIL_THRESHOLD:
+            transition = "none"
+            if was_half_open:
                 self._tripped[backend] = time.monotonic()
+                transition = "reopened"
+            elif not was_tripped and fails >= BREAKER_FAIL_THRESHOLD:
+                self._tripped[backend] = time.monotonic()
+                transition = "opened"
+            if transition != "none":
                 logger.warning(
                     "Circuit breaker tripped for %s after %d failures (cooldown %ds)",
                     backend,
                     fails,
                     int(BREAKER_COOLDOWN),
                 )
+            return transition
 
     def record_aborted(self, backend: str) -> None:
         """Release a half-open probe when caller cancellation aborts the request."""
@@ -242,6 +276,7 @@ class _RequestOutcome:
     state: str
     attempts: int
     error: str | None = None
+    http_status: int | None = None
 
 
 @dataclass
@@ -255,9 +290,17 @@ class _BackendOutcome:
     attempts: int = 0
     unresponsive_engines: list[Any] = field(default_factory=list)
     error: str | None = None
+    http_status: int | None = None
+    credential_mode: str = "none"
+    circuit_before: str = "unknown"
+    circuit_after: str = "unknown"
+    circuit_transition: str = "none"
+    circuit_failures: int = 0
 
 
 _last_search: dict[str, Any] | None = None
+_telemetry: TelemetryStore | None = None
+_telemetry_lock = Lock()
 
 
 # --------------------------------------------------------------------------- #
@@ -301,6 +344,110 @@ def _record_last_search(payload: dict[str, Any]) -> None:
         "provider_states": payload.get("provider_states", {}),
         "mode": payload.get("mode"),
     }
+
+
+def _get_telemetry() -> TelemetryStore:
+    global _telemetry
+    if _telemetry is None:
+        with _telemetry_lock:
+            if _telemetry is None:
+                _telemetry = TelemetryStore(
+                    LOCAL_SEARCH_DATA_DIR,
+                    enabled=TELEMETRY_ENABLED,
+                )
+                atexit.register(_telemetry.close)
+    return _telemetry
+
+
+def _provider_event(outcome: _BackendOutcome) -> ProviderEvent:
+    snapshot = _breaker.snapshot(outcome.backend)
+    return ProviderEvent(
+        provider=outcome.backend,
+        state=outcome.state,
+        attempts=outcome.attempts,
+        result_count=len(outcome.results),
+        latency_ms=outcome.elapsed_ms,
+        error_kind=classify_error(outcome.error, outcome.http_status),
+        http_status=outcome.http_status,
+        credential_mode=outcome.credential_mode,
+        circuit_before=outcome.circuit_before,
+        circuit_after=(
+            outcome.circuit_after
+            if outcome.circuit_after != "unknown"
+            else str(snapshot["state"])
+        ),
+        circuit_transition=outcome.circuit_transition,
+        circuit_failures=(
+            outcome.circuit_failures
+            if outcome.circuit_after != "unknown"
+            else int(snapshot["consecutive_failures"])
+        ),
+    )
+
+
+def _record_search_telemetry(
+    *,
+    status: str,
+    backend: str,
+    requested_count: int,
+    result_count: int,
+    fallback_reason: str | None,
+    total_latency_ms: float,
+    searxng: _BackendOutcome | None,
+    tavily: _BackendOutcome | None,
+) -> None:
+    """Queue only explicitly allowlisted operational fields, never a search payload."""
+    try:
+        providers = tuple(
+            _provider_event(outcome)
+            for outcome in (searxng, tavily)
+            if outcome is not None
+        )
+        engine_failures = normalize_engine_failures(
+            searxng.unresponsive_engines if searxng is not None else []
+        )
+        _get_telemetry().record(
+            SearchEvent(
+                status=status,
+                backend=backend,
+                mode=TAVILY_MODE,
+                requested_count=requested_count,
+                result_count=result_count,
+                fallback_reason=fallback_reason,
+                total_latency_ms=total_latency_ms,
+                providers=providers,
+                engine_failures=engine_failures,
+            )
+        )
+    except Exception as exc:
+        # Monitoring must never break or delay search behavior.
+        logger.warning("Telemetry event dropped (%s)", type(exc).__name__)
+
+
+def _finish_search(
+    rendered: str,
+    *,
+    status: str,
+    backend: str,
+    requested_count: int,
+    result_count: int,
+    fallback_reason: str | None = None,
+    timings_ms: dict[str, float | None] | None = None,
+    searxng: _BackendOutcome | None = None,
+    tavily: _BackendOutcome | None = None,
+) -> str:
+    total_latency_ms = float((timings_ms or {}).get("total") or 0.0)
+    _record_search_telemetry(
+        status=status,
+        backend=backend,
+        requested_count=requested_count,
+        result_count=result_count,
+        fallback_reason=fallback_reason,
+        total_latency_ms=total_latency_ms,
+        searxng=searxng,
+        tavily=tavily,
+    )
+    return rendered
 
 
 def _search_error_payload(
@@ -810,6 +957,7 @@ async def _searxng_request(
     client = await _client()
     last_state = "error"
     last_error = "request failed"
+    last_http_status: int | None = None
     attempts = 0
 
     for attempt in range(SEARCH_MAX_RETRIES + 1):
@@ -827,8 +975,14 @@ async def _searxng_request(
             response.raise_for_status()
             data = response.json()
             if not isinstance(data, dict):
-                return _RequestOutcome(None, "error", attempts, "invalid JSON payload")
-            return _RequestOutcome(data, "ok", attempts)
+                return _RequestOutcome(
+                    None,
+                    "error",
+                    attempts,
+                    "invalid JSON payload",
+                    response.status_code,
+                )
+            return _RequestOutcome(data, "ok", attempts, http_status=response.status_code)
         except httpx.TimeoutException:
             last_state = "timeout"
             last_error = "request timed out"
@@ -839,6 +993,7 @@ async def _searxng_request(
             logger.warning("SearXNG connection failed (attempt %d)", attempts)
         except httpx.HTTPStatusError as exc:
             status_code = exc.response.status_code
+            last_http_status = status_code
             retryable = status_code in {408, 425, 429} or status_code >= 500
             last_state = "error"
             last_error = f"HTTP {status_code}"
@@ -857,17 +1012,22 @@ async def _searxng_request(
             break
         await asyncio.sleep(min(SEARCH_RETRY_BACKOFF, remaining))
 
-    return _RequestOutcome(None, last_state, attempts, last_error)
+    return _RequestOutcome(None, last_state, attempts, last_error, last_http_status)
 
 
 async def _searxng_search(query: str, num_results: int) -> _BackendOutcome:
     started = time.monotonic()
+    circuit_before = _breaker.snapshot("searxng")
     if not _breaker.allow("searxng"):
         logger.info("SearXNG circuit open; skipping")
+        circuit_after = _breaker.snapshot("searxng")
         return _BackendOutcome(
             backend="searxng",
             state="circuit_open",
             elapsed_ms=round((time.monotonic() - started) * 1000, 1),
+            circuit_before=str(circuit_before["state"]),
+            circuit_after=str(circuit_after["state"]),
+            circuit_failures=int(circuit_after["consecutive_failures"]),
         )
 
     try:
@@ -881,16 +1041,23 @@ async def _searxng_search(query: str, num_results: int) -> _BackendOutcome:
     request = _coerce_request_outcome(raw_outcome)
     elapsed_ms = round((time.monotonic() - started) * 1000, 1)
     if request.data is None:
-        _breaker.record_failure("searxng")
+        circuit_transition = _breaker.record_failure("searxng")
+        circuit_after = _breaker.snapshot("searxng")
         return _BackendOutcome(
             backend="searxng",
             state=request.state,
             elapsed_ms=elapsed_ms,
             attempts=request.attempts,
             error=request.error,
+            http_status=request.http_status,
+            circuit_before=str(circuit_before["state"]),
+            circuit_after=str(circuit_after["state"]),
+            circuit_transition=circuit_transition,
+            circuit_failures=int(circuit_after["consecutive_failures"]),
         )
 
-    _breaker.record_success("searxng")
+    circuit_transition = _breaker.record_success("searxng")
+    circuit_after = _breaker.snapshot("searxng")
     raw_results = request.data.get("results", [])
     if not isinstance(raw_results, list):
         raw_results = []
@@ -911,6 +1078,11 @@ async def _searxng_search(query: str, num_results: int) -> _BackendOutcome:
         elapsed_ms=elapsed_ms,
         attempts=request.attempts,
         unresponsive_engines=unresponsive,
+        http_status=request.http_status,
+        circuit_before=str(circuit_before["state"]),
+        circuit_after=str(circuit_after["state"]),
+        circuit_transition=circuit_transition,
+        circuit_failures=int(circuit_after["consecutive_failures"]),
     )
 
 
@@ -921,12 +1093,19 @@ async def _searxng_search(query: str, num_results: int) -> _BackendOutcome:
 async def _tavily_search(query: str, num_results: int, api_key: str) -> _BackendOutcome:
     """Search Tavily in keyed or keyless mode without mixing credential roles."""
     started = time.monotonic()
+    credential_mode = "keyed" if api_key else "keyless"
+    circuit_before = _breaker.snapshot("tavily")
     if not _breaker.allow("tavily"):
         logger.info("Tavily circuit open; skipping")
+        circuit_after = _breaker.snapshot("tavily")
         return _BackendOutcome(
             backend="tavily",
             state="circuit_open",
             elapsed_ms=round((time.monotonic() - started) * 1000, 1),
+            credential_mode=credential_mode,
+            circuit_before=str(circuit_before["state"]),
+            circuit_after=str(circuit_after["state"]),
+            circuit_failures=int(circuit_after["consecutive_failures"]),
         )
 
     payload = {
@@ -958,25 +1137,29 @@ async def _tavily_search(query: str, num_results: int, api_key: str) -> _Backend
         _breaker.record_aborted("tavily")
         raise
     except httpx.TimeoutException:
-        _breaker.record_failure("tavily")
+        circuit_transition = _breaker.record_failure("tavily")
         state = "timeout"
         error = "request timed out"
+        http_status = None
     except httpx.HTTPStatusError as exc:
         status_code = exc.response.status_code
+        http_status = status_code
         # Authentication/client errors prove the provider is reachable and
         # must not globally circuit-break valid keys or keyless traffic.
         if status_code in {400, 401, 403, 404, 422}:
-            _breaker.record_success("tavily")
+            circuit_transition = _breaker.record_success("tavily")
         else:
-            _breaker.record_failure("tavily")
+            circuit_transition = _breaker.record_failure("tavily")
         state = "error"
         error = f"HTTP {status_code}"
     except Exception as exc:
-        _breaker.record_failure("tavily")
+        circuit_transition = _breaker.record_failure("tavily")
         state = "error"
         error = type(exc).__name__
+        http_status = None
     else:
-        _breaker.record_success("tavily")
+        circuit_transition = _breaker.record_success("tavily")
+        circuit_after = _breaker.snapshot("tavily")
         raw_results = data.get("results", [])
         if not isinstance(raw_results, list):
             raw_results = []
@@ -992,8 +1175,15 @@ async def _tavily_search(query: str, num_results: int, api_key: str) -> _Backend
             state="ok" if results else "empty",
             elapsed_ms=round((time.monotonic() - started) * 1000, 1),
             attempts=1,
+            http_status=response.status_code,
+            credential_mode=credential_mode,
+            circuit_before=str(circuit_before["state"]),
+            circuit_after=str(circuit_after["state"]),
+            circuit_transition=circuit_transition,
+            circuit_failures=int(circuit_after["consecutive_failures"]),
         )
 
+    circuit_after = _breaker.snapshot("tavily")
     logger.warning(
         "Tavily search failed (%s): %s",
         "keyed" if api_key else "keyless",
@@ -1005,6 +1195,12 @@ async def _tavily_search(query: str, num_results: int, api_key: str) -> _Backend
         elapsed_ms=round((time.monotonic() - started) * 1000, 1),
         attempts=1,
         error=error,
+        http_status=http_status,
+        credential_mode=credential_mode,
+        circuit_before=str(circuit_before["state"]),
+        circuit_after=str(circuit_after["state"]),
+        circuit_transition=circuit_transition,
+        circuit_failures=int(circuit_after["consecutive_failures"]),
     )
 
 
@@ -1085,6 +1281,7 @@ async def _health_payload() -> dict[str, Any]:
             "last_state": provider_states.get("tavily"),
             "circuit": tavily_breaker,
         },
+        "telemetry": _get_telemetry().status(),
         "last_search": _last_search,
     }
 
@@ -1106,6 +1303,31 @@ async def ready(request: Request) -> JSONResponse:
 async def health(request: Request) -> JSONResponse:
     """Compatibility health endpoint. Always HTTP 200; inspect status and ready."""
     return JSONResponse(await _health_payload())
+
+
+@mcp.custom_route("/stats", methods=["GET"])
+async def stats(request: Request) -> JSONResponse:
+    """Return query-free aggregate telemetry for an allowlisted time window."""
+    window = request.query_params.get("window", "24h")
+    try:
+        payload = await asyncio.to_thread(_get_telemetry().stats, window)
+    except InvalidWindow as exc:
+        return JSONResponse(
+            {"status": "error", "error": str(exc)},
+            status_code=400,
+        )
+    except TelemetryUnavailable:
+        return JSONResponse(
+            {"status": "error", "available": False, "error": "telemetry unavailable"},
+            status_code=503,
+        )
+    except Exception as exc:
+        logger.warning("Telemetry stats failed (%s)", type(exc).__name__)
+        return JSONResponse(
+            {"status": "error", "available": False, "error": "telemetry unavailable"},
+            status_code=503,
+        )
+    return JSONResponse(payload)
 
 
 # --------------------------------------------------------------------------- #
@@ -1141,26 +1363,38 @@ def _coerce_backend_outcome(value: Any, backend: str, elapsed_ms: float) -> _Bac
 
 async def _run_backend(backend: str, awaitable: Any, timeout: float) -> _BackendOutcome:
     started = time.monotonic()
+    circuit_before = _breaker.snapshot(backend)
     try:
         value = await asyncio.wait_for(awaitable, timeout=max(0.05, timeout))
     except asyncio.TimeoutError:
-        _breaker.record_failure(backend)
+        circuit_transition = _breaker.record_failure(backend)
+        circuit_after = _breaker.snapshot(backend)
         return _BackendOutcome(
             backend=backend,
             state="timeout",
             elapsed_ms=round((time.monotonic() - started) * 1000, 1),
+            attempts=1,
             error="stage deadline exceeded",
+            circuit_before=str(circuit_before["state"]),
+            circuit_after=str(circuit_after["state"]),
+            circuit_transition=circuit_transition,
+            circuit_failures=int(circuit_after["consecutive_failures"]),
         )
     except asyncio.CancelledError:
         raise
     except Exception as exc:
-        _breaker.record_failure(backend)
+        circuit_transition = _breaker.record_failure(backend)
+        circuit_after = _breaker.snapshot(backend)
         logger.warning("%s search raised %s", backend, type(exc).__name__)
         return _BackendOutcome(
             backend=backend,
             state="error",
             elapsed_ms=round((time.monotonic() - started) * 1000, 1),
             error=type(exc).__name__,
+            circuit_before=str(circuit_before["state"]),
+            circuit_after=str(circuit_after["state"]),
+            circuit_transition=circuit_transition,
+            circuit_failures=int(circuit_after["consecutive_failures"]),
         )
     return _coerce_backend_outcome(
         value,
@@ -1208,7 +1442,23 @@ async def web_search(query: str, num_results: int = 8) -> str:
     query = query.strip()
     requested = min(MAX_NUM_RESULTS, max(1, int(num_results)))
     if not query:
-        return _search_error_payload(query, "Search error: query must not be empty.")
+        timings_ms = {
+            "total": round((time.monotonic() - started) * 1000, 1),
+            "searxng": None,
+            "tavily": None,
+        }
+        return _finish_search(
+            _search_error_payload(
+                query,
+                "Search error: query must not be empty.",
+                timings_ms=timings_ms,
+            ),
+            status="error",
+            backend="none",
+            requested_count=requested,
+            result_count=0,
+            timings_ms=timings_ms,
+        )
 
     candidate_limit = min(MAX_NUM_RESULTS, requested * RESULT_OVERFETCH_FACTOR)
     attempted = ["searxng"]
@@ -1230,70 +1480,102 @@ async def web_search(query: str, num_results: int = 8) -> str:
     if not should_use_tavily:
         results = _dedupe_and_rank(searxng_candidates, requested)
         timings_ms = _timings(started, searxng, None)
+        fallback_reason: str | None = None
+        backend = "none"
         if results:
             status = "degraded" if searxng.state == "degraded" else "ok"
-            return _format_results(
+            backend = "searxng"
+            rendered = _format_results(
                 query,
                 results,
                 searxng.suggestions,
                 status=status,
-                backend="searxng",
+                backend=backend,
                 attempted=attempted,
                 timings_ms=timings_ms,
                 unresponsive_engines=searxng.unresponsive_engines,
                 provider_states=provider_states,
             )
-        if searxng.ok:
+        elif searxng.ok:
             degraded = searxng.state == "degraded"
-            return _format_results(
+            status = "degraded" if degraded else "empty"
+            fallback_reason = "searxng_degraded" if degraded else None
+            rendered = _format_results(
                 query,
                 [],
                 searxng.suggestions,
-                status="degraded" if degraded else "empty",
-                backend="none",
+                status=status,
+                backend=backend,
                 attempted=attempted,
-                fallback_reason="searxng_degraded" if degraded else None,
+                fallback_reason=fallback_reason,
                 timings_ms=timings_ms,
                 unresponsive_engines=searxng.unresponsive_engines,
                 provider_states=provider_states,
             )
-        return _search_error_payload(
-            query,
-            "Search error: SearXNG failed and Tavily is disabled by policy.",
-            searxng.suggestions,
-            attempted=attempted,
-            fallback_reason=_fallback_reason(searxng, 0, threshold),
+        else:
+            status = "error"
+            fallback_reason = _fallback_reason(searxng, 0, threshold)
+            rendered = _search_error_payload(
+                query,
+                "Search error: SearXNG failed and Tavily is disabled by policy.",
+                searxng.suggestions,
+                attempted=attempted,
+                fallback_reason=fallback_reason,
+                timings_ms=timings_ms,
+                unresponsive_engines=searxng.unresponsive_engines,
+                provider_states=provider_states,
+            )
+        return _finish_search(
+            rendered,
+            status=status,
+            backend=backend,
+            requested_count=requested,
+            result_count=len(results),
+            fallback_reason=fallback_reason,
             timings_ms=timings_ms,
-            unresponsive_engines=searxng.unresponsive_engines,
-            provider_states=provider_states,
+            searxng=searxng,
         )
 
     attempted.append("tavily")
     reason = _fallback_reason(searxng, len(searxng_candidates), threshold)
     remaining = SEARCH_TOTAL_TIMEOUT - (time.monotonic() - started)
     if remaining <= 0:
-        tavily = _BackendOutcome(backend="tavily", state="timeout", error="total deadline exceeded")
+        circuit = _breaker.snapshot("tavily")
+        tavily = _BackendOutcome(
+            backend="tavily",
+            state="timeout",
+            error="total deadline exceeded",
+            circuit_before=str(circuit["state"]),
+            circuit_after=str(circuit["state"]),
+            circuit_failures=int(circuit["consecutive_failures"]),
+        )
     else:
         # Tavily credentials are resolved only when policy permits external egress.
+        tavily_key = _resolve_tavily_key()
         tavily = await _run_backend(
             "tavily",
-            _tavily_search(query, candidate_limit, _resolve_tavily_key()),
+            _tavily_search(query, candidate_limit, tavily_key),
             min(TAVILY_TIMEOUT, remaining),
         )
+        if tavily.credential_mode == "none":
+            tavily.credential_mode = "keyed" if tavily_key else "keyless"
     provider_states["tavily"] = tavily.state
 
-    if TAVILY_MODE == "supplement" or (TAVILY_MODE == "fallback" and searxng.state == "degraded"):
+    if TAVILY_MODE == "supplement" or (
+        TAVILY_MODE == "fallback" and searxng.state == "degraded"
+    ):
         results = _merge_with_secondary_reserve(searxng_candidates, tavily.results, requested)
     else:
         results = _dedupe_and_rank(tavily.results, requested)
     backend = _result_backend(results)
     timings_ms = _timings(started, searxng, tavily)
     if results:
-        return _format_results(
+        status = "degraded"
+        rendered = _format_results(
             query,
             results,
             searxng.suggestions,
-            status="degraded",
+            status=status,
             backend=backend,
             attempted=attempted,
             fallback_reason=reason,
@@ -1301,9 +1583,9 @@ async def web_search(query: str, num_results: int = 8) -> str:
             unresponsive_engines=searxng.unresponsive_engines,
             provider_states=provider_states,
         )
-
-    if not searxng.ok and not tavily.ok:
-        return _search_error_payload(
+    elif not searxng.ok and not tavily.ok:
+        status = "error"
+        rendered = _search_error_payload(
             query,
             "Search error: SearXNG unreachable and Tavily failed.",
             searxng.suggestions,
@@ -1313,19 +1595,31 @@ async def web_search(query: str, num_results: int = 8) -> str:
             unresponsive_engines=searxng.unresponsive_engines,
             provider_states=provider_states,
         )
-
-    status = "empty" if searxng.ok and tavily.ok else "degraded"
-    return _format_results(
-        query,
-        [],
-        searxng.suggestions,
+    else:
+        status = "empty" if searxng.ok and tavily.ok else "degraded"
+        backend = "none"
+        rendered = _format_results(
+            query,
+            [],
+            searxng.suggestions,
+            status=status,
+            backend=backend,
+            attempted=attempted,
+            fallback_reason=reason,
+            timings_ms=timings_ms,
+            unresponsive_engines=searxng.unresponsive_engines,
+            provider_states=provider_states,
+        )
+    return _finish_search(
+        rendered,
         status=status,
-        backend="none",
-        attempted=attempted,
+        backend=backend,
+        requested_count=requested,
+        result_count=len(results),
         fallback_reason=reason,
         timings_ms=timings_ms,
-        unresponsive_engines=searxng.unresponsive_engines,
-        provider_states=provider_states,
+        searxng=searxng,
+        tavily=tavily,
     )
 
 
@@ -1423,4 +1717,6 @@ async def web_fetch(url: str, max_chars: int = 20000) -> str:
 
 
 if __name__ == "__main__":
+    # Initialize private SQLite state before accepting stdio tool calls.
+    _get_telemetry()
     mcp.run()

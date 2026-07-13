@@ -9,6 +9,10 @@ searxng/src/
 # Operator logs
 .logs/
 
+# Private query-free telemetry (including SQLite WAL/SHM files) and local install state
+data/*.sqlite3*
+data/install.env
+
 # pytest
 .pytest_cache/
 

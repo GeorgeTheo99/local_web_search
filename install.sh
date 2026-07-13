@@ -9,6 +9,7 @@
 #   ./install.sh                 # bootstrap + start + verify
 #   ./install.sh --no-start      # bootstrap only (no service start)
 #   LOCAL_SEARCH_LOG_DIR=... ./install.sh
+#   LOCAL_SEARCH_DATA_DIR=... ./install.sh
 #
 # Prerequisites: macOS, Homebrew uv, git, python3, curl.
 set -euo pipefail

@@ -26,6 +26,7 @@ opt-in for machines that want a local search backend.
 | MCP liveness | `GET http://127.0.0.1:8889/live` | Dependency-free process check |
 | MCP readiness | `GET http://127.0.0.1:8889/ready` | Provider readiness; HTTP 503 when unavailable |
 | MCP diagnostics | `GET http://127.0.0.1:8889/health` | Compatibility endpoint; policy, circuits, and last-search quality |
+| MCP telemetry | `GET http://127.0.0.1:8889/stats?window=24h` | Query-free aggregates (`24h`, `7d`, or `30d`) |
 
 ## Search backends and Tavily policy
 
@@ -80,6 +81,46 @@ should inject `TAVILY_API_KEY` through their process environment.
 When a key is present, it takes precedence over keyless and uses the caller's
 account quota. Local-search never persists per-call keys.
 
+## Query-free telemetry
+
+Operational telemetry is enabled by default and stored in
+`data/telemetry.sqlite3`, or under `LOCAL_SEARCH_DATA_DIR` when configured.
+SQLite writes use WAL, short transactions, and a background queue so telemetry
+cannot hold up search responses. The directory is mode `0700`; database,
+WAL, SHM, and non-secret install-state files are restricted to the current
+user and ignored by Git.
+
+Telemetry persists only:
+
+- timestamps, requested/result counts, provider outcomes, and latency;
+- SearXNG degradation plus categorized engine failures;
+- Tavily selection/attempts, errors, HTTP 429s, and keyed/keyless mode (never
+  the credential itself);
+- fallback reasons/rates and circuit trips, skips, and recoveries.
+
+It never stores search queries or hashes, URLs, result titles/snippets/content,
+suggestions, response bodies, request headers, credentials, or API keys. The
+loopback-only `/stats` endpoint returns aggregates rather than raw events. It
+marks a window incomplete when durable drop/write-failure markers exist.
+Tavily credit usage is reported as unavailable because no dedicated usage API
+credential is configured.
+
+Supported windows:
+
+```bash
+local-search stats 24h
+local-search stats 7d
+local-search stats 30d
+```
+
+Telemetry is preserved by install, update, and uninstall. A custom installed
+data path is reused by later CLI, update, and reinstall commands. Telemetry is erased only by
+the explicit command `local-search telemetry-reset --yes`, which briefly stops
+the managed HTTP MCP process to drain its writer queue before clearing SQLite
+and then restarts it. A database reset epoch also rejects pre-reset events from
+other writers. Set `LOCAL_SEARCH_TELEMETRY_ENABLED=false` during install only
+when telemetry must be disabled completely.
+
 ## Requirements
 
 - macOS (launchd-managed)
@@ -105,8 +146,9 @@ What `install.sh` does (delegates to `scripts/local-search install`):
 1. Clones/updates SearXNG source into `searxng/src` at the pinned ref.
 2. Builds the SearXNG venv (`uv venv` + `requirements.txt` + editable install).
 3. Builds the MCP websearch venv (`uv sync`).
-4. Writes launchd plists (`com.local.searxng`, `com.local.mcp-websearch`) into
-   `~/Library/LaunchAgents/` with logs under `~/Library/Logs/local-search/`.
+4. Creates the private telemetry data directory and writes launchd plists
+   (`com.local.searxng`, `com.local.mcp-websearch`) into
+   `~/Library/LaunchAgents/`, with logs under `~/Library/Logs/local-search/`.
 5. Starts services (SearXNG first, then MCP) and runs health verification.
 
 Flags / non-secret policy overrides:
@@ -114,6 +156,7 @@ Flags / non-secret policy overrides:
 ```bash
 ./install.sh --no-start                          # bootstrap without starting
 LOCAL_SEARCH_LOG_DIR=~/logs ./install.sh         # custom log dir
+LOCAL_SEARCH_DATA_DIR=/private/path ./install.sh # custom telemetry directory
 WEBSEARCH_TAVILY_MODE=disabled ./install.sh      # SearXNG-only privacy mode
 WEBSEARCH_TAVILY_MODE=supplement \
   WEBSEARCH_SUPPLEMENT_MIN_RESULTS=5 ./install.sh
@@ -133,6 +176,8 @@ local-search install [--no-start]    bootstrap + start + verify
 local-search uninstall               stop services, remove plists (keeps src/venvs)
 local-search start | stop | restart  service control (ordered: searxng before mcp)
 local-search status                  launchd state + /health probes
+local-search stats [24h|7d|30d]      query-free telemetry aggregates
+local-search telemetry-reset --yes   explicitly erase telemetry events
 local-search verify                  health + tools/list smoke
 local-search logs [searxng|mcp] [-f|N]
 local-search update                  git pull + rebuild venvs + restart + verify
@@ -224,6 +269,9 @@ installed separately on machines that want a local search backend.
   when no policy-allowed backend is usable; `/health` remains HTTP 200 for
   compatibility and exposes safe breaker/policy/last-search metadata, including
   recent per-provider outcomes, without retaining query text, URLs, headers, or keys.
+- **Private telemetry**: `/stats` is loopback-only and aggregate-only. SQLite
+  stores no query/result/credential data, uses a private data directory and
+  file permissions, and fails open so monitoring cannot break search.
 - **Local binding**: SearXNG and the MCP HTTP broker listen on loopback only.
 - **Query-log hygiene**: broker HTTP client logging suppresses full request
   URLs, and the tracked SearXNG runner redacts `q`/`query`/`s` parameters from
@@ -242,20 +290,26 @@ Covers the SSRF rejection matrix, `web_fetch` errors, compatibility payloads,
 Tavily disabled/fallback/supplement policy, overfetch/dedupe, bounded stage
 timeouts, distinct empty/degraded/error states, readiness, safe last-search
 metadata, single-probe half-open circuits, key separation, and `tools/list`.
+Telemetry tests cover persistence across reopen, aggregation windows, schema and
+row privacy, concurrent writes, invalid windows, unavailable/disabled storage,
+file permissions, HTTP 429/circuit/fallback counts, and explicit reset.
 
 ## Layout
 
 ```
 local-search/
 ├── install.sh                    # bootstrap entrypoint (→ scripts/local-search install)
+├── data/
+│   └── README.md                 # private telemetry location (SQLite files ignored)
 ├── scripts/
 │   └── local-search              # operator CLI (install/uninstall/start/stop/...)
 ├── mcp-websearch/
-│   ├── server.py                 # MCP tools, provider policy, PDF extraction, and health routes
+│   ├── server.py                 # MCP tools, provider policy, PDF extraction, and HTTP routes
+│   ├── telemetry.py              # query-free SQLite events, aggregates, and reset
 │   ├── macos_vision_ocr.swift    # optional scanned-PDF OCR helper
 │   ├── http_server.py            # HTTP transport entrypoint (uvicorn)
 │   ├── pyproject.toml            # uv project (fastmcp, httpx; dev: pytest)
-│   └── tests/test_server.py
+│   └── tests/                    # broker and telemetry tests
 └── searxng/
     ├── engines/mwmbl_safe.py     # Defensive keyless Mwmbl JSON adapter
     ├── run.py                    # SearXNG entry point with local engines + log redaction
@@ -267,6 +321,6 @@ local-search/
 ## Uninstall
 
 ```bash
-local-search uninstall          # stops services + removes plists (keeps src/venvs)
-rm -rf ~/local_code/local-search  # full removal
+local-search uninstall          # stops services + removes plists; keeps telemetry/src/venvs
+rm -rf ~/local_code/local-search  # full removal, including repository-local telemetry
 ```
