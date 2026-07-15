@@ -806,7 +806,12 @@ async def test_tools_list_exposes_expected_tools():
     async with Client(srv.mcp) as client:
         tools = await client.list_tools()
     names = {t.name for t in tools}
-    assert names == {"web_search", "web_fetch"}
+    assert names == {"web_search", "image_search", "web_fetch"}
+    image_tool = next(tool for tool in tools if tool.name == "image_search")
+    schema = image_tool.model_dump(by_alias=True)["inputSchema"]
+    assert schema["required"] == ["query"]
+    assert schema["properties"]["query"]["type"] == "string"
+    assert schema["properties"]["num_results"] == {"default": 8, "type": "integer"}
 
 
 # --------------------------------------------------------------------------- #

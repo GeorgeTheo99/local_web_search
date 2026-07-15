@@ -355,7 +355,7 @@ verify() {
     -H 'content-type: application/json' -H 'accept: application/json' \
     -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' 2>/dev/null \
     | python3 -c 'import sys,json;d=json.load(sys.stdin);print(",".join(t["name"] for t in d.get("result",{}).get("tools",[])))' 2>/dev/null || true)"
-  if [ "$tools" = "web_search,web_fetch" ]; then ok "MCP tools: $tools"; else warn "MCP tools/list unexpected: '$tools'"; rc=1; fi
+  if [ "$tools" = "web_search,image_search,web_fetch" ]; then ok "MCP tools: $tools"; else warn "MCP tools/list unexpected: '$tools'"; rc=1; fi
   return $rc
 }
 

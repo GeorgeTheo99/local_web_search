@@ -2,8 +2,9 @@
 """Policy-aware MCP web search broker for local SearXNG and Tavily.
 
 Tools:
-  - web_search(query, num_results=8)  SearXNG first; Tavily policy-controlled
-  - web_fetch(url, max_chars=20000)   direct fetch with SSRF guard
+  - web_search(query, num_results=8)    SearXNG first; Tavily policy-controlled
+  - image_search(query, num_results=8)  loopback SearXNG images; no fallback
+  - web_fetch(url, max_chars=20000)     direct fetch with SSRF guard
 
 HTTP diagnostics:
   - GET /live    dependency-free process liveness
@@ -173,15 +174,16 @@ _pdf_extract_semaphore = asyncio.Semaphore(2)
 async def _client() -> httpx.AsyncClient:
     global _http_client
     if _http_client is None or _http_client.is_closed:
-        _http_client = httpx.AsyncClient(timeout=FETCH_TIMEOUT)
+        _http_client = httpx.AsyncClient(timeout=FETCH_TIMEOUT, trust_env=False)
     return _http_client
 
 
 mcp = FastMCP(
     "websearch",
     instructions=(
-        "Web search and page fetching via local SearXNG with policy-controlled Tavily fallback or supplementation. "
+        "Web and image search plus page fetching via local SearXNG, with policy-controlled Tavily fallback or supplementation for web search only. "
         "Use web_search for any question about current events, news, facts, people, places, or any topic that requires up-to-date information. "
+        "Use image_search to find public image and source-page URLs without downloading image bytes. "
         "Use web_fetch to retrieve the full text content of a specific URL."
     ),
 )
@@ -316,6 +318,7 @@ def _search_metadata(
     timings_ms: dict[str, float | None] | None,
     unresponsive_engines: list[Any] | None,
     provider_states: dict[str, str] | None,
+    mode: str | None = None,
 ) -> dict[str, Any]:
     return {
         "status": status,
@@ -323,7 +326,7 @@ def _search_metadata(
         "attempted": attempted or [],
         "fallback_reason": fallback_reason,
         "timings_ms": timings_ms or {"total": 0.0, "searxng": None, "tavily": None},
-        "mode": TAVILY_MODE,
+        "mode": mode or TAVILY_MODE,
         "unresponsive_engines": (unresponsive_engines or [])[:10],
         "provider_states": provider_states or {},
     }
@@ -395,6 +398,7 @@ def _record_search_telemetry(
     total_latency_ms: float,
     searxng: _BackendOutcome | None,
     tavily: _BackendOutcome | None,
+    mode: str | None = None,
 ) -> None:
     """Queue only explicitly allowlisted operational fields, never a search payload."""
     try:
@@ -410,7 +414,7 @@ def _record_search_telemetry(
             SearchEvent(
                 status=status,
                 backend=backend,
-                mode=TAVILY_MODE,
+                mode=mode or TAVILY_MODE,
                 requested_count=requested_count,
                 result_count=result_count,
                 fallback_reason=fallback_reason,
@@ -435,6 +439,7 @@ def _finish_search(
     timings_ms: dict[str, float | None] | None = None,
     searxng: _BackendOutcome | None = None,
     tavily: _BackendOutcome | None = None,
+    mode: str | None = None,
 ) -> str:
     total_latency_ms = float((timings_ms or {}).get("total") or 0.0)
     _record_search_telemetry(
@@ -446,6 +451,7 @@ def _finish_search(
         total_latency_ms=total_latency_ms,
         searxng=searxng,
         tavily=tavily,
+        mode=mode,
     )
     return rendered
 
@@ -461,6 +467,7 @@ def _search_error_payload(
     timings_ms: dict[str, float | None] | None = None,
     unresponsive_engines: list[Any] | None = None,
     provider_states: dict[str, str] | None = None,
+    mode: str | None = None,
 ) -> str:
     payload = {
         "query": query,
@@ -476,6 +483,7 @@ def _search_error_payload(
             timings_ms=timings_ms,
             unresponsive_engines=unresponsive_engines,
             provider_states=provider_states,
+            mode=mode,
         ),
     }
     _record_last_search(payload)
@@ -499,6 +507,137 @@ def _normalize_searxng_result(r: dict) -> dict[str, Any]:
         "snippet": (r.get("content") or "").strip(),
         "engine": r.get("engine") if isinstance(r.get("engine"), str) else "searxng",
         "score": None,
+    }
+
+
+def _public_http_url(value: Any) -> str | None:
+    """Return a syntactically public-looking HTTP(S) URL without resolving or fetching it."""
+    if not isinstance(value, str):
+        return None
+    url = value.strip()
+    if not url or any(char.isspace() for char in url):
+        return None
+    try:
+        parsed = urllib.parse.urlsplit(url)
+        host = (parsed.hostname or "").rstrip(".").lower()
+        if (
+            parsed.scheme.lower() not in {"http", "https"}
+            or not host
+            or parsed.username is not None
+            or parsed.password is not None
+        ):
+            return None
+        # Accessing port validates malformed/out-of-range values.
+        _ = parsed.port
+        if host in {"localhost", "local"} or host.endswith((".localhost", ".local")):
+            return None
+        try:
+            if _is_private_ip(ipaddress.ip_address(host)):
+                return None
+        except ValueError:
+            labels = host.split(".")
+            if len(labels) < 2 or any(
+                not label
+                or len(label) > 63
+                or not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]*[a-z0-9])?", label)
+                for label in labels
+            ):
+                return None
+    except (TypeError, ValueError):
+        return None
+    return url
+
+
+def _first_public_http_url(r: dict[str, Any], *keys: str) -> str | None:
+    for key in keys:
+        if url := _public_http_url(r.get(key)):
+            return url
+    return None
+
+
+def _image_dimension(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return parsed if parsed > 0 and str(value).strip() in {str(parsed), f"{parsed}.0"} else None
+
+
+def _image_dimensions(r: dict[str, Any]) -> tuple[int | None, int | None]:
+    width = _image_dimension(r.get("width"))
+    height = _image_dimension(r.get("height"))
+    resolution = r.get("resolution")
+    if (width is None or height is None) and isinstance(resolution, str):
+        match = re.search(r"(\d+)\s*[x×]\s*(\d+)", resolution, flags=re.IGNORECASE)
+        if match:
+            width = width or _image_dimension(match.group(1))
+            height = height or _image_dimension(match.group(2))
+    return width, height
+
+
+def _image_mime_type(r: dict[str, Any]) -> str | None:
+    value = r.get("mime_type") or r.get("img_format")
+    if not isinstance(value, str):
+        return None
+    value = value.strip().lower()
+    if not value:
+        return None
+    if re.fullmatch(r"image/[a-z0-9.+-]+", value):
+        return value
+    subtype = {"jpg": "jpeg", "svg": "svg+xml", "tif": "tiff"}.get(value, value)
+    if re.fullmatch(r"[a-z0-9.+-]+", subtype):
+        return f"image/{subtype}"
+    return None
+
+
+def _image_text(r: dict[str, Any], *keys: str) -> str:
+    for key in keys:
+        value = r.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+        if key in {"license", "creator"} and isinstance(value, dict):
+            name = value.get("name")
+            if isinstance(name, str) and name.strip():
+                return name.strip()
+    return ""
+
+
+_MODERATE_SAFESEARCH_IMAGE_ENGINES = frozenset({"duckduckgo images", "google images"})
+
+
+def _normalize_searxng_image_result(r: dict[str, Any]) -> dict[str, Any] | None:
+    image_url = _first_public_http_url(r, "img_src", "image_url", "image")
+    if image_url is None:
+        return None
+    page_url = _first_public_http_url(r, "url", "page_url")
+    width, height = _image_dimensions(r)
+    engine = _image_text(r, "engine")
+    if not engine and isinstance(r.get("engines"), (list, tuple)):
+        engine = next(
+            (item.strip() for item in r["engines"] if isinstance(item, str) and item.strip()),
+            "",
+        )
+    engine = engine.lower()
+    if engine not in _MODERATE_SAFESEARCH_IMAGE_ENGINES:
+        return None
+    source = _image_text(r, "source") or (_domain(page_url) if page_url else "")
+    return {
+        "title": _image_text(r, "title") or "Untitled",
+        "image_url": image_url,
+        "thumbnail_url": _first_public_http_url(
+            r, "thumbnail_src", "thumbnail_url", "thumbnail"
+        ),
+        "page_url": page_url,
+        "source": source,
+        "engine": engine or "searxng",
+        "width": width,
+        "height": height,
+        "mime_type": _image_mime_type(r),
+        "creator": _image_text(r, "creator", "author"),
+        "license": _image_text(r, "license", "license_name"),
+        "license_url": _public_http_url(r.get("license_url")),
     }
 
 
@@ -548,6 +687,25 @@ def _dedupe_and_rank(results: list[dict[str, Any]], num_results: int) -> list[di
     unique: list[dict[str, Any]] = []
     for result in results:
         key = _canonical_result_url(str(result.get("url") or ""))
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        unique.append(dict(result))
+        if len(unique) >= num_results:
+            break
+    for index, result in enumerate(unique, 1):
+        result["rank"] = index
+    return unique
+
+
+def _dedupe_and_rank_images(
+    results: list[dict[str, Any]], num_results: int
+) -> list[dict[str, Any]]:
+    """Dedupe canonical image URLs before truncation while preserving SearXNG order."""
+    seen: set[str] = set()
+    unique: list[dict[str, Any]] = []
+    for result in results:
+        key = _canonical_result_url(str(result.get("image_url") or ""))
         if not key or key in seen:
             continue
         seen.add(key)
@@ -629,6 +787,54 @@ def _format_results(
             timings_ms=timings_ms,
             unresponsive_engines=unresponsive_engines,
             provider_states=provider_states,
+        ),
+    }
+    _record_last_search(payload)
+    return json.dumps(payload)
+
+
+def _format_image_results(
+    query: str,
+    results: list[dict[str, Any]],
+    suggestions: list[str],
+    *,
+    status: str,
+    backend: str,
+    fallback_reason: str | None,
+    timings_ms: dict[str, float | None],
+    unresponsive_engines: list[Any],
+    provider_states: dict[str, str],
+) -> str:
+    if results:
+        lines = [f"## Image search: {query}\n"]
+        for result in results:
+            source = result.get("source") or result.get("engine") or ""
+            lines.append(f"{result['rank']}. **{result['title']}** — {source}")
+            if result.get("page_url"):
+                lines.append(f"   Page: {result['page_url']}")
+            lines.append(f"   Image: {result['image_url']}")
+            lines.append("")
+        if suggestions:
+            lines.append(f"Related: {', '.join(suggestions[:5])}")
+        text = "\n".join(lines)
+    else:
+        text = f"No image results found for: {query}"
+
+    payload = {
+        "query": query,
+        "results": results,
+        "suggestions": suggestions[:5],
+        "text": text,
+        "safe_search": "moderate",
+        **_search_metadata(
+            status=status,
+            backend=backend,
+            attempted=["searxng"],
+            fallback_reason=fallback_reason,
+            timings_ms=timings_ms,
+            unresponsive_engines=unresponsive_engines,
+            provider_states=provider_states,
+            mode="disabled",
         ),
     }
     _record_last_search(payload)
@@ -946,6 +1152,20 @@ def _coerce_request_outcome(value: Any) -> _RequestOutcome:
     return _RequestOutcome(None, "error", 1, "request failed")
 
 
+def _searxng_url_is_loopback() -> bool:
+    try:
+        parsed = urllib.parse.urlsplit(SEARXNG_URL)
+        host = parsed.hostname or ""
+        if parsed.scheme.lower() not in {"http", "https"} or not host:
+            return False
+        if parsed.username is not None or parsed.password is not None:
+            return False
+        _ = parsed.port
+        return host.lower().rstrip(".") == "localhost" or ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
 async def _searxng_request(
     path: str, params: dict, timeout: float | None = None
 ) -> _RequestOutcome:
@@ -1062,6 +1282,94 @@ async def _searxng_search(query: str, num_results: int) -> _BackendOutcome:
     if not isinstance(raw_results, list):
         raw_results = []
     results = [_normalize_searxng_result(item) for item in raw_results[:num_results] if isinstance(item, dict)]
+    suggestions = request.data.get("suggestions", [])
+    if not isinstance(suggestions, list):
+        suggestions = []
+    unresponsive = request.data.get("unresponsive_engines", [])
+    if not isinstance(unresponsive, list):
+        unresponsive = []
+    state = "degraded" if unresponsive else ("ok" if results else "empty")
+    return _BackendOutcome(
+        backend="searxng",
+        results=results,
+        suggestions=[str(item) for item in suggestions],
+        ok=True,
+        state=state,
+        elapsed_ms=elapsed_ms,
+        attempts=request.attempts,
+        unresponsive_engines=unresponsive,
+        http_status=request.http_status,
+        circuit_before=str(circuit_before["state"]),
+        circuit_after=str(circuit_after["state"]),
+        circuit_transition=circuit_transition,
+        circuit_failures=int(circuit_after["consecutive_failures"]),
+    )
+
+
+async def _searxng_image_search(query: str, num_results: int) -> _BackendOutcome:
+    """Search images through loopback SearXNG only and normalize URL metadata."""
+    started = time.monotonic()
+    circuit_before = _breaker.snapshot("searxng")
+    if not _searxng_url_is_loopback():
+        return _BackendOutcome(
+            backend="searxng",
+            state="error",
+            elapsed_ms=round((time.monotonic() - started) * 1000, 1),
+            error="SearXNG URL is not loopback",
+            circuit_before=str(circuit_before["state"]),
+            circuit_after=str(circuit_before["state"]),
+            circuit_failures=int(circuit_before["consecutive_failures"]),
+        )
+    if not _breaker.allow("searxng"):
+        logger.info("SearXNG circuit open; skipping image search")
+        circuit_after = _breaker.snapshot("searxng")
+        return _BackendOutcome(
+            backend="searxng",
+            state="circuit_open",
+            elapsed_ms=round((time.monotonic() - started) * 1000, 1),
+            circuit_before=str(circuit_before["state"]),
+            circuit_after=str(circuit_after["state"]),
+            circuit_failures=int(circuit_after["consecutive_failures"]),
+        )
+
+    try:
+        raw_outcome = await _searxng_request(
+            "/search",
+            {"q": query, "format": "json", "categories": "images", "safesearch": 1},
+        )
+    except asyncio.CancelledError:
+        _breaker.record_aborted("searxng")
+        raise
+
+    request = _coerce_request_outcome(raw_outcome)
+    elapsed_ms = round((time.monotonic() - started) * 1000, 1)
+    if request.data is None:
+        circuit_transition = _breaker.record_failure("searxng")
+        circuit_after = _breaker.snapshot("searxng")
+        return _BackendOutcome(
+            backend="searxng",
+            state=request.state,
+            elapsed_ms=elapsed_ms,
+            attempts=request.attempts,
+            error=request.error,
+            http_status=request.http_status,
+            circuit_before=str(circuit_before["state"]),
+            circuit_after=str(circuit_after["state"]),
+            circuit_transition=circuit_transition,
+            circuit_failures=int(circuit_after["consecutive_failures"]),
+        )
+
+    circuit_transition = _breaker.record_success("searxng")
+    circuit_after = _breaker.snapshot("searxng")
+    raw_results = request.data.get("results", [])
+    if not isinstance(raw_results, list):
+        raw_results = []
+    results = [
+        normalized
+        for item in raw_results[:num_results]
+        if isinstance(item, dict)
+        and (normalized := _normalize_searxng_image_result(item)) is not None
+    ]
     suggestions = request.data.get("suggestions", [])
     if not isinstance(suggestions, list):
         suggestions = []
@@ -1620,6 +1928,110 @@ async def web_search(query: str, num_results: int = 8) -> str:
         timings_ms=timings_ms,
         searxng=searxng,
         tavily=tavily,
+    )
+
+
+@mcp.tool()
+async def image_search(query: str, num_results: int = 8) -> str:
+    """Search public image metadata via loopback SearXNG with moderate SafeSearch."""
+    started = time.monotonic()
+    query = query.strip()
+    requested = min(MAX_NUM_RESULTS, max(1, int(num_results)))
+    if not query:
+        timings_ms = {
+            "total": round((time.monotonic() - started) * 1000, 1),
+            "searxng": None,
+            "tavily": None,
+        }
+        return _finish_search(
+            _search_error_payload(
+                query,
+                "Image search error: query must not be empty.",
+                timings_ms=timings_ms,
+                mode="disabled",
+            ),
+            status="error",
+            backend="none",
+            requested_count=requested,
+            result_count=0,
+            timings_ms=timings_ms,
+            mode="disabled",
+        )
+
+    candidate_limit = min(
+        MAX_NUM_RESULTS * RESULT_OVERFETCH_FACTOR,
+        requested * RESULT_OVERFETCH_FACTOR,
+    )
+    searxng = await _run_backend(
+        "searxng",
+        _searxng_image_search(query, candidate_limit),
+        min(SEARCH_TIMEOUT, SEARCH_TOTAL_TIMEOUT),
+    )
+    results = _dedupe_and_rank_images(searxng.results, requested)
+    timings_ms = _timings(started, searxng, None)
+    provider_states = {"searxng": searxng.state}
+    fallback_reason: str | None = None
+
+    if results:
+        status = "degraded" if searxng.state == "degraded" else "ok"
+        backend = "searxng"
+        rendered = _format_image_results(
+            query,
+            results,
+            searxng.suggestions,
+            status=status,
+            backend=backend,
+            fallback_reason=None,
+            timings_ms=timings_ms,
+            unresponsive_engines=searxng.unresponsive_engines,
+            provider_states=provider_states,
+        )
+    elif searxng.ok:
+        status = "degraded" if searxng.state == "degraded" else "empty"
+        backend = "none"
+        fallback_reason = "searxng_degraded" if status == "degraded" else None
+        rendered = _format_image_results(
+            query,
+            [],
+            searxng.suggestions,
+            status=status,
+            backend=backend,
+            fallback_reason=fallback_reason,
+            timings_ms=timings_ms,
+            unresponsive_engines=searxng.unresponsive_engines,
+            provider_states=provider_states,
+        )
+    else:
+        status = "error"
+        backend = "none"
+        fallback_reason = _fallback_reason(searxng, 0, requested)
+        message = (
+            "Image search error: loopback SearXNG is required."
+            if searxng.error == "SearXNG URL is not loopback"
+            else "Image search error: loopback SearXNG failed."
+        )
+        rendered = _search_error_payload(
+            query,
+            message,
+            searxng.suggestions,
+            attempted=["searxng"],
+            fallback_reason=fallback_reason,
+            timings_ms=timings_ms,
+            unresponsive_engines=searxng.unresponsive_engines,
+            provider_states=provider_states,
+            mode="disabled",
+        )
+
+    return _finish_search(
+        rendered,
+        status=status,
+        backend=backend,
+        requested_count=requested,
+        result_count=len(results),
+        fallback_reason=fallback_reason,
+        timings_ms=timings_ms,
+        searxng=searxng,
+        mode="disabled",
     )
 
 

@@ -2,7 +2,7 @@
 
 A self-contained, installable local web-search stack for developer/agent
 tooling and Home Automation. Runs SearXNG (metasearch) and a FastMCP wrapper
-that exposes `web_search` / `web_fetch` tools over MCP (HTTP and stdio), with
+that exposes `web_search` / `image_search` / `web_fetch` tools over MCP (HTTP and stdio), with
 **Tavily failover** for reliability when SearXNG's scraped engines block or
 rate-limit.
 
@@ -41,7 +41,10 @@ egress is explicit and controlled by `WEBSEARCH_TAVILY_MODE`:
 
 The SearXNG layer deliberately keeps only a tested engine set: Google CSE,
 DuckDuckGo, Bing, Startpage, the tracked defensive Mwmbl JSON adapter, and the
-focused Wikipedia/GitHub/arXiv engines. HTML Google, Qwant, Mojeek, and the
+focused Wikipedia/GitHub/arXiv engines. Image search uses only the pinned-upstream
+`duckduckgo images` and `google images` engines, whose request implementations
+apply moderate SafeSearch. Broker normalization rejects results attributed to
+any other image engine. HTML Google web search, Qwant, Mojeek, and the
 rate-limited Brave web scraper stay excluded. The `keep_only` policy prevents
 new upstream defaults from silently joining every brokered search. Google CSE
 is upstream's temporary replacement for its blocked HTML Google adapter and is
@@ -58,6 +61,32 @@ contract and adds `status`, `backend`, `attempted`, `fallback_reason`,
 `timings_ms`, `provider_states`, `mode`, and `unresponsive_engines`. `status` distinguishes
 `ok`, `empty`, `degraded`, and terminal `error`; only terminal errors carry the
 legacy `error` key.
+
+### Image search contract
+
+`image_search(query: str, num_results: int = 8)` uses only the configured
+loopback SearXNG endpoint. It sends category `images` with numeric
+`SafeSearch=1` (moderate), accepts results only from the verified engine allowlist,
+never resolves a Tavily key, and never falls back to or supplements from Tavily.
+Its SearXNG stage and total runtime use the same
+bounded timeout policy as `web_search`; requested results are clamped to 1–20.
+Image payloads use the normal metadata fields above with `mode: "disabled"`,
+`attempted: ["searxng"]`, and `timings_ms.tavily: null`.
+
+Each image result always has exactly these normalized fields:
+
+```text
+rank, title, image_url, thumbnail_url, page_url, source, engine,
+width, height, mime_type, creator, license, license_url
+```
+
+`image_url` is required. Invalid, local/private-looking, credential-bearing, or
+non-HTTP(S) image candidates are dropped; invalid optional URLs become `null`.
+Candidates are deduplicated by canonical image URL before truncation while
+preserving SearXNG order. Missing dimensions, MIME type, and optional URLs are
+`null`; unavailable text metadata is an empty string. The broker returns URLs
+only: it does not fetch or store image bytes, and query-free telemetry stores no
+queries, URLs, titles, or result metadata.
 
 ### Tavily: keyless by default, optional key upgrade
 
@@ -263,6 +292,7 @@ installed separately on machines that want a local search backend.
 - **Readable bounded fetches**: responses are byte-capped; HTML preserves links to attachments; text PDFs use Poppler; scanned PDFs use bounded macOS Vision OCR when available. Unsupported binary data is never presented as successfully read text.
 - **Bounded search**: one total deadline contains SearXNG retries and Tavily
   fallback; timeout and circuit states remain visible in result metadata.
+  Image search uses the SearXNG portion of the same deadline and has no Tavily path.
 - **Consistent states**: searches distinguish `ok`, `empty`, `degraded`, and
   terminal `error`; fetch errors retain the stable `Fetch error:` prefix.
 - **Health separation**: `/live` is dependency-free; `/ready` returns 503 only
@@ -290,6 +320,9 @@ Covers the SSRF rejection matrix, `web_fetch` errors, compatibility payloads,
 Tavily disabled/fallback/supplement policy, overfetch/dedupe, bounded stage
 timeouts, distinct empty/degraded/error states, readiness, safe last-search
 metadata, single-probe half-open circuits, key separation, and `tools/list`.
+Focused image tests cover category/SafeSearch request parameters, URL and field
+normalization, canonical-image dedupe/limits, empty/degraded/error states,
+loopback enforcement, no-Tavily behavior, and query/result-free telemetry.
 Telemetry tests cover persistence across reopen, aggregation windows, schema and
 row privacy, concurrent writes, invalid windows, unavailable/disabled storage,
 file permissions, HTTP 429/circuit/fallback counts, and explicit reset.
@@ -304,7 +337,7 @@ local-search/
 ├── scripts/
 │   └── local-search              # operator CLI (install/uninstall/start/stop/...)
 ├── mcp-websearch/
-│   ├── server.py                 # MCP tools, provider policy, PDF extraction, and HTTP routes
+│   ├── server.py                 # MCP web/image/fetch tools, provider policy, PDF extraction, and HTTP routes
 │   ├── telemetry.py              # query-free SQLite events, aggregates, and reset
 │   ├── macos_vision_ocr.swift    # optional scanned-PDF OCR helper
 │   ├── http_server.py            # HTTP transport entrypoint (uvicorn)

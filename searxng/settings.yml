@@ -9,6 +9,8 @@ use_default_settings:
       - wikipedia
       - github
       - arxiv
+      - duckduckgo images
+      - google images
 
 general:
   instance_name: "Local SearXNG"
@@ -67,4 +69,10 @@ engines:
   - name: github
     disabled: false
   - name: arxiv
+    disabled: false
+  # Image engines whose pinned implementations apply moderate SafeSearch.
+  # Broker normalization rejects results from every other image engine.
+  - name: duckduckgo images
+    disabled: false
+  - name: google images
     disabled: false

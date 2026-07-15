@@ -63,6 +63,8 @@ _KNOWN_ENGINE_NAMES = {
     "wikipedia",
     "github",
     "arxiv",
+    "duckduckgo images",
+    "google images",
 }
 _CIRCUIT_TRANSITIONS = {"none", "opened", "reopened", "recovered"}
 
