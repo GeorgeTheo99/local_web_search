@@ -8,11 +8,15 @@ import re
 import runpy
 from pathlib import Path
 
-_QUERY_PARAM = re.compile(r"([?&](?:q|query|s)=)[^&\s\"']+", re.IGNORECASE)
+# Search engines use many parameter names, so redact every URL query value.
+# Some providers (notably Wikipedia REST) place the search term in the path.
+_QUERY_VALUE = re.compile(r"([?&][^=&\s#\"']+=)[^&\s#\"']*", re.IGNORECASE)
+_SUMMARY_PATH = re.compile(r"(/page/summary/)[^?\s#\"']+", re.IGNORECASE)
 
 
 def _redact_search_terms(message: str) -> str:
-    return _QUERY_PARAM.sub(r"\1[redacted]", message)
+    message = _SUMMARY_PATH.sub(r"\1[redacted]", message)
+    return _QUERY_VALUE.sub(r"\1[redacted]", message)
 
 
 def _install_query_redaction() -> None:

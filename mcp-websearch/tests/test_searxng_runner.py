@@ -20,14 +20,25 @@ _ENGINE_SPEC.loader.exec_module(mwmbl)
 def test_redacts_search_query_parameters_from_logs():
     message = "GET https://search.example/search?q=private+terms&source=web"
     assert runner._redact_search_terms(message) == (
-        "GET https://search.example/search?q=[redacted]&source=web"
+        "GET https://search.example/search?q=[redacted]&source=[redacted]"
     )
 
 
-def test_redacts_common_query_parameter_names_without_changing_other_urls():
-    assert runner._redact_search_terms("/api?query=secret&page=1") == "/api?query=[redacted]&page=1"
-    assert runner._redact_search_terms("/api?s=secret") == "/api?s=[redacted]"
+def test_redacts_all_query_parameter_values_without_changing_query_free_urls():
+    assert runner._redact_search_terms("/api?query=secret&page=1") == (
+        "/api?query=[redacted]&page=[redacted]"
+    )
+    assert runner._redact_search_terms("/api?unknown=encoded%20terms#fragment") == (
+        "/api?unknown=[redacted]#fragment"
+    )
     assert runner._redact_search_terms("https://example.com/health") == "https://example.com/health"
+
+
+def test_redacts_query_bearing_summary_paths():
+    message = "GET https://en.example/api/rest_v1/page/summary/private_topic?redirect=true"
+    assert runner._redact_search_terms(message) == (
+        "GET https://en.example/api/rest_v1/page/summary/[redacted]?redirect=[redacted]"
+    )
 
 
 def test_mwmbl_adapter_handles_missing_extracts():

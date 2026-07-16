@@ -1,0 +1,283 @@
+#!/usr/bin/env bash
+# local-search-tunnel — manage a loopback-only SSH tunnel to local-search on macOS.
+#
+# Usage:
+#   local-search-tunnel render --ssh-host <ssh-config-alias>
+#   local-search-tunnel install --ssh-host <ssh-config-alias> [--no-start]
+#   local-search-tunnel start | stop | status | verify
+#   local-search-tunnel rotate-logs --yes
+#   local-search-tunnel uninstall
+set -euo pipefail
+
+LABEL="com.local.local-search-tunnel"
+PLIST_DIR="$HOME/Library/LaunchAgents"
+PLIST_PATH="$PLIST_DIR/$LABEL.plist"
+LOG_DIR="${LOCAL_SEARCH_TUNNEL_LOG_DIR:-$HOME/Library/Logs/local-search-tunnel}"
+LOG_PATH="$LOG_DIR/ssh-tunnel.log"
+LOCAL_PORT=8889
+REMOTE_PORT=8889
+ENDPOINT="http://127.0.0.1:${LOCAL_PORT}/mcp"
+
+log() { printf '▶ %s\n' "$*"; }
+ok() { printf '✓ %s\n' "$*"; }
+die() { printf '✗ %s\n' "$*" >&2; exit 1; }
+
+usage() {
+  sed -n '2,/^set -euo/p' "$0" | grep -E '^#   ' | sed 's/^#   /  /'
+  exit 1
+}
+
+require_macos_tools() {
+  [ "$(uname -s)" = "Darwin" ] || die "this helper requires macOS launchd"
+  [ -x /usr/bin/ssh ] || die "required command not found: /usr/bin/ssh"
+  command -v launchctl >/dev/null 2>&1 || die "required command not found: launchctl"
+  command -v plutil >/dev/null 2>&1 || die "required command not found: plutil"
+}
+
+validate_ssh_host() {
+  local value="$1"
+  [ -n "$value" ] || die "--ssh-host is required"
+  case "$value" in
+    -*|*[!A-Za-z0-9._@:-]*)
+      die "--ssh-host must be an SSH config alias or destination using only A-Z, a-z, 0-9, . _ @ : -"
+      ;;
+  esac
+}
+
+parse_ssh_host() {
+  SSH_HOST=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --ssh-host)
+        [ $# -ge 2 ] || die "--ssh-host requires a value"
+        SSH_HOST="$2"
+        shift 2
+        ;;
+      *) die "unknown argument: $1" ;;
+    esac
+  done
+  validate_ssh_host "$SSH_HOST"
+}
+
+render_plist() {
+  local ssh_host="$1"
+  validate_ssh_host "$ssh_host"
+  cat <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>Label</key><string>${LABEL}</string>
+<key>ProgramArguments</key><array>
+  <string>/usr/bin/ssh</string>
+  <string>-N</string>
+  <string>-T</string>
+  <string>-o</string><string>BatchMode=yes</string>
+  <string>-o</string><string>ExitOnForwardFailure=yes</string>
+  <string>-o</string><string>ServerAliveInterval=30</string>
+  <string>-o</string><string>ServerAliveCountMax=3</string>
+  <string>-o</string><string>ConnectTimeout=10</string>
+  <string>-o</string><string>ConnectionAttempts=1</string>
+  <string>-o</string><string>ForwardAgent=no</string>
+  <string>-L</string><string>127.0.0.1:${LOCAL_PORT}:127.0.0.1:${REMOTE_PORT}</string>
+  <string>--</string><string>${ssh_host}</string>
+</array>
+<key>StandardOutPath</key><string>${LOG_PATH}</string>
+<key>StandardErrorPath</key><string>${LOG_PATH}</string>
+<key>ProcessType</key><string>Background</string>
+<key>KeepAlive</key><true/>
+<key>RunAtLoad</key><true/>
+<key>ThrottleInterval</key><integer>30</integer>
+<key>Umask</key><integer>63</integer>
+</dict></plist>
+EOF
+}
+
+ensure_private_paths() {
+  mkdir -p "$PLIST_DIR" "$LOG_DIR"
+  chmod 700 "$LOG_DIR"
+  (umask 077; touch "$LOG_PATH")
+  chmod 600 "$LOG_PATH"
+  [ ! -f "$PLIST_PATH" ] || chmod 600 "$PLIST_PATH"
+}
+
+is_loaded() {
+  launchctl print "gui/$(id -u)/$LABEL" >/dev/null 2>&1
+}
+
+bootout() {
+  launchctl bootout "gui/$(id -u)/$LABEL" >/dev/null 2>&1 || true
+}
+
+bootstrap() {
+  local _
+  for _ in 1 2 3; do
+    launchctl bootstrap "gui/$(id -u)" "$PLIST_PATH" >/dev/null 2>&1 && return 0
+    sleep 1
+  done
+  die "could not bootstrap $LABEL; inspect $LOG_PATH"
+}
+
+local_port_available() {
+  if command -v lsof >/dev/null 2>&1 && lsof -nP -iTCP:"$LOCAL_PORT" -sTCP:LISTEN >/dev/null 2>&1; then
+    return 1
+  fi
+  return 0
+}
+
+cmd_render() {
+  parse_ssh_host "$@"
+  render_plist "$SSH_HOST"
+}
+
+cmd_install() {
+  local start=1 ssh_host="" arg
+  while [ $# -gt 0 ]; do
+    arg="$1"
+    case "$arg" in
+      --ssh-host)
+        [ $# -ge 2 ] || die "--ssh-host requires a value"
+        ssh_host="$2"
+        shift 2
+        ;;
+      --no-start) start=0; shift ;;
+      *) die "unknown argument: $arg" ;;
+    esac
+  done
+  validate_ssh_host "$ssh_host"
+  require_macos_tools
+  ensure_private_paths
+
+  local tmp changed=1 was_loaded=0
+  tmp="$(mktemp "$PLIST_DIR/.${LABEL}.XXXXXX")"
+  trap 'rm -f "${tmp:-}"' EXIT
+  (umask 077; render_plist "$ssh_host" >"$tmp")
+  chmod 600 "$tmp"
+  plutil -lint "$tmp" >/dev/null || die "generated plist is invalid"
+  if [ -f "$PLIST_PATH" ] && cmp -s "$tmp" "$PLIST_PATH"; then
+    changed=0
+  fi
+  is_loaded && was_loaded=1
+
+  if [ "$changed" -eq 1 ]; then
+    [ "$was_loaded" -eq 0 ] || bootout
+    mv -f "$tmp" "$PLIST_PATH"
+    chmod 600 "$PLIST_PATH"
+    trap - EXIT
+    ok "Wrote $PLIST_PATH"
+  else
+    rm -f "$tmp"
+    trap - EXIT
+    chmod 600 "$PLIST_PATH"
+    ok "Plist already current"
+  fi
+
+  if [ "$start" -eq 1 ]; then
+    if [ "$changed" -eq 1 ] || [ "$was_loaded" -eq 0 ]; then
+      local_port_available || die "127.0.0.1:$LOCAL_PORT is already in use"
+      bootstrap
+    fi
+    verify_tunnel
+  fi
+  ok "Client endpoint: $ENDPOINT"
+}
+
+cmd_start() {
+  require_macos_tools
+  [ -f "$PLIST_PATH" ] || die "missing $PLIST_PATH; run install first"
+  ensure_private_paths
+  if is_loaded; then
+    ok "$LABEL already loaded"
+  else
+    local_port_available || die "127.0.0.1:$LOCAL_PORT is already in use"
+    bootstrap
+    ok "Started $LABEL"
+  fi
+}
+
+cmd_stop() {
+  require_macos_tools
+  bootout
+  ok "Stopped $LABEL"
+}
+
+cmd_status() {
+  local state="not-loaded"
+  if is_loaded; then
+    state="$(launchctl print "gui/$(id -u)/$LABEL" 2>/dev/null | awk -F' = ' '/^[[:space:]]*state/ {print $2; exit}')"
+  fi
+  printf '%-18s %s\n' "launchd:" "${state:-unknown}"
+  printf '%-18s %s\n' "plist:" "$PLIST_PATH"
+  printf '%-18s %s\n' "endpoint:" "$ENDPOINT"
+  printf '%-18s %s\n' "/live:" "$(curl -fsS --max-time 3 "http://127.0.0.1:${LOCAL_PORT}/live" 2>/dev/null || echo DOWN)"
+}
+
+verify_tunnel() {
+  local live tools
+  command -v curl >/dev/null 2>&1 || die "required command not found: curl"
+  command -v python3 >/dev/null 2>&1 || die "required command not found: python3"
+  live="$(curl -fsS --max-time 5 "http://127.0.0.1:${LOCAL_PORT}/live" 2>/dev/null || true)"
+  printf '%s' "$live" | grep -q '"status":"ok"' || die "tunnel endpoint /live is unavailable"
+  tools="$(curl -fsS --max-time 5 -X POST "$ENDPOINT" \
+    -H 'content-type: application/json' -H 'accept: application/json' \
+    -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' 2>/dev/null \
+    | python3 -c 'import json,sys; d=json.load(sys.stdin); names=[t["name"] for t in d.get("result",{}).get("tools",[])]; required={"web_search","image_search","web_fetch"}; print(("ok:" if required.issubset(names) else "missing:") + ",".join(names))' 2>/dev/null || true)"
+  case "$tools" in
+    ok:*) ok "Tunnel verified: ${tools#ok:}" ;;
+    *) die "required MCP tools missing from tools/list: '${tools#missing:}'" ;;
+  esac
+}
+
+cmd_rotate_logs() {
+  [ "${1:-}" = "--yes" ] || die "usage: local-search-tunnel rotate-logs --yes"
+  require_macos_tools
+  ensure_private_paths
+  local was_loaded=0 stamp archive archived n=0
+  is_loaded && was_loaded=1
+  [ "$was_loaded" -eq 0 ] || bootout
+  local_port_available || die "127.0.0.1:$LOCAL_PORT is still in use; log was not rotated"
+  stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+  archive="$LOG_DIR/archive"
+  mkdir -p "$archive"
+  chmod 700 "$archive"
+  if [ -s "$LOG_PATH" ]; then
+    archived="$archive/ssh-tunnel.${stamp}.log"
+    while [ -e "$archived" ]; do
+      n=$((n+1))
+      archived="$archive/ssh-tunnel.${stamp}.${n}.log"
+    done
+    mv "$LOG_PATH" "$archived"
+    chmod 600 "$archived"
+    ok "Archived log without deleting it: $archived"
+  fi
+  (umask 077; : >"$LOG_PATH")
+  chmod 600 "$LOG_PATH"
+  if [ "$was_loaded" -eq 1 ]; then
+    bootstrap
+    verify_tunnel
+  fi
+}
+
+cmd_uninstall() {
+  require_macos_tools
+  bootout
+  rm -f "$PLIST_PATH"
+  ok "Removed $PLIST_PATH (logs retained at $LOG_DIR)"
+}
+
+main() {
+  [ $# -ge 1 ] || usage
+  case "$1" in
+    render) shift; cmd_render "$@" ;;
+    install) shift; cmd_install "$@" ;;
+    start) cmd_start ;;
+    stop) cmd_stop ;;
+    status) cmd_status ;;
+    verify) verify_tunnel ;;
+    rotate-logs) shift; cmd_rotate_logs "$@" ;;
+    uninstall) cmd_uninstall ;;
+    -h|--help|help) usage ;;
+    *) die "unknown command: $1" ;;
+  esac
+}
+
+main "$@"

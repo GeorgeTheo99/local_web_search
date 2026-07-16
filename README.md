@@ -175,9 +175,10 @@ What `install.sh` does (delegates to `scripts/local-search install`):
 1. Clones/updates SearXNG source into `searxng/src` at the pinned ref.
 2. Builds the SearXNG venv (`uv venv` + `requirements.txt` + editable install).
 3. Builds the MCP websearch venv (`uv sync`).
-4. Creates the private telemetry data directory and writes launchd plists
-   (`com.local.searxng`, `com.local.mcp-websearch`) into
-   `~/Library/LaunchAgents/`, with logs under `~/Library/Logs/local-search/`.
+4. Creates the private telemetry/log directories and writes mode-`0600`
+   launchd plists (`com.local.searxng`, `com.local.mcp-websearch`) into
+   `~/Library/LaunchAgents/`, with mode-`0600` logs under
+   `~/Library/Logs/local-search/` and launchd `Umask 077`.
 5. Starts services (SearXNG first, then MCP) and runs health verification.
 
 Flags / non-secret policy overrides:
@@ -209,6 +210,7 @@ local-search stats [24h|7d|30d]      query-free telemetry aggregates
 local-search telemetry-reset --yes   explicitly erase telemetry events
 local-search verify                  health + tools/list smoke
 local-search logs [searxng|mcp] [-f|N]
+local-search rotate-logs --yes       privately archive logs without deleting them
 local-search update                  git pull + rebuild venvs + restart + verify
 local-search update-searxng-ref <sha>   pin a new SearXNG commit
 local-search mcp-stdio               run MCP in stdio mode (for client config)
@@ -270,6 +272,27 @@ stdio transport (Claude `settings.json`):
 
 HTTP transport (any MCP client): `http://127.0.0.1:8889/mcp`.
 
+### Remote clients
+
+The supported remote architecture is a persistent SSH local forward. The broker
+stays bound to server loopback, and the remote client still uses exactly:
+
+```text
+http://127.0.0.1:8889/mcp
+```
+
+Use [`scripts/local-search-tunnel`](scripts/local-search-tunnel) on a client Mac.
+It creates a secret-free, private LaunchAgent and does not edit Pi or another
+client's configuration. The complete key restrictions, threat model, install,
+status, verify, log rotation, and uninstall procedure is in
+[`docs/remote-mcp-over-ssh.md`](docs/remote-mcp-over-ssh.md). The architecture
+comparison and direct-exposure prerequisites are recorded in
+[ADR 0001](docs/adr/0001-loopback-mcp-over-ssh.md).
+
+Do not proxy MCP through Caddy, bind it to a LAN/tailnet interface, or add a
+public endpoint. A Tailscale address may transport SSH, but SSH remains the
+client authentication boundary.
+
 ## Distribution matrix
 
 Home Automation supports several search backends. This stack is one option:
@@ -303,9 +326,13 @@ installed separately on machines that want a local search backend.
   stores no query/result/credential data, uses a private data directory and
   file permissions, and fails open so monitoring cannot break search.
 - **Local binding**: SearXNG and the MCP HTTP broker listen on loopback only.
+  HTTP requests also require an exact loopback `Host`; a supplied browser
+  `Origin` must be loopback.
 - **Query-log hygiene**: broker HTTP client logging suppresses full request
-  URLs, and the tracked SearXNG runner redacts `q`/`query`/`s` parameters from
-  operational log messages before they are written.
+  URLs, and the tracked SearXNG runner redacts every URL query value plus known
+  query-bearing summary paths before operational messages are written. Use
+  `local-search rotate-logs --yes` to preserve old logs in a private archive and
+  start clean files; archives are never deleted automatically.
 - **Dependency-ordered restart**: MCP is stopped before SearXNG and started after
   SearXNG is healthy; ports are checked free to avoid bind races.
 - **KeepAlive**: both services auto-restart on crash (`ThrottleInterval` 5s).
@@ -325,7 +352,10 @@ normalization, canonical-image dedupe/limits, empty/degraded/error states,
 loopback enforcement, no-Tavily behavior, and query/result-free telemetry.
 Telemetry tests cover persistence across reopen, aggregation windows, schema and
 row privacy, concurrent writes, invalid windows, unavailable/disabled storage,
-file permissions, HTTP 429/circuit/fallback counts, and explicit reset.
+file permissions, HTTP 429/circuit/fallback counts, and explicit reset. Tunnel
+helper tests validate exact SSH arguments, plist structure, idempotence, and
+private permissions; HTTP tests cover Host/Origin rejection and the loopback
+bind regression.
 
 ## Layout
 
@@ -334,8 +364,12 @@ local-search/
 ├── install.sh                    # bootstrap entrypoint (→ scripts/local-search install)
 ├── data/
 │   └── README.md                 # private telemetry location (SQLite files ignored)
+├── docs/
+│   ├── remote-mcp-over-ssh.md     # remote client setup and operations
+│   └── adr/0001-loopback-mcp-over-ssh.md
 ├── scripts/
-│   └── local-search              # operator CLI (install/uninstall/start/stop/...)
+│   ├── local-search              # server operator CLI
+│   └── local-search-tunnel       # macOS remote-client SSH LaunchAgent helper
 ├── mcp-websearch/
 │   ├── server.py                 # MCP web/image/fetch tools, provider policy, PDF extraction, and HTTP routes
 │   ├── telemetry.py              # query-free SQLite events, aggregates, and reset

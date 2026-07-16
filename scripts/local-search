@@ -14,6 +14,7 @@
 #   local-search telemetry-reset --yes explicitly erase telemetry events
 #   local-search verify                health + tools/list smoke
 #   local-search logs [searxng|mcp] [-f]
+#   local-search rotate-logs --yes     privately archive operational logs
 #   local-search update                git pull + rebuild + restart
 #   local-search update-searxng-ref <sha>
 #   local-search mcp-stdio             run MCP in stdio mode (for client config)
@@ -193,10 +194,16 @@ ensure_mcp_venv() {
 # Launchd plist management.
 # --------------------------------------------------------------------------- #
 write_plist() {
-  local label="$1" plist="$2"
+  local label="$1" plist="$2" target tmp
+  target="$PLIST_DIR/$label.plist"
   mkdir -p "$PLIST_DIR"
-  printf '%s' "$plist" >"$PLIST_DIR/$label.plist"
-  ok "Wrote $PLIST_DIR/$label.plist"
+  tmp="$(mktemp "$PLIST_DIR/.${label}.XXXXXX")"
+  (umask 077; printf '%s' "$plist" >"$tmp")
+  chmod 600 "$tmp"
+  /usr/bin/plutil -lint "$tmp" >/dev/null || { rm -f "$tmp"; die "invalid plist for $label"; }
+  mv -f "$tmp" "$target"
+  chmod 600 "$target"
+  ok "Wrote $target"
 }
 
 searxng_plist() {
@@ -217,6 +224,7 @@ searxng_plist() {
 <key>KeepAlive</key><true/>
 <key>RunAtLoad</key><true/>
 <key>ThrottleInterval</key><integer>5</integer>
+<key>Umask</key><integer>63</integer>
 </dict></plist>
 EOF
 }
@@ -248,12 +256,20 @@ mcp_plist() {
 <key>KeepAlive</key><true/>
 <key>RunAtLoad</key><true/>
 <key>ThrottleInterval</key><integer>5</integer>
+<key>Umask</key><integer>63</integer>
 </dict></plist>
 EOF
 }
 
-install_plists() {
+ensure_private_logs() {
   mkdir -p "$LOG_DIR"
+  chmod 700 "$LOG_DIR"
+  (umask 077; touch "$LOG_DIR/searxng.log" "$LOG_DIR/mcp-websearch.log")
+  chmod 600 "$LOG_DIR/searxng.log" "$LOG_DIR/mcp-websearch.log"
+}
+
+install_plists() {
+  ensure_private_logs
   ensure_data_dir
   persist_install_config
   write_plist "$SEARXNG_LABEL" "$(searxng_plist)"
@@ -494,13 +510,66 @@ cmd_telemetry_reset() {
 
 cmd_logs() {
   local which="${1:-all}"
-  mkdir -p "$LOG_DIR"
+  ensure_private_logs
   case "$which" in
     searxng) tail "${2:--50}" "$LOG_DIR/searxng.log" 2>/dev/null || warn "no searxng log yet" ;;
     mcp|mcp-websearch) tail "${2:--50}" "$LOG_DIR/mcp-websearch.log" 2>/dev/null || warn "no mcp log yet" ;;
     all|"") tail "${2:--50}" "$LOG_DIR/searxng.log" "$LOG_DIR/mcp-websearch.log" 2>/dev/null || warn "no logs yet" ;;
     *) die "usage: local-search logs [searxng|mcp] [lines]" ;;
   esac
+}
+
+cmd_rotate_logs() {
+  [ "${1:-}" = "--yes" ] || die "usage: local-search rotate-logs --yes"
+  local searxng_loaded=0 mcp_loaded=0 stamp archive file target archived n rc=0
+  launchctl print "gui/$(id -u)/$SEARXNG_LABEL" >/dev/null 2>&1 && searxng_loaded=1
+  launchctl print "gui/$(id -u)/$MCP_LABEL" >/dev/null 2>&1 && mcp_loaded=1
+
+  # Stop first so launchd releases its file descriptors. Existing logs are moved,
+  # never truncated or deleted, and remain available only to the current user.
+  stop_services
+  _wait_port_free "$MCP_PORT" || die "MCP port still active; logs were not rotated"
+  ensure_private_logs
+  stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+  archive="$LOG_DIR/archive"
+  mkdir -p "$archive"
+  chmod 700 "$archive"
+  for file in searxng.log mcp-websearch.log; do
+    target="$LOG_DIR/$file"
+    if [ -s "$target" ]; then
+      n=0
+      archived="$archive/${file%.log}.${stamp}.log"
+      while [ -e "$archived" ]; do
+        n=$((n+1))
+        archived="$archive/${file%.log}.${stamp}.${n}.log"
+      done
+      mv "$target" "$archived"
+      chmod 600 "$archived"
+      ok "Archived without deleting: $archived"
+    fi
+    (umask 077; : >"$target")
+    chmod 600 "$target"
+  done
+
+  if [ "$searxng_loaded" -eq 1 ]; then
+    if ! bootstrap_service "$SEARXNG_LABEL"; then
+      warn "searxng could not be restarted after log rotation"
+      rc=1
+    elif ! wait_http "$SEARXNG_URL/healthz" "OK" 30; then
+      warn "searxng did not become healthy after log rotation"
+      rc=1
+    fi
+  fi
+  if [ "$mcp_loaded" -eq 1 ]; then
+    if ! bootstrap_service "$MCP_LABEL"; then
+      warn "mcp-websearch could not be restarted after log rotation"
+      rc=1
+    elif ! wait_http "http://127.0.0.1:${MCP_PORT}/live" '"status":"ok"' 30; then
+      warn "mcp-websearch did not become live after log rotation"
+      rc=1
+    fi
+  fi
+  return "$rc"
 }
 
 cmd_mcp_stdio() {
@@ -529,6 +598,7 @@ main() {
     telemetry-reset) shift; cmd_telemetry_reset "$@" ;;
     verify) verify ;;
     logs) shift; cmd_logs "$@" ;;
+    rotate-logs) shift; cmd_rotate_logs "$@" ;;
     update) cmd_update ;;
     update-searxng-ref) shift; cmd_update_ref "$@" ;;
     mcp-stdio) cmd_mcp_stdio ;;
@@ -538,4 +608,6 @@ main() {
   esac
 }
 
-main "$@"
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+  main "$@"
+fi
