@@ -40,6 +40,10 @@ async def _call_tool(tool_name: str, arguments: dict[str, Any]) -> Any:
         return await client.call_tool(tool_name, arguments)
 
 
+async def _allow_public_url(_url: str):
+    return [srv.ipaddress.ip_address("8.8.8.8")]
+
+
 def _result_text(result: Any) -> str:
     """Mirror Home Automation's _mcp_result_text extraction.
 
@@ -69,6 +73,11 @@ def _reset_runtime_state(monkeypatch, tmp_path):
     monkeypatch.setattr(srv, "_breaker", srv._CircuitBreaker())
     monkeypatch.setattr(srv, "_last_search", None)
     monkeypatch.setattr(srv, "_telemetry", telemetry)
+
+    async def test_public_fetch_client():
+        return await srv._client()
+
+    monkeypatch.setattr(srv, "_public_fetch_client", test_public_fetch_client)
     yield
     telemetry.close()
 
@@ -138,7 +147,25 @@ async def test_allow_public_domain(monkeypatch):
     async def fake_resolve(host, port, scheme):
         return [ipaddress.ip_address("93.184.216.34")]  # example.com
     monkeypatch.setattr(srv, "_resolve_host_ips", fake_resolve)
-    await srv._validate_public_http_url("https://example.com/")  # should not raise
+    addresses = await srv._validate_public_http_url("https://example.com/")
+    assert addresses == [ipaddress.ip_address("93.184.216.34")]
+
+
+@pytest.mark.asyncio
+async def test_reject_credential_bearing_url():
+    with pytest.raises(ValueError, match="Credential-bearing"):
+        await srv._validate_public_http_url("https://user:pass@example.com/")
+
+
+def test_pinned_public_request_preserves_host_and_tls_sni():
+    address = srv.ipaddress.ip_address("93.184.216.34")
+    url, host, extensions = srv._pinned_public_request(
+        "https://example.com:8443/path?q=1#fragment",
+        address,
+    )
+    assert url == "https://93.184.216.34:8443/path?q=1"
+    assert host == "example.com:8443"
+    assert extensions == {"sni_hostname": "example.com"}
 
 
 # --------------------------------------------------------------------------- #
@@ -174,6 +201,96 @@ def test_html_extractor_preserves_safe_attachment_links_and_base_href():
     assert "bad.pdf" not in text
 
 
+def test_html_main_content_removes_boilerplate_and_preserves_article_links():
+    article = (
+        "The zoning ordinance explains setback requirements, permitted uses, "
+        "application deadlines, and appeal procedures for property owners. " * 8
+    )
+    html = (
+        "<html><body><nav>HOME NAVIGATION PRICING LOGIN</nav>"
+        f'<main><article><h1>Planning Guide</h1><p>{article}</p>'
+        '<a href="details.html">Read details</a></article></main>'
+        "<footer>COOKIE POLICY PRIVACY TERMS SOCIAL</footer></body></html>"
+    )
+    text = srv._extract_html_content(html, "https://example.com/guides/page")
+    assert "Planning Guide" in text
+    assert "setback requirements" in text
+    assert "[Read details](https://example.com/guides/details.html)" in text
+    assert "HOME NAVIGATION" not in text
+    assert "COOKIE POLICY" not in text
+
+
+def test_html_main_content_retains_attachments_omitted_from_article():
+    article = "Primary article content with enough detail for extraction. " * 12
+    html = (
+        '<base href="https://cdn.example.com/files/">'
+        f"<article><p>{article}</p></article>"
+        '<footer><a href="schedule.pdf">Official schedule</a>'
+        '<a href="javascript:alert(1)" download>Unsafe</a></footer>'
+    )
+    text = srv._extract_html_content(html, "https://example.com/page")
+    assert "Primary article content" in text
+    assert "Attachments:" in text
+    assert "[Official schedule](https://cdn.example.com/files/schedule.pdf)" in text
+    assert "javascript:" not in text
+
+
+def test_html_main_content_keeps_late_in_article_attachment_after_truncation():
+    html = (
+        "<article><p>" + ("Long article content. " * 200) + "</p>"
+        '<a href="late-report.pdf">Late report</a></article>'
+    )
+    text = srv._extract_html_content(html, "https://example.com/page", 200)
+    assert len(text) <= 200
+    assert "[Late report](https://example.com/late-report.pdf)" in text
+
+
+def test_html_main_content_bounds_attachment_labels():
+    html = (
+        "<article><p>" + ("Useful article content. " * 30) + "</p></article>"
+        f'<footer><a href="report.pdf">{"label " * 500}</a></footer>'
+    )
+    text = srv._extract_html_content(html, "https://example.com/page", 500)
+    assert len(text) <= 500
+    assert "https://example.com/report.pdf" in text
+    assert ("label " * 50) not in text
+
+
+def test_html_main_content_resolves_relative_base_once():
+    article = "Detailed article content for a relative base URL regression. " * 12
+    html = (
+        '<base href="assets/">'
+        f'<article><p>{article}</p><a href="details.html">Details</a></article>'
+    )
+    text = srv._extract_html_content(html, "https://example.com/path/page")
+    assert "[Details](https://example.com/path/assets/details.html)" in text
+    assert "assets/assets" not in text
+
+
+def test_html_main_content_falls_back_on_short_or_failed_readability(monkeypatch):
+    class BrokenDocument:
+        def __init__(self, *args, **kwargs):
+            raise ValueError("malformed")
+
+    monkeypatch.setattr(srv.htmlx, "Document", BrokenDocument)
+    html = '<nav>Navigation</nav><p>Short but useful fact.</p><a href="report.pdf">Report</a>'
+    text = srv._extract_html_content(html, "https://example.com/page")
+    assert "Navigation" in text
+    assert "Short but useful fact." in text
+    assert text.count("https://example.com/report.pdf") == 1
+
+
+def test_html_main_content_skips_readability_over_size_limit(monkeypatch):
+    class UnexpectedDocument:
+        def __init__(self, *args, **kwargs):
+            raise AssertionError("readability should be skipped")
+
+    monkeypatch.setattr(srv.htmlx, "Document", UnexpectedDocument)
+    monkeypatch.setattr(srv.htmlx, "MAIN_CONTENT_MAX_CHARS", 10)
+    text = srv._extract_html_content("<p>Useful oversized document text.</p>", "https://example.com/")
+    assert text == "Useful oversized document text."
+
+
 class _FakeStream:
     def __init__(self, response):
         self.response = response
@@ -201,21 +318,205 @@ class _StaticResponse:
 
 
 @pytest.mark.asyncio
+async def test_fetch_pins_validated_ip_against_dns_rebinding(monkeypatch):
+    resolutions = 0
+    request: dict[str, Any] = {}
+
+    async def alternating_resolve(host, port, scheme):
+        nonlocal resolutions
+        resolutions += 1
+        address = "93.184.216.34" if resolutions == 1 else "127.0.0.1"
+        return [srv.ipaddress.ip_address(address)]
+
+    class FakeClient:
+        def stream(self, method, url, **kwargs):
+            request.update({"url": url, **kwargs})
+            return _FakeStream(_StaticResponse(url, b"safe", "text/plain"))
+
+    async def fake_client():
+        return FakeClient()
+
+    monkeypatch.setattr(srv, "_resolve_host_ips", alternating_resolve)
+    monkeypatch.setattr(srv, "_client", fake_client)
+    final_url, body, content_type = await srv._fetch_public_body("https://example.com/path")
+
+    assert resolutions == 1
+    assert request["url"] == "https://93.184.216.34/path"
+    assert request["headers"]["Host"] == "example.com"
+    assert request["extensions"] == {"sni_hostname": "example.com"}
+    assert final_url == "https://example.com/path"
+    assert body == b"safe"
+    assert content_type == "text/plain"
+
+
+@pytest.mark.asyncio
+async def test_fetch_revalidates_and_rejects_private_redirect(monkeypatch):
+    calls = 0
+
+    class RedirectResponse:
+        is_redirect = True
+        headers = {"location": "http://127.0.0.1/admin"}
+        url = srv.httpx.URL("https://93.184.216.34/start")
+
+    class FakeClient:
+        def stream(self, method, url, **kwargs):
+            nonlocal calls
+            calls += 1
+            return _FakeStream(RedirectResponse())
+
+    async def fake_client():
+        return FakeClient()
+
+    async def public_example(host, port, scheme):
+        try:
+            return [srv.ipaddress.ip_address(host)]
+        except ValueError:
+            return [srv.ipaddress.ip_address("93.184.216.34")]
+
+    monkeypatch.setattr(srv, "_resolve_host_ips", public_example)
+    monkeypatch.setattr(srv, "_client", fake_client)
+    with pytest.raises(ValueError, match="local/private"):
+        await srv._fetch_public_body("https://example.com/start")
+    assert calls == 1
+
+
+@pytest.mark.asyncio
+async def test_fetch_uses_fresh_tls_pool_for_each_redirect_host(monkeypatch):
+    created = 0
+    closed = 0
+    requests: list[tuple[str, str, dict[str, Any]]] = []
+
+    class RedirectResponse:
+        is_redirect = True
+        headers = {"location": "https://second.example/final"}
+        url = srv.httpx.URL("https://93.184.216.34/start")
+
+    class HopClient:
+        def __init__(self, hop: int):
+            self.hop = hop
+
+        def stream(self, method, url, **kwargs):
+            requests.append((url, kwargs["headers"]["Host"], kwargs["extensions"]))
+            response = (
+                RedirectResponse()
+                if self.hop == 1
+                else _StaticResponse(url, b"safe", "text/plain")
+            )
+            return _FakeStream(response)
+
+        async def aclose(self):
+            nonlocal closed
+            closed += 1
+
+    async def fresh_client():
+        nonlocal created
+        created += 1
+        return HopClient(created)
+
+    async def same_public_ip(host, port, scheme):
+        return [srv.ipaddress.ip_address("93.184.216.34")]
+
+    monkeypatch.setattr(srv, "_resolve_host_ips", same_public_ip)
+    monkeypatch.setattr(srv, "_public_fetch_client", fresh_client)
+    final_url, body, _ = await srv._fetch_public_body("https://first.example/start")
+
+    assert created == closed == 2
+    assert requests == [
+        (
+            "https://93.184.216.34/start",
+            "first.example",
+            {"sni_hostname": "first.example"},
+        ),
+        (
+            "https://93.184.216.34/final",
+            "second.example",
+            {"sni_hostname": "second.example"},
+        ),
+    ]
+    assert final_url == "https://second.example/final"
+    assert body == b"safe"
+
+
+@pytest.mark.asyncio
+async def test_web_fetch_html_reserves_space_for_attachments(monkeypatch):
+    article = "Long main article content that must be truncated safely. " * 100
+    html = (
+        f"<article><p>{article}</p></article>"
+        '<footer><a href="report.pdf">Official report</a></footer>'
+    ).encode()
+
+    class FakeClient:
+        def stream(self, method, url, **kwargs):
+            return _FakeStream(_StaticResponse(url, html, "text/html; charset=utf-8"))
+
+    async def fake_client():
+        return FakeClient()
+
+    monkeypatch.setattr(srv, "_validate_public_http_url", _allow_public_url)
+    monkeypatch.setattr(srv, "_client", fake_client)
+    result = await _call_tool(
+        "web_fetch",
+        {"url": "https://example.com/page", "max_chars": 200},
+    )
+    text = _result_text(result)
+    assert len(text) <= 200
+    assert "Attachments:" in text
+    assert "[Official report](https://example.com/report.pdf)" in text
+
+
+@pytest.mark.asyncio
+async def test_html_extraction_timeout_kills_isolated_child(monkeypatch, tmp_path):
+    script = tmp_path / "slow_extractor.py"
+    script.write_text("import sys,time\nsys.stdin.buffer.read()\ntime.sleep(10)\n")
+    monkeypatch.setattr(srv, "HTML_EXTRACT_SCRIPT", script)
+    monkeypatch.setattr(srv, "HTML_EXTRACT_TIMEOUT", 0.05)
+    started = srv.time.monotonic()
+    with pytest.raises(asyncio.TimeoutError):
+        await srv._extract_html_content_isolated(
+            "<p>content</p>",
+            "https://example.com/",
+            1000,
+        )
+    assert srv.time.monotonic() - started < 1
+
+
+@pytest.mark.asyncio
+async def test_extraction_admission_rejects_excess_without_queueing():
+    admission: asyncio.Queue[None] = asyncio.Queue(maxsize=1)
+    semaphore = asyncio.Semaphore(1)
+    started = srv.time.monotonic()
+    with pytest.raises(RuntimeError, match="capacity exhausted"):
+        async with srv._bounded_extraction_slot(admission, semaphore, 10, "HTML"):
+            raise AssertionError("slot must not be admitted")
+    assert srv.time.monotonic() - started < 0.1
+
+
+@pytest.mark.asyncio
+async def test_extraction_queue_wait_counts_against_deadline():
+    admission: asyncio.Queue[None] = asyncio.Queue(maxsize=1)
+    admission.put_nowait(None)
+    semaphore = asyncio.Semaphore(0)
+    started = srv.time.monotonic()
+    with pytest.raises(asyncio.TimeoutError):
+        async with srv._bounded_extraction_slot(admission, semaphore, 0.05, "HTML"):
+            raise AssertionError("slot must time out")
+    assert srv.time.monotonic() - started < 0.5
+    assert admission.qsize() == 1
+
+
+@pytest.mark.asyncio
 async def test_web_fetch_pdf_returns_plain_extracted_text(monkeypatch):
     class FakeClient:
         def stream(self, method, url, **kwargs):
             return _FakeStream(_StaticResponse(url, b"%PDF-1.7 fake fixture", "application/pdf"))
 
-    async def allow_url(url):
-        return None
-
     async def fake_client():
         return FakeClient()
 
-    async def fake_extract(body):
+    async def fake_extract(body, deadline=None):
         return "AC district Lot Size: 10 acres", "macos_vision_ocr"
 
-    monkeypatch.setattr(srv, "_validate_public_http_url", allow_url)
+    monkeypatch.setattr(srv, "_validate_public_http_url", _allow_public_url)
     monkeypatch.setattr(srv, "_client", fake_client)
     monkeypatch.setattr(srv, "_extract_pdf_text", fake_extract)
     result = await _call_tool(
@@ -234,16 +535,13 @@ async def test_web_fetch_pdf_output_limit_uses_error_contract(monkeypatch):
         def stream(self, method, url, **kwargs):
             return _FakeStream(_StaticResponse(url, b"%PDF-1.7 fake fixture", "application/pdf"))
 
-    async def allow_url(url):
-        return None
-
     async def fake_client():
         return FakeClient()
 
-    async def limited_extract(body):
+    async def limited_extract(body, deadline=None):
         raise srv._OutputLimitExceeded("PDF command output exceeds limit")
 
-    monkeypatch.setattr(srv, "_validate_public_http_url", allow_url)
+    monkeypatch.setattr(srv, "_validate_public_http_url", _allow_public_url)
     monkeypatch.setattr(srv, "_client", fake_client)
     monkeypatch.setattr(srv, "_extract_pdf_text", limited_extract)
     result = await _call_tool("web_fetch", {"url": "https://example.com/Schedule.pdf"})
@@ -261,16 +559,13 @@ async def test_web_fetch_never_decodes_unreadable_pdf_as_binary_text(monkeypatch
         def stream(self, method, url, **kwargs):
             return _FakeStream(_StaticResponse(url, b"%PDF-1.4\x00binary stream", "application/octet-stream"))
 
-    async def allow_url(url):
-        return None
-
     async def fake_client():
         return FakeClient()
 
-    async def fake_extract(body):
+    async def fake_extract(body, deadline=None):
         return None, "PDF OCR produced no meaningful text"
 
-    monkeypatch.setattr(srv, "_validate_public_http_url", allow_url)
+    monkeypatch.setattr(srv, "_validate_public_http_url", _allow_public_url)
     monkeypatch.setattr(srv, "_client", fake_client)
     monkeypatch.setattr(srv, "_extract_pdf_text", fake_extract)
     result = await _call_tool("web_fetch", {"url": "https://example.com/scan.pdf"})
@@ -320,14 +615,11 @@ async def test_web_fetch_stops_stream_at_byte_limit(monkeypatch):
         def stream(self, method, url, **kwargs):
             return _FakeStream(ChunkedResponse())
 
-    async def allow_url(url):
-        return None
-
     async def fake_client():
         return FakeClient()
 
     monkeypatch.setattr(srv, "FETCH_MAX_BYTES", 10)
-    monkeypatch.setattr(srv, "_validate_public_http_url", allow_url)
+    monkeypatch.setattr(srv, "_validate_public_http_url", _allow_public_url)
     monkeypatch.setattr(srv, "_client", fake_client)
     result = await _call_tool("web_fetch", {"url": "https://example.com/large"})
     assert _result_text(result) == "Fetch error: response exceeds 10 byte limit"
@@ -339,13 +631,10 @@ async def test_web_fetch_honors_small_max_chars(monkeypatch):
         def stream(self, method, url, **kwargs):
             return _FakeStream(_StaticResponse(url, b"abcdefghijklmnopqrstuvwxyz", "text/plain"))
 
-    async def allow_url(url):
-        return None
-
     async def fake_client():
         return FakeClient()
 
-    monkeypatch.setattr(srv, "_validate_public_http_url", allow_url)
+    monkeypatch.setattr(srv, "_validate_public_http_url", _allow_public_url)
     monkeypatch.setattr(srv, "_client", fake_client)
     result = await _call_tool("web_fetch", {"url": "https://example.com/text", "max_chars": 10})
     assert len(_result_text(result)) == 10
@@ -357,13 +646,10 @@ async def test_web_fetch_rejects_binary_mislabeled_as_text(monkeypatch):
         def stream(self, method, url, **kwargs):
             return _FakeStream(_StaticResponse(url, b"PNG\x00\x01\x02binary", "text/plain"))
 
-    async def allow_url(url):
-        return None
-
     async def fake_client():
         return FakeClient()
 
-    monkeypatch.setattr(srv, "_validate_public_http_url", allow_url)
+    monkeypatch.setattr(srv, "_validate_public_http_url", _allow_public_url)
     monkeypatch.setattr(srv, "_client", fake_client)
     result = await _call_tool("web_fetch", {"url": "https://example.com/fake.txt"})
     assert _result_text(result) == "Fetch error: unsupported binary content type: text/plain"
@@ -806,7 +1092,20 @@ async def test_tools_list_exposes_expected_tools():
     async with Client(srv.mcp) as client:
         tools = await client.list_tools()
     names = {t.name for t in tools}
-    assert names == {"web_search", "image_search", "web_fetch"}
+    assert names == {"web_search", "batch_web_search", "image_search", "web_fetch"}
+    batch_tool = next(tool for tool in tools if tool.name == "batch_web_search")
+    batch_schema = batch_tool.model_dump(by_alias=True)["inputSchema"]
+    assert batch_schema["required"] == ["queries"]
+    queries_schema = batch_schema["properties"]["queries"]
+    assert queries_schema["type"] == "array"
+    assert queries_schema["minItems"] == 1
+    assert queries_schema["maxItems"] == srv.BATCH_MAX_QUERIES
+    assert queries_schema["items"] == {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": srv.BATCH_MAX_QUERY_CHARS,
+    }
+    assert batch_schema["properties"]["num_results"] == {"default": 8, "type": "integer"}
     image_tool = next(tool for tool in tools if tool.name == "image_search")
     schema = image_tool.model_dump(by_alias=True)["inputSchema"]
     assert schema["required"] == ["query"]

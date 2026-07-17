@@ -2,9 +2,10 @@
 """Policy-aware MCP web search broker for local SearXNG and Tavily.
 
 Tools:
-  - web_search(query, num_results=8)    SearXNG first; Tavily policy-controlled
-  - image_search(query, num_results=8)  loopback SearXNG images; no fallback
-  - web_fetch(url, max_chars=20000)     direct fetch with SSRF guard
+  - web_search(query, num_results=8)          SearXNG first; Tavily policy-controlled
+  - batch_web_search(queries, num_results=8)  up to three searches under one deadline
+  - image_search(query, num_results=8)        loopback SearXNG images; no fallback
+  - web_fetch(url, max_chars=20000)           direct fetch with SSRF guard
 
 HTTP diagnostics:
   - GET /live    dependency-free process liveness
@@ -27,6 +28,7 @@ Key configuration:
   SEARXNG_URL                         default http://127.0.0.1:8888
   WEBSEARCH_TAVILY_MODE               disabled|fallback|supplement
   WEBSEARCH_FETCH_MAX_BYTES           default 20 MiB
+  WEBSEARCH_HTML_EXTRACT_TIMEOUT      default 8 seconds
   WEBSEARCH_PDF_MAX_PAGES             default 20
   WEBSEARCH_TOTAL_TIMEOUT             capped at 18 seconds
   WEBSEARCH_SEARXNG_TIMEOUT           default 7 seconds
@@ -55,18 +57,20 @@ import sys
 import tempfile
 import time
 import urllib.parse
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from html.parser import HTMLParser
 from pathlib import Path
 from threading import Lock
-from typing import Any
+from typing import Annotated, Any
 
 import httpx
 from fastmcp import FastMCP
+from pydantic import WithJsonSchema
 from fastmcp.server.dependencies import get_http_headers
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
+import html_extraction as htmlx
 from telemetry import (
     InvalidWindow,
     ProviderEvent,
@@ -132,6 +136,24 @@ SUPPLEMENT_MIN_RESULTS = _bounded_int(
 )
 MAX_NUM_RESULTS = 20
 RESULT_OVERFETCH_FACTOR = 2
+BATCH_MAX_QUERIES = 3
+BATCH_MAX_QUERY_CHARS = 512
+BATCH_MAX_CONCURRENCY = 2
+BatchQueries = Annotated[
+    list[str],
+    WithJsonSchema(
+        {
+            "type": "array",
+            "items": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": BATCH_MAX_QUERY_CHARS,
+            },
+            "minItems": 1,
+            "maxItems": BATCH_MAX_QUERIES,
+        }
+    ),
+]
 
 # Other tunables.
 FETCH_TIMEOUT = _bounded_float("WEBSEARCH_FETCH_TIMEOUT", 30.0, minimum=1.0, maximum=60.0)
@@ -144,6 +166,13 @@ PDF_MIN_TEXT_CHARS = _bounded_int("WEBSEARCH_PDF_MIN_TEXT_CHARS", 200, minimum=2
 PDF_TEXT_MAX_BYTES = _bounded_int("WEBSEARCH_PDF_TEXT_MAX_BYTES", 2 * 1024 * 1024, minimum=65536, maximum=10 * 1024 * 1024)
 PDF_RENDER_MAX_BYTES = _bounded_int("WEBSEARCH_PDF_RENDER_MAX_BYTES", 64 * 1024 * 1024, minimum=1024 * 1024, maximum=256 * 1024 * 1024)
 PDF_STDERR_MAX_BYTES = 256 * 1024
+HTML_EXTRACT_TIMEOUT = _bounded_float(
+    "WEBSEARCH_HTML_EXTRACT_TIMEOUT", 8.0, minimum=1.0, maximum=20.0
+)
+HTML_EXTRACT_STDERR_MAX_BYTES = 64 * 1024
+HTML_EXTRACT_SCRIPT = Path(__file__).with_name("html_extraction.py")
+HTML_EXTRACT_MAX_ADMITTED = 4
+PDF_EXTRACT_MAX_ADMITTED = 4
 PDFTOTEXT = shutil.which("pdftotext") or next(
     (path for path in ("/opt/homebrew/bin/pdftotext", "/usr/local/bin/pdftotext") if Path(path).is_file()),
     None,
@@ -167,8 +196,24 @@ BREAKER_COOLDOWN = _bounded_float(
     "WEBSEARCH_BREAKER_COOLDOWN", 60.0, minimum=1.0, maximum=3600.0
 )
 
+def _admission_queue(size: int) -> asyncio.Queue[None]:
+    queue: asyncio.Queue[None] = asyncio.Queue(maxsize=size)
+    for _ in range(size):
+        queue.put_nowait(None)
+    return queue
+
+
 _http_client: httpx.AsyncClient | None = None
 _pdf_extract_semaphore = asyncio.Semaphore(2)
+_html_extract_semaphore = asyncio.Semaphore(2)
+_pdf_extract_admission = _admission_queue(PDF_EXTRACT_MAX_ADMITTED)
+_html_extract_admission = _admission_queue(HTML_EXTRACT_MAX_ADMITTED)
+
+# Preserve the existing testable parser helpers while production web_fetch runs
+# the same extraction logic in a bounded child process.
+_TextExtractor = htmlx.TextExtractor
+_extract_with_text_parser = htmlx.extract_with_text_parser
+_extract_html_content = htmlx.extract_html_content
 
 
 async def _client() -> httpx.AsyncClient:
@@ -178,13 +223,18 @@ async def _client() -> httpx.AsyncClient:
     return _http_client
 
 
+async def _public_fetch_client() -> httpx.AsyncClient:
+    """Return a one-hop client so TLS pools cannot cross original hostnames."""
+    return httpx.AsyncClient(timeout=FETCH_TIMEOUT, trust_env=False)
+
+
 mcp = FastMCP(
     "websearch",
     instructions=(
         "Web and image search plus page fetching via local SearXNG, with policy-controlled Tavily fallback or supplementation for web search only. "
-        "Use web_search for any question about current events, news, facts, people, places, or any topic that requires up-to-date information. "
+        "Use web_search for one focused query and batch_web_search for two or three independent query angles that can run together. "
         "Use image_search to find public image and source-page URLs without downloading image bytes. "
-        "Use web_fetch to retrieve the full text content of a specific URL."
+        "Use web_fetch to retrieve the main text and attachment links from a specific URL."
     ),
 )
 
@@ -841,61 +891,6 @@ def _format_image_results(
     return json.dumps(payload)
 
 
-class _TextExtractor(HTMLParser):
-    """Extract readable text while preserving links needed to follow attachments."""
-
-    def __init__(self, base_url: str):
-        super().__init__()
-        self._base_url = base_url
-        self._chunks: list[str] = []
-        self._skip_depth = 0
-        self._anchor_href: str | None = None
-        self._anchor_chunks: list[str] = []
-
-    def handle_starttag(self, tag, attrs):
-        if tag in ("script", "style", "noscript"):
-            self._skip_depth += 1
-            return
-        if self._skip_depth:
-            return
-        href = next((value for key, value in attrs if key.lower() == "href"), None)
-        if tag == "base" and href:
-            candidate = urllib.parse.urljoin(self._base_url, href)
-            if urllib.parse.urlparse(candidate).scheme in {"http", "https"}:
-                self._base_url = candidate
-            return
-        if tag != "a" or self._anchor_href is not None or not href:
-            return
-        candidate = urllib.parse.urljoin(self._base_url, href)
-        if urllib.parse.urlparse(candidate).scheme in {"http", "https"}:
-            self._anchor_href = candidate
-            self._anchor_chunks = []
-
-    def handle_endtag(self, tag):
-        if tag in ("script", "style", "noscript"):
-            self._skip_depth = max(0, self._skip_depth - 1)
-            return
-        if tag == "a" and self._anchor_href is not None:
-            label = " ".join(self._anchor_chunks).strip() or self._anchor_href
-            self._chunks.append(f"[{label}]({self._anchor_href})")
-            self._anchor_href = None
-            self._anchor_chunks = []
-
-    def handle_data(self, data):
-        if self._skip_depth:
-            return
-        text = " ".join(data.split())
-        if not text:
-            return
-        if self._anchor_href is not None:
-            self._anchor_chunks.append(text)
-        else:
-            self._chunks.append(text)
-
-    def get_text(self) -> str:
-        return "\n".join(self._chunks)
-
-
 def _meaningful_text(text: str) -> bool:
     return len(re.sub(r"\s+", "", text)) >= PDF_MIN_TEXT_CHARS
 
@@ -913,6 +908,106 @@ async def _read_stream_limited(stream: asyncio.StreamReader, limit: int, label: 
         chunks.extend(chunk)
         if len(chunks) > limit:
             raise _OutputLimitExceeded(f"{label} exceeds {limit} byte limit")
+
+
+async def _write_process_stdin(writer: asyncio.StreamWriter, data: bytes) -> None:
+    try:
+        writer.write(data)
+        await writer.drain()
+    except (BrokenPipeError, ConnectionResetError):
+        pass
+    finally:
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
+
+@asynccontextmanager
+async def _bounded_extraction_slot(
+    admission: asyncio.Queue[None],
+    semaphore: asyncio.Semaphore,
+    timeout: float,
+    label: str,
+):
+    """Bound active plus queued extraction work under one absolute deadline."""
+    try:
+        admission.get_nowait()
+    except asyncio.QueueEmpty as exc:
+        raise RuntimeError(f"{label} extraction capacity exhausted") from exc
+    acquired = False
+    deadline = time.monotonic() + timeout
+    try:
+        await asyncio.wait_for(semaphore.acquire(), timeout=max(0.001, deadline - time.monotonic()))
+        acquired = True
+        yield deadline
+    finally:
+        if acquired:
+            semaphore.release()
+        admission.put_nowait(None)
+
+
+async def _extract_html_content_isolated(html: str, base_url: str, max_chars: int) -> str:
+    """Run untrusted HTML parsing in a resource-limited, cancellable child process."""
+    encoded = html.encode("utf-8")
+    output_limit = max_chars * 4 + 4096
+    async with _bounded_extraction_slot(
+        _html_extract_admission,
+        _html_extract_semaphore,
+        HTML_EXTRACT_TIMEOUT,
+        "HTML",
+    ) as deadline:
+        process = await asyncio.create_subprocess_exec(
+            sys.executable,
+            str(HTML_EXTRACT_SCRIPT),
+            "--base-url",
+            base_url,
+            "--max-chars",
+            str(max_chars),
+            "--max-input-bytes",
+            str(max(len(encoded), FETCH_MAX_BYTES)),
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            start_new_session=True,
+        )
+        assert process.stdin is not None
+        assert process.stdout is not None
+        assert process.stderr is not None
+        stdout_task = asyncio.create_task(
+            _read_stream_limited(process.stdout, output_limit, "HTML extraction output")
+        )
+        stderr_task = asyncio.create_task(
+            _read_stream_limited(
+                process.stderr,
+                HTML_EXTRACT_STDERR_MAX_BYTES,
+                "HTML extraction error output",
+            )
+        )
+        stdin_task = asyncio.create_task(_write_process_stdin(process.stdin, encoded))
+        wait_task = asyncio.create_task(process.wait())
+        tasks = (stdout_task, stderr_task, stdin_task, wait_task)
+        try:
+            stdout, stderr, _, returncode = await asyncio.wait_for(
+                asyncio.gather(*tasks),
+                timeout=max(0.001, deadline - time.monotonic()),
+            )
+        except (asyncio.CancelledError, asyncio.TimeoutError, _OutputLimitExceeded):
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            await process.wait()
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise
+        if returncode != 0:
+            detail = stderr.decode("utf-8", "replace").strip()[:200]
+            raise RuntimeError(detail or f"extractor exited with status {returncode}")
+        return stdout.decode("utf-8", "replace")
 
 
 async def _run_pdf_command(
@@ -952,9 +1047,12 @@ async def _run_pdf_command(
     return process.returncode or 0, stdout, stderr
 
 
-async def _extract_pdf_text(pdf_bytes: bytes) -> tuple[str, str] | tuple[None, str]:
+async def _extract_pdf_text(
+    pdf_bytes: bytes,
+    deadline: float | None = None,
+) -> tuple[str, str] | tuple[None, str]:
     """Extract bounded PDF text under one deadline, then try macOS Vision OCR."""
-    deadline = time.monotonic() + PDF_EXTRACT_TIMEOUT
+    deadline = deadline or (time.monotonic() + PDF_EXTRACT_TIMEOUT)
     with tempfile.TemporaryDirectory(prefix="local-search-pdf-") as temp_dir:
         root = Path(temp_dir)
         pdf_path = root / "document.pdf"
@@ -1101,17 +1199,48 @@ def _is_private_ip(ip: ipaddress._BaseAddress) -> bool:
     return any(getattr(ip, attr, False) for attr in _PRIVATE_IP_ATTRS)
 
 
-async def _validate_public_http_url(url: str) -> None:
+async def _validate_public_http_url(url: str) -> list[ipaddress._BaseAddress]:
     parsed = urllib.parse.urlparse(url)
     if parsed.scheme not in {"http", "https"} or not parsed.hostname:
         raise ValueError("Only public http(s) URLs can be fetched")
+    if parsed.username is not None or parsed.password is not None:
+        raise ValueError("Credential-bearing URLs cannot be fetched")
     host = parsed.hostname.strip().lower()
     if host in {"localhost", "local"} or host.endswith(".localhost"):
         raise ValueError("Refusing to fetch local/private URL")
     addresses = await _resolve_host_ips(host, parsed.port, parsed.scheme)
+    if not addresses:
+        raise ValueError("Could not resolve URL host")
     for ip in addresses:
         if _is_private_ip(ip):
             raise ValueError("Refusing to fetch local/private URL")
+    # Prefer IPv4 when both families are returned because many local machines
+    # lack working public IPv6. The selected address is pinned for the request.
+    return sorted(set(addresses), key=lambda ip: (ip.version != 4, str(ip)))
+
+
+def _pinned_public_request(
+    url: str,
+    address: ipaddress._BaseAddress,
+) -> tuple[str, str, dict[str, Any]]:
+    """Build an IP-pinned request while retaining the original Host and TLS SNI."""
+    parsed = urllib.parse.urlsplit(url)
+    assert parsed.hostname is not None
+    original_host = parsed.hostname.encode("idna").decode("ascii")
+    host_header = f"[{original_host}]" if ":" in original_host else original_host
+    if parsed.port is not None:
+        host_header = f"{host_header}:{parsed.port}"
+    address_text = str(address)
+    pinned_host = f"[{address_text}]" if address.version == 6 else address_text
+    if parsed.port is not None:
+        pinned_host = f"{pinned_host}:{parsed.port}"
+    pinned_url = urllib.parse.urlunsplit(
+        (parsed.scheme, pinned_host, parsed.path or "/", parsed.query, "")
+    )
+    extensions: dict[str, Any] = {}
+    if parsed.scheme == "https":
+        extensions["sni_hostname"] = original_host
+    return pinned_url, host_header, extensions
 
 
 # --------------------------------------------------------------------------- #
@@ -1743,9 +1872,8 @@ def _timings(started: float, searxng: _BackendOutcome, tavily: _BackendOutcome |
     }
 
 
-@mcp.tool()
-async def web_search(query: str, num_results: int = 8) -> str:
-    """Search SearXNG first, then apply the configured Tavily egress policy."""
+async def _web_search_impl(query: str, num_results: int = 8) -> str:
+    """Execute one web search using the public tool's stable payload contract."""
     started = time.monotonic()
     query = query.strip()
     requested = min(MAX_NUM_RESULTS, max(1, int(num_results)))
@@ -1932,6 +2060,184 @@ async def web_search(query: str, num_results: int = 8) -> str:
 
 
 @mcp.tool()
+async def web_search(query: str, num_results: int = 8) -> str:
+    """Search SearXNG first, then apply the configured Tavily egress policy."""
+    return await _web_search_impl(query, num_results)
+
+
+def _batch_error_payload(message: str, started: float, requested: int) -> str:
+    timings_ms = {"total": round((time.monotonic() - started) * 1000, 1)}
+    _record_search_telemetry(
+        status="error",
+        backend="none",
+        requested_count=requested,
+        result_count=0,
+        fallback_reason=None,
+        total_latency_ms=float(timings_ms["total"]),
+        searxng=None,
+        tavily=None,
+    )
+    return json.dumps(
+        {
+            "status": "error",
+            "error": message,
+            "query_count": 0,
+            "duplicates_ignored": 0,
+            "results": [],
+            "timings_ms": timings_ms,
+        }
+    )
+
+
+def _compact_batch_item(rendered: str) -> dict[str, Any]:
+    """Remove the single-search display rendering while preserving structured data."""
+    payload = json.loads(rendered)
+    payload.pop("text", None)
+    return payload
+
+
+def _batch_timeout_item(query: str, requested: int, elapsed_ms: float) -> dict[str, Any]:
+    _record_search_telemetry(
+        status="timeout",
+        backend="none",
+        requested_count=requested,
+        result_count=0,
+        fallback_reason="batch_deadline",
+        total_latency_ms=elapsed_ms,
+        searxng=None,
+        tavily=None,
+    )
+    return {
+        "query": query,
+        "results": [],
+        "suggestions": [],
+        "status": "timeout",
+        "backend": "none",
+        "attempted": [],
+        "fallback_reason": "batch_deadline",
+        "timings_ms": {"total": elapsed_ms, "searxng": None, "tavily": None},
+        "mode": TAVILY_MODE,
+        "unresponsive_engines": [],
+        "provider_states": {},
+        "error": "Search error: batch deadline exceeded.",
+    }
+
+
+@mcp.tool()
+async def batch_web_search(queries: BatchQueries, num_results: int = 8) -> str:
+    """Run up to three deduplicated searches concurrently under one total deadline."""
+    started = time.monotonic()
+    requested = min(MAX_NUM_RESULTS, max(1, int(num_results)))
+    if not queries:
+        return _batch_error_payload("Batch search error: queries must not be empty.", started, requested)
+    if len(queries) > BATCH_MAX_QUERIES:
+        return _batch_error_payload(
+            f"Batch search error: at most {BATCH_MAX_QUERIES} queries are allowed.",
+            started,
+            requested,
+        )
+
+    normalized: list[str] = []
+    seen: set[str] = set()
+    duplicates_ignored = 0
+    for raw_query in queries:
+        query = " ".join(raw_query.split())
+        if not query:
+            return _batch_error_payload(
+                "Batch search error: queries must not contain empty values.",
+                started,
+                requested,
+            )
+        if len(query) > BATCH_MAX_QUERY_CHARS:
+            return _batch_error_payload(
+                f"Batch search error: each query must be at most {BATCH_MAX_QUERY_CHARS} characters.",
+                started,
+                requested,
+            )
+        key = query.casefold()
+        if key in seen:
+            duplicates_ignored += 1
+            continue
+        seen.add(key)
+        normalized.append(query)
+
+    semaphore = asyncio.Semaphore(BATCH_MAX_CONCURRENCY)
+
+    async def run_one(query: str) -> dict[str, Any]:
+        try:
+            async with semaphore:
+                return _compact_batch_item(await _web_search_impl(query, requested))
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning("Batch search item failed internally (%s)", type(exc).__name__)
+            elapsed_ms = round((time.monotonic() - started) * 1000, 1)
+            _record_search_telemetry(
+                status="error",
+                backend="none",
+                requested_count=requested,
+                result_count=0,
+                fallback_reason=None,
+                total_latency_ms=elapsed_ms,
+                searxng=None,
+                tavily=None,
+            )
+            return {
+                "query": query,
+                "results": [],
+                "suggestions": [],
+                "status": "error",
+                "backend": "none",
+                "attempted": [],
+                "fallback_reason": None,
+                "timings_ms": {"total": elapsed_ms, "searxng": None, "tavily": None},
+                "mode": TAVILY_MODE,
+                "unresponsive_engines": [],
+                "provider_states": {},
+                "error": "Search error: internal batch item failure.",
+            }
+
+    tasks = [asyncio.create_task(run_one(query)) for query in normalized]
+    try:
+        done, pending = await asyncio.wait(tasks, timeout=SEARCH_TOTAL_TIMEOUT)
+    except asyncio.CancelledError:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        raise
+
+    elapsed_ms = round((time.monotonic() - started) * 1000, 1)
+    for task in pending:
+        task.cancel()
+    if pending:
+        await asyncio.gather(*pending, return_exceptions=True)
+
+    items: list[dict[str, Any]] = []
+    for query, task in zip(normalized, tasks, strict=True):
+        if task in done and not task.cancelled():
+            items.append(task.result())
+        else:
+            items.append(_batch_timeout_item(query, requested, elapsed_ms))
+
+    failed = sum(item.get("status") in {"error", "timeout"} for item in items)
+    if failed == 0:
+        status = "ok"
+    elif failed == len(items):
+        status = "error"
+    else:
+        status = "partial"
+    return json.dumps(
+        {
+            "status": status,
+            "query_count": len(items),
+            "duplicates_ignored": duplicates_ignored,
+            "results": items,
+            "timings_ms": {"total": elapsed_ms},
+        }
+    )
+
+
+@mcp.tool()
 async def image_search(query: str, num_results: int = 8) -> str:
     """Search public image metadata via loopback SearXNG with moderate SafeSearch."""
     started = time.monotonic()
@@ -2037,41 +2343,49 @@ async def image_search(query: str, num_results: int = 8) -> str:
 
 async def _fetch_public_body(url: str) -> tuple[str, bytes, str]:
     current_url = url
-    await _validate_public_http_url(current_url)
-    client = await _client()
     for _ in range(FETCH_MAX_REDIRECTS + 1):
+        addresses = await _validate_public_http_url(current_url)
+        pinned_url, host_header, extensions = _pinned_public_request(current_url, addresses[0])
         redirect_url: str | None = None
-        async with client.stream(
-            "GET",
-            current_url,
-            headers={
-                "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)",
-                "Accept": "text/html,application/xhtml+xml,application/pdf,application/json,text/plain,*/*",
-                "Accept-Encoding": "identity",
-            },
-            follow_redirects=False,
-        ) as resp:
-            if resp.is_redirect:
-                location = resp.headers.get("location")
-                if not location:
-                    raise ValueError("redirect response missing Location header")
-                redirect_url = str(resp.url.join(location))
-            else:
-                resp.raise_for_status()
-                content_encoding = resp.headers.get("content-encoding", "").lower().strip()
-                if content_encoding not in {"", "identity"}:
-                    raise ValueError(f"unsupported encoded response: {content_encoding}")
-                content_length = resp.headers.get("content-length")
-                if content_length and content_length.isdigit() and int(content_length) > FETCH_MAX_BYTES:
-                    raise ValueError(f"response exceeds {FETCH_MAX_BYTES} byte limit")
-                chunks = bytearray()
-                async for chunk in resp.aiter_raw():
-                    if len(chunks) + len(chunk) > FETCH_MAX_BYTES:
+        client = await _public_fetch_client()
+        try:
+            stream_context = client.stream(
+                "GET",
+                pinned_url,
+                headers={
+                    "Host": host_header,
+                    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)",
+                    "Accept": "text/html,application/xhtml+xml,application/pdf,application/json,text/plain,*/*",
+                    "Accept-Encoding": "identity",
+                },
+                follow_redirects=False,
+                extensions=extensions,
+            )
+            async with stream_context as resp:
+                if resp.is_redirect:
+                    location = resp.headers.get("location")
+                    if not location:
+                        raise ValueError("redirect response missing Location header")
+                    redirect_url = urllib.parse.urljoin(current_url, location)
+                else:
+                    resp.raise_for_status()
+                    content_encoding = resp.headers.get("content-encoding", "").lower().strip()
+                    if content_encoding not in {"", "identity"}:
+                        raise ValueError(f"unsupported encoded response: {content_encoding}")
+                    content_length = resp.headers.get("content-length")
+                    if content_length and content_length.isdigit() and int(content_length) > FETCH_MAX_BYTES:
                         raise ValueError(f"response exceeds {FETCH_MAX_BYTES} byte limit")
-                    chunks.extend(chunk)
-                return str(resp.url), bytes(chunks), resp.headers.get("content-type", "").lower()
+                    chunks = bytearray()
+                    async for chunk in resp.aiter_raw():
+                        if len(chunks) + len(chunk) > FETCH_MAX_BYTES:
+                            raise ValueError(f"response exceeds {FETCH_MAX_BYTES} byte limit")
+                        chunks.extend(chunk)
+                    return current_url, bytes(chunks), resp.headers.get("content-type", "").lower()
+        finally:
+            close = getattr(client, "aclose", None)
+            if close is not None:
+                await close()
         current_url = redirect_url or current_url
-        await _validate_public_http_url(current_url)
     raise ValueError("too many redirects")
 
 
@@ -2085,7 +2399,7 @@ async def web_fetch(url: str, max_chars: int = 20000) -> str:
             timeout=FETCH_TIMEOUT,
         )
     except httpx.HTTPStatusError as e:
-        return _fetch_error(f"HTTP {e.response.status_code} from {e.request.url}")
+        return _fetch_error(f"HTTP {e.response.status_code} from {url}")
     except httpx.RequestError as e:
         return _fetch_error(f"request failed: {e}")
     except asyncio.TimeoutError:
@@ -2097,9 +2411,20 @@ async def web_fetch(url: str, max_chars: int = 20000) -> str:
 
     if "application/pdf" in content_type or body.startswith(b"%PDF-"):
         try:
-            async with _pdf_extract_semaphore:
-                text, method = await _extract_pdf_text(body)
-        except (OSError, TimeoutError, asyncio.TimeoutError, _OutputLimitExceeded) as exc:
+            async with _bounded_extraction_slot(
+                _pdf_extract_admission,
+                _pdf_extract_semaphore,
+                PDF_EXTRACT_TIMEOUT,
+                "PDF",
+            ) as deadline:
+                text, method = await _extract_pdf_text(body, deadline)
+        except (
+            OSError,
+            RuntimeError,
+            TimeoutError,
+            asyncio.TimeoutError,
+            _OutputLimitExceeded,
+        ) as exc:
             return _fetch_error(f"PDF extraction failed: {exc}")
         if text is None:
             return _fetch_error(method)
@@ -2119,13 +2444,19 @@ async def web_fetch(url: str, max_chars: int = 20000) -> str:
 
     decoded = _decode_text_body(body, content_type)
     if "html" in media_type:
-        parser = _TextExtractor(current_url)
-        parser.feed(decoded)
-        text = parser.get_text()
-    else:
-        text = decoded
+        try:
+            text = await _extract_html_content_isolated(decoded, current_url, max_chars)
+        except asyncio.TimeoutError:
+            return _fetch_error(
+                f"HTML extraction exceeded {HTML_EXTRACT_TIMEOUT:g} second deadline"
+            )
+        except _OutputLimitExceeded as exc:
+            return _fetch_error(f"HTML extraction failed: {exc}")
+        except (OSError, RuntimeError) as exc:
+            return _fetch_error(f"HTML extraction failed: {exc}")
+        return text
 
-    return _truncate_text(text, max_chars, "\n\n... (truncated)")
+    return _truncate_text(decoded, max_chars, "\n\n... (truncated)")
 
 
 if __name__ == "__main__":

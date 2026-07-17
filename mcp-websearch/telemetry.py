@@ -29,7 +29,7 @@ DB_FILENAME = "telemetry.sqlite3"
 SCHEMA_VERSION = 1
 VALID_WINDOWS = {"24h": 24 * 60 * 60, "7d": 7 * 24 * 60 * 60, "30d": 30 * 24 * 60 * 60}
 
-_SEARCH_STATUSES = {"ok", "empty", "degraded", "error"}
+_SEARCH_STATUSES = {"ok", "empty", "degraded", "error", "timeout"}
 _BACKENDS = {"none", "searxng", "tavily", "searxng+tavily"}
 _MODES = {"disabled", "fallback", "supplement"}
 _FALLBACK_REASONS = {
@@ -39,6 +39,7 @@ _FALLBACK_REASONS = {
     "searxng_timeout",
     "searxng_circuit_open",
     "searxng_error",
+    "batch_deadline",
 }
 _PROVIDER_STATES = {"ok", "empty", "degraded", "error", "timeout", "circuit_open"}
 _CIRCUIT_STATES = {"closed", "open", "half_open", "unknown"}

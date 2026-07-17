@@ -2,9 +2,9 @@
 
 A self-contained, installable local web-search stack for developer/agent
 tooling and Home Automation. Runs SearXNG (metasearch) and a FastMCP wrapper
-that exposes `web_search` / `image_search` / `web_fetch` tools over MCP (HTTP and stdio), with
-**Tavily failover** for reliability when SearXNG's scraped engines block or
-rate-limit.
+that exposes `web_search` / `batch_web_search` / `image_search` / `web_fetch`
+tools over MCP (HTTP and stdio), with **Tavily failover** for reliability when
+SearXNG's scraped engines block or rate-limit.
 
 This is its own component. It is a **dependency** of:
 
@@ -61,6 +61,22 @@ contract and adds `status`, `backend`, `attempted`, `fallback_reason`,
 `timings_ms`, `provider_states`, `mode`, and `unresponsive_engines`. `status` distinguishes
 `ok`, `empty`, `degraded`, and terminal `error`; only terminal errors carry the
 legacy `error` key.
+
+### Batch web search contract
+
+`batch_web_search(queries: list[str], num_results: int = 8)` runs two or three
+independent query angles in one MCP round trip. It preserves `web_search`
+unchanged for existing consumers and reuses the same SearXNG/Tavily policy,
+URL dedupe, circuit breakers, and per-query telemetry.
+
+Inputs are limited to three non-empty queries of at most 512 characters.
+Whitespace is normalized and case-insensitive duplicates are ignored rather
+than searched twice. At most two provider pipelines run concurrently, and all
+items share the broker's single 18-second-or-less total deadline. Caller
+cancellation cancels and awaits every child request. The ordered batch payload
+reports `ok`, `partial`, or `error`, includes explicit per-query timeout/error
+states, and omits each single-search `text` rendering to avoid duplicating the
+structured results in model context. It never silently drops excess queries.
 
 ### Image search contract
 
@@ -127,6 +143,9 @@ Telemetry persists only:
   the credential itself);
 - fallback reasons/rates and circuit trips, skips, and recoveries.
 
+Batch search records one ordinary query-free operational event per query,
+including an allowlisted `timeout` status and `batch_deadline` reason; it adds
+no query-bearing batch state.
 It never stores search queries or hashes, URLs, result titles/snippets/content,
 suggestions, response bodies, request headers, credentials, or API keys. The
 loopback-only `/stats` endpoint returns aggregates rather than raw events. It
@@ -312,10 +331,24 @@ installed separately on machines that want a local search backend.
 - **SSRF guard**: `web_fetch` rejects loopback, RFC1918, link-local, multicast,
   reserved, unspecified IPs and `localhost`/`.localhost` domains, including
   hostnames that resolve to private IPs and redirect chains to private IPs.
-- **Readable bounded fetches**: responses are byte-capped; HTML preserves links to attachments; text PDFs use Poppler; scanned PDFs use bounded macOS Vision OCR when available. Unsupported binary data is never presented as successfully read text.
+  Each redirect hop connects to the exact validated IP while preserving the
+  original HTTP Host and TLS SNI. A fresh one-hop HTTP client prevents TLS
+  connection reuse across different hostnames that share an IP, closing both
+  DNS-rebinding and cross-host certificate-validation gaps.
+- **Readable bounded fetches**: responses are byte-capped; already-downloaded
+  HTML is reduced to its main content with `readability-lxml`, with the original
+  bounded parser as a fallback and omitted document/archive attachments appended
+  inside the output limit. Untrusted parsing runs in a concurrency-limited child
+  process with CPU, memory, file, output, admission, queue-wait, and wall-clock
+  bounds; excess extraction work fails fast instead of building an unbounded
+  queue. The extractor performs no network access. Text PDFs use Poppler; scanned
+  PDFs use bounded macOS Vision OCR when available. Unsupported binary data is
+  never presented as successfully read text.
 - **Bounded search**: one total deadline contains SearXNG retries and Tavily
   fallback; timeout and circuit states remain visible in result metadata.
-  Image search uses the SearXNG portion of the same deadline and has no Tavily path.
+  Batch search shares that same deadline across at most three queries with two
+  active provider pipelines. Image search uses the SearXNG portion of the same
+  deadline and has no Tavily path.
 - **Consistent states**: searches distinguish `ok`, `empty`, `degraded`, and
   terminal `error`; fetch errors retain the stable `Fetch error:` prefix.
 - **Health separation**: `/live` is dependency-free; `/ready` returns 503 only
@@ -343,10 +376,15 @@ installed separately on machines that want a local search backend.
 cd mcp-websearch && uv run pytest -q
 ```
 
-Covers the SSRF rejection matrix, `web_fetch` errors, compatibility payloads,
-Tavily disabled/fallback/supplement policy, overfetch/dedupe, bounded stage
-timeouts, distinct empty/degraded/error states, readiness, safe last-search
-metadata, single-probe half-open circuits, key separation, and `tools/list`.
+Covers the SSRF rejection matrix, DNS-pinned fetches, `web_fetch` errors,
+isolated main-content extraction and fallback, truncation-safe attachment
+retention, compatibility payloads, Tavily
+disabled/fallback/supplement policy, overfetch/dedupe, bounded stage timeouts,
+distinct empty/degraded/error states, readiness, safe last-search metadata,
+single-probe half-open circuits, key separation, and `tools/list`. Focused batch
+tests cover validation, normalization/dedupe, ordered compact results,
+concurrency, shared deadlines, partial timeouts, cancellation, provider-policy
+reuse, and query-free telemetry.
 Focused image tests cover category/SafeSearch request parameters, URL and field
 normalization, canonical-image dedupe/limits, empty/degraded/error states,
 loopback enforcement, no-Tavily behavior, and query/result-free telemetry.
@@ -371,11 +409,12 @@ local-search/
 │   ├── local-search              # server operator CLI
 │   └── local-search-tunnel       # macOS remote-client SSH LaunchAgent helper
 ├── mcp-websearch/
-│   ├── server.py                 # MCP web/image/fetch tools, provider policy, PDF extraction, and HTTP routes
+│   ├── server.py                 # MCP single/batch/image/fetch tools, policy, and HTTP routes
+│   ├── html_extraction.py        # offline resource-limited HTML extraction child
 │   ├── telemetry.py              # query-free SQLite events, aggregates, and reset
 │   ├── macos_vision_ocr.swift    # optional scanned-PDF OCR helper
 │   ├── http_server.py            # HTTP transport entrypoint (uvicorn)
-│   ├── pyproject.toml            # uv project (fastmcp, httpx; dev: pytest)
+│   ├── pyproject.toml            # uv project (fastmcp, httpx, readability; dev: pytest)
 │   └── tests/                    # broker and telemetry tests
 └── searxng/
     ├── engines/mwmbl_safe.py     # Defensive keyless Mwmbl JSON adapter
