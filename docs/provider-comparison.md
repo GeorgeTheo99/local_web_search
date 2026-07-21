@@ -8,9 +8,10 @@ Keep **self-hosted SearXNG first** and treat external providers as explicit egre
 
 - Default `fallback` should contact an external provider only when SearXNG has no usable results.
 - Use `disabled` for sensitive queries and `supplement` only when broader recall matters more than privacy.
-- Tavily is the better-supported retrieval fallback today: its published retrieval evaluation is stronger, the broker already normalizes it, and basic search is inexpensive.
-- Re-evaluate **Perplexity Search API** as a second selectable fallback after a local benchmark and written confirmation that its zero-data-retention commitment covers Search API, not only Sonar API.
-- Compare Tavily Research with Perplexity Agent/Sonar separately. They generate answers and conduct multi-step research; they are not substitutes for a raw ranked-results endpoint.
+- Tavily remains the better-supported **raw retrieval** fallback today: its published retrieval evaluation is stronger, the broker already normalizes it, and basic search is inexpensive. It is not appropriate for sensitive queries under its standard privacy policy.
+- Do **not** adopt Perplexity's raw Search API as a privacy upgrade. Its Search Addendum expressly excludes zero-data-retention obligations and permits Perplexity to retain and use Search Data for lawful business purposes, including product improvement.
+- If proprietary Perplexity retrieval plus zero retention is desired, benchmark **Sonar** as a separate fallback and normalize its `search_results` array. Sonar generates an answer and has token costs, so it is not strictly equivalent to a raw ranked-results endpoint.
+- Compare Tavily Research with Perplexity Agent/Sonar separately from raw retrieval.
 
 ## Apples-to-apples view
 
@@ -18,7 +19,7 @@ Keep **self-hosted SearXNG first** and treat external providers as explicit egre
 |---|---|---|---|---|---|
 | Self-hosted SearXNG | Raw metasearch results | No portable vendor-independent score; quality varies with enabled engines, blocks, geography, and ranking | No per-query API fee; machine/network/admin cost remains | Best local control. SearXNG strips client cookies/private data and hides the user's IP from engines, but upstream engines still receive the query and the server IP | Highest maintenance; scraped engines can degrade or block |
 | Tavily Search | Raw ranked results and snippets | Tavily's own reproducible eval reports 93.3% SimpleQA and 83.02% document relevance with **advanced** search; Perplexity Search scored 85.92% and 71.2% in that same vendor-run setup | Basic: 1 credit, about $0.005–$0.008/query on paid pricing; advanced: 2 credits, about $0.010–$0.016/query; 1,000 credits/month free | Tavily says it collects queries, may use portions to improve future responses unless contractually restricted, retains data under purpose/account-based criteria, and may share queries with third-party indexes such as Google | Simple integration; current keyless tier is convenient but shared limits are not a reliability SLA |
-| Perplexity Search API | Raw ranked results and extracted snippets | Tavily's vendor-run eval places it below Tavily advanced; no independent result set was found that also includes this machine's SearXNG configuration | $5/1,000 requests = $0.005/query, no token charge | Perplexity explicitly promises zero retention/no training for **Sonar API**. The current privacy page does not explicitly extend that wording to Search API, so confirm before sending sensitive data | Competitive fixed price, filters, multi-query support, and up to 20 results; requires an API key |
+| Perplexity Search API | Raw ranked results and extracted snippets | Tavily's vendor-run eval places it below Tavily advanced; no independent result set was found that also includes this machine's SearXNG configuration | $5/1,000 requests = $0.005/query, no token charge | **No standard ZDR.** The Search Addendum says Sonar ZDR obligations do not apply and permits retention/use of Input and Output; it also says not to submit personal data without written authorization | Competitive fixed price, proprietary continuously refreshed public-content index, filters, multi-query support, and up to 20 results; requires an API key |
 
 The Tavily evaluation is useful directional evidence, not a neutral verdict: Tavily authored it, Tavily ran in `advanced` mode, and SearXNG was not included. The configuration used Tavily advanced with 10 results and Perplexity Search with 10 results and 512 tokens per page. A local decision should use a blinded query set representative of our traffic.
 
@@ -64,7 +65,9 @@ Tavily's policy, updated 2025-11-24, states that it collects query data and uplo
 
 ### Perplexity
 
-Perplexity's API privacy page says Sonar API prompt/response content is not retained or used for training; only billing metadata such as model, token count, timestamp, duration, and API-key identity is retained. Because the text explicitly names Sonar API while Search API is now a separate product, obtain written confirmation or contract language before treating raw Search API as zero-retention.
+Perplexity's API privacy page says **Sonar API** prompt/response content is not retained or used for training; only billing metadata such as model, token count, timestamp, duration, and API-key identity is retained. The separate Perplexity Search Addendum, last updated 2025-09-22, is decisive for the raw `/search` endpoint: it says Search Services are separate from Sonar, that zero-data-retention obligations for other services do not apply, and that Perplexity may retain, copy, distribute, and otherwise use Search Data (Input and Output) for lawful business purposes including product improvement. It also prohibits submitting personal data without Perplexity's written authorization. General API FAQ or privacy wording should not be read to override these service-specific terms.
+
+Sonar uses Perplexity's search index/public internet and returns a structured `search_results` array alongside generated content. It is therefore the Perplexity product to benchmark when ZDR is required, accepting the extra generation step and token cost.
 
 ## Local benchmark design
 
@@ -87,6 +90,7 @@ A 100-query raw-retrieval run costs roughly $0.50 for Perplexity Search, $0.50�
 - Tavily search evaluation and configuration: <https://github.com/tavily-ai/tavily-search-evals>
 - Perplexity pricing: <https://docs.perplexity.ai/docs/getting-started/pricing>
 - Perplexity Search API: <https://docs.perplexity.ai/docs/search/quickstart>
-- Perplexity API privacy/security: <https://docs.perplexity.ai/docs/resources/privacy-security>
+- Perplexity Search Addendum: <https://www.perplexity.ai/hub/legal/perplexity-api-terms-of-service-search>
+- Perplexity API privacy/security (Sonar ZDR): <https://docs.perplexity.ai/docs/resources/privacy-security>
 - Perplexity agentic evaluation: <https://github.com/perplexityai/search_evals>
 - SearXNG private-instance privacy model: <https://docs.searxng.org/own-instance.html>
