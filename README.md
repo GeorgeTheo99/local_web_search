@@ -1,10 +1,16 @@
-# Local Search Stack
+# Local Web Search Stack
 
 A self-contained, installable local web-search stack for developer/agent
 tooling and Home Automation. Runs SearXNG (metasearch) and a FastMCP wrapper
 that exposes `web_search` / `batch_web_search` / `image_search` / `web_fetch`
-tools over MCP (HTTP and stdio), with **Tavily failover** for reliability when
-SearXNG's scraped engines block or rate-limit.
+tools over MCP (HTTP and stdio), with **policy-controlled Tavily failover**
+when SearXNG has no usable results.
+
+The repository/directory is named `local_web_search`. Stable public interfaces
+retain their existing names: the `local-search` operator command, MCP tool names,
+launchd labels, ports, and URLs do not change when the repository moves. See the
+[current provider comparison](docs/provider-comparison.md) for accuracy, cost,
+privacy, and benchmark guidance covering SearXNG, Tavily, and Perplexity.
 
 This is its own component. It is a **dependency** of:
 
@@ -36,8 +42,8 @@ egress is explicit and controlled by `WEBSEARCH_TAVILY_MODE`:
 | Mode | Behavior |
 |---|---|
 | `disabled` | Never contact Tavily; return SearXNG results, empty, or error state |
-| `fallback` (default) | Use Tavily when SearXNG has no results or reports degraded engines; degraded nonempty results are retained and supplemented |
-| `supplement` | Add Tavily when deduped SearXNG results are below `WEBSEARCH_SUPPLEMENT_MIN_RESULTS` |
+| `fallback` (default) | Use Tavily only when SearXNG has no usable results; degraded nonempty results remain local |
+| `supplement` | Add Tavily when deduped SearXNG results are below `WEBSEARCH_SUPPLEMENT_MIN_RESULTS`, including degraded nonempty searches |
 
 The SearXNG layer deliberately keeps only a tested engine set: Google CSE,
 DuckDuckGo, Bing, Startpage, the tracked defensive Mwmbl JSON adapter, and the
@@ -53,8 +59,9 @@ expected to require replacement when Google retires the current CSE path in
 
 The broker overfetches candidates before removing URL fragments and tracking
 parameters, dedupes with SearXNG precedence, then truncates to the requested
-count. A thread-safe per-backend circuit breaker admits only one half-open
-recovery probe after cooldown.
+count. Single and batch queries are capped at 512 characters, and each provider
+JSON response is stream-capped at 2 MiB by default. A thread-safe per-backend
+circuit breaker admits only one half-open recovery probe after cooldown.
 
 Every payload preserves the legacy `query` / `results` / `suggestions` / `text`
 contract and adds `status`, `backend`, `attempted`, `fallback_reason`,
@@ -107,9 +114,10 @@ queries, URLs, titles, or result metadata.
 ### Tavily: keyless by default, optional key upgrade
 
 Tavily failover works **with zero setup** via Tavily's free keyless tier
-(`X-Tavily-Access-Mode: keyless` — no account, no API key, no signup). Every
-install gets reliable search out of the box. The keyless tier uses a shared
-anonymous rate limit; for higher limits, swap in a free API key
+(`X-Tavily-Access-Mode: keyless` — no account, no API key, no signup). It is a
+best-effort fallback, not guaranteed capacity. The keyless tier uses a shared
+rate limit; it avoids an account/key but is not anonymous to Tavily, which still
+receives the query and network metadata. For higher limits, swap in a free API key
 (1,000 credits/month, no credit card) — same code path, no changes needed.
 
 Tavily key resolution (precedence):
@@ -184,8 +192,8 @@ Clone this repo (or your fork) anywhere, then run the installer. It is
 idempotent and safe to re-run:
 
 ```bash
-git clone <this-repo> ~/local_code/local-search
-cd ~/local_code/local-search
+git clone <this-repo> ~/local_code/local_web_search
+cd ~/local_code/local_web_search
 ./install.sh
 ```
 
@@ -212,6 +220,7 @@ WEBSEARCH_TAVILY_MODE=supplement \
 ```
 
 Installed policy defaults are `18s` total, `7s` SearXNG, and `8s` Tavily.
+Provider search responses default to a 2 MiB cap (`WEBSEARCH_SEARCH_MAX_BYTES`).
 `WEBSEARCH_TOTAL_TIMEOUT` is hard-capped at 18 seconds so Pi's 20-second MCP
 budget retains transport/serialization margin. `WEBSEARCH_SEARCH_TIMEOUT`
 remains a deprecated alias for `WEBSEARCH_SEARXNG_TIMEOUT`.
@@ -239,7 +248,7 @@ local-search env                     print resolved config
 Install a `local-search` shim on PATH (optional):
 
 ```bash
-ln -s ~/local_code/local-search/scripts/local-search ~/.local/bin/local-search
+ln -s ~/local_code/local_web_search/scripts/local-search ~/.local/bin/local-search
 ```
 
 ### Upgrade
@@ -282,8 +291,8 @@ stdio transport (Claude `settings.json`):
 {
   "mcpServers": {
     "websearch": {
-      "command": "/Users/<you>/local_code/local-search/mcp-websearch/.venv/bin/python",
-      "args": ["/Users/<you>/local_code/local-search/mcp-websearch/server.py"]
+      "command": "/Users/<you>/local_code/local_web_search/mcp-websearch/.venv/bin/python",
+      "args": ["/Users/<you>/local_code/local_web_search/mcp-websearch/server.py"]
     }
   }
 }
@@ -345,7 +354,8 @@ installed separately on machines that want a local search backend.
   PDFs use bounded macOS Vision OCR when available. Unsupported binary data is
   never presented as successfully read text.
 - **Bounded search**: one total deadline contains SearXNG retries and Tavily
-  fallback; timeout and circuit states remain visible in result metadata.
+  fallback; each query is capped at 512 characters and each provider JSON body
+  is stream-capped; timeout and circuit states remain visible in result metadata.
   Batch search shares that same deadline across at most three queries with two
   active provider pipelines. Image search uses the SearXNG portion of the same
   deadline and has no Tavily path.
@@ -395,10 +405,19 @@ helper tests validate exact SSH arguments, plist structure, idempotence, and
 private permissions; HTTP tests cover Host/Origin rejection and the loopback
 bind regression.
 
+The optional synthetic provider smoke is reproducible and bypasses production
+telemetry. It uses Tavily keyless unless `TAVILY_API_KEY` is set and adds
+Perplexity Search only when `PERPLEXITY_API_KEY` is set:
+
+```bash
+cd mcp-websearch
+uv run python ../benchmarks/provider_smoke.py
+```
+
 ## Layout
 
 ```
-local-search/
+local_web_search/
 ├── install.sh                    # bootstrap entrypoint (→ scripts/local-search install)
 ├── data/
 │   └── README.md                 # private telemetry location (SQLite files ignored)
@@ -428,5 +447,5 @@ local-search/
 
 ```bash
 local-search uninstall          # stops services + removes plists; keeps telemetry/src/venvs
-rm -rf ~/local_code/local-search  # full removal, including repository-local telemetry
+rm -rf ~/local_code/local_web_search  # full removal, including repository-local telemetry
 ```

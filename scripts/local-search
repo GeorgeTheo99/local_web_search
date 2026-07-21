@@ -64,6 +64,8 @@ LOCAL_SEARCH_TELEMETRY_ENABLED="${LOCAL_SEARCH_TELEMETRY_ENABLED:-$(installed_mc
 LOCAL_SEARCH_TELEMETRY_ENABLED="${LOCAL_SEARCH_TELEMETRY_ENABLED:-true}"
 
 LOG_DIR="${LOCAL_SEARCH_LOG_DIR:-$HOME/Library/Logs/local-search}"
+LOCAL_SEARCH_DATA_DIR_EXPLICIT=0
+[ -n "${LOCAL_SEARCH_DATA_DIR:-}" ] && LOCAL_SEARCH_DATA_DIR_EXPLICIT=1
 LOCAL_SEARCH_DATA_DIR="${LOCAL_SEARCH_DATA_DIR:-$(installed_config_value LOCAL_SEARCH_DATA_DIR)}"
 LOCAL_SEARCH_DATA_DIR="${LOCAL_SEARCH_DATA_DIR:-$(installed_mcp_env LOCAL_SEARCH_DATA_DIR)}"
 LOCAL_SEARCH_DATA_DIR="${LOCAL_SEARCH_DATA_DIR:-$ROOT_DIR/data}"
@@ -71,6 +73,16 @@ case "$LOCAL_SEARCH_DATA_DIR" in
   /*) ;;
   *) LOCAL_SEARCH_DATA_DIR="$ROOT_DIR/$LOCAL_SEARCH_DATA_DIR" ;;
 esac
+# One-time repository rename migration: a persisted default may still point at
+# the exact removed sibling checkout. Explicit overrides and other custom paths win.
+LEGACY_REPO_DATA_DIR="${ROOT_DIR%/*}/local-search/data"
+legacy_root="${LEGACY_REPO_DATA_DIR%/data}"
+if [ "$LOCAL_SEARCH_DATA_DIR_EXPLICIT" -eq 0 ] \
+  && [ "$LOCAL_SEARCH_DATA_DIR" = "$LEGACY_REPO_DATA_DIR" ] \
+  && [ ! -e "$legacy_root/.git" ]; then
+  printf '! migrating stale repository-local data path to %s/data\n' "$ROOT_DIR" >&2
+  LOCAL_SEARCH_DATA_DIR="$ROOT_DIR/data"
+fi
 case "$(printf '%s' "$LOCAL_SEARCH_TELEMETRY_ENABLED" | tr '[:upper:]' '[:lower:]' | xargs)" in
   0|false|no|off) LOCAL_SEARCH_TELEMETRY_ENABLED=false ;;
   *) LOCAL_SEARCH_TELEMETRY_ENABLED=true ;;

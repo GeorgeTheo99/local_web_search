@@ -680,6 +680,152 @@ async def test_web_search_error_payload_when_searxng_down(monkeypatch):
     assert "text" in payload
 
 @pytest.mark.asyncio
+async def test_web_search_rejects_oversized_query_before_provider_access(monkeypatch):
+    monkeypatch.setattr(
+        srv,
+        "_searxng_search",
+        lambda *_args: (_ for _ in ()).throw(AssertionError("provider must not run")),
+    )
+    secret_suffix = "PRIVATE_SUFFIX"
+    result = await _call_tool(
+        "web_search",
+        {"query": "x" * srv.MAX_QUERY_CHARS + secret_suffix, "num_results": 3},
+    )
+    payload = json.loads(_result_text(result))
+    assert payload["status"] == "error"
+    assert str(srv.MAX_QUERY_CHARS) in payload["error"]
+    assert secret_suffix not in _result_text(result)
+
+
+def test_public_result_urls_reject_noncanonical_private_ip_literals():
+    for url in (
+        "http://127.1/secret",
+        "http://0177.0.0.1/secret",
+        "http://0x7f.0.0.1/secret",
+    ):
+        assert srv._public_http_url(url) is None
+        assert srv._normalize_searxng_image_result(
+            {"img_src": url, "engine": "duckduckgo images"}
+        ) is None
+
+
+def test_tavily_base_url_requires_credential_free_https(monkeypatch):
+    assert srv._tavily_search_url() == "https://api.tavily.com/search"
+    for invalid in (
+        "http://api.tavily.com",
+        "https://user:pass@api.tavily.com",
+        "https://api.tavily.com/v1",
+        "https://api.tavily.com:bad",
+        "https://api.tavily.com?token=secret",
+    ):
+        monkeypatch.setattr(srv, "TAVILY_BASE_URL", invalid)
+        with pytest.raises(ValueError, match="credential-free HTTPS"):
+            srv._tavily_search_url()
+
+
+@pytest.mark.asyncio
+async def test_provider_json_response_is_size_bounded(monkeypatch):
+    monkeypatch.setattr(srv, "SEARCH_RESPONSE_MAX_BYTES", 8)
+    response = srv.httpx.Response(200, stream=srv.httpx.ByteStream(b'{"result": true}'))
+    with pytest.raises(ValueError, match="byte limit"):
+        await srv._limited_json_object(response, provider="test")
+
+
+@pytest.mark.asyncio
+async def test_provider_json_response_rejects_compression_before_decode():
+    response = srv.httpx.Response(
+        200,
+        headers={"Content-Encoding": "gzip"},
+        stream=srv.httpx.ByteStream(b"compressed bytes are never decoded"),
+    )
+    with pytest.raises(ValueError, match="content encoding"):
+        await srv._limited_json_object(response, provider="test")
+
+
+@pytest.mark.asyncio
+async def test_search_provider_requests_disable_compression(monkeypatch):
+    seen: list[tuple[str, str]] = []
+
+    async def handler(request):
+        seen.append((request.url.path, request.headers.get("accept-encoding", "")))
+        if request.url.path == "/search" and request.method == "GET":
+            return srv.httpx.Response(
+                200,
+                headers={"Content-Type": "application/json"},
+                stream=srv.httpx.ByteStream(b'{"results": []}'),
+            )
+        return srv.httpx.Response(
+            200,
+            headers={"Content-Type": "application/json"},
+            stream=srv.httpx.ByteStream(
+                b'{"results": [{"title": "safe", "url": "https://example.com/"}]}'
+            ),
+        )
+
+    client = srv.httpx.AsyncClient(transport=srv.httpx.MockTransport(handler))
+
+    async def fake_client():
+        return client
+
+    monkeypatch.setattr(srv, "_client", fake_client)
+    monkeypatch.setattr(srv, "TAVILY_BASE_URL", "https://api.tavily.com")
+    try:
+        searxng = await srv._searxng_request("/search", {"q": "test"})
+        tavily = await srv._tavily_search("test", 1, "")
+    finally:
+        await client.aclose()
+
+    assert searxng.data == {"results": []}
+    assert tavily.state == "ok"
+    assert seen == [("/search", "identity"), ("/search", "identity")]
+
+
+@pytest.mark.asyncio
+async def test_web_search_filters_unsafe_urls_and_falls_back_when_none_are_usable(monkeypatch):
+    monkeypatch.setattr(srv, "TAVILY_MODE", "fallback")
+
+    async def fake_request(path, params, timeout=None):
+        return {
+            "results": [
+                {"title": "relative", "url": "/private", "content": "bad"},
+                {"title": "script", "url": "javascript:alert(1)", "content": "bad"},
+                {"title": "local", "url": "http://127.0.0.1/secret", "content": "bad"},
+                {"title": "short local", "url": "http://127.1/secret", "content": "bad"},
+            ],
+            "unresponsive_engines": [["duckduckgo", "blocked"]],
+        }
+
+    async def fake_tavily(query, num_results, api_key):
+        return [
+            {"title": "safe", "url": "https://example.com/", "content": "good"},
+            {"title": "credential", "url": "https://u:p@example.com/private", "content": "bad"},
+        ], True
+
+    monkeypatch.setattr(srv, "_searxng_request", fake_request)
+    monkeypatch.setattr(srv, "_tavily_search", fake_tavily)
+    result = await _call_tool("web_search", {"query": "safe sources", "num_results": 5})
+    payload = json.loads(_result_text(result))
+    assert payload["attempted"] == ["searxng", "tavily"]
+    assert [item["url"] for item in payload["results"]] == ["https://example.com/"]
+
+
+@pytest.mark.asyncio
+async def test_image_search_rejects_oversized_query_before_provider_access(monkeypatch):
+    monkeypatch.setattr(
+        srv,
+        "_searxng_image_search",
+        lambda *_args: (_ for _ in ()).throw(AssertionError("provider must not run")),
+    )
+    result = await _call_tool(
+        "image_search",
+        {"query": "x" * (srv.MAX_QUERY_CHARS + 1), "num_results": 3},
+    )
+    payload = json.loads(_result_text(result))
+    assert payload["status"] == "error"
+    assert str(srv.MAX_QUERY_CHARS) in payload["error"]
+
+
+@pytest.mark.asyncio
 async def test_web_search_success_payload_shape(monkeypatch):
     """Success payload matches the contract Home Automation's McpSearchProvider
     relies on: result.content[].text is JSON with results/suggestions/text,
@@ -799,33 +945,31 @@ async def test_tavily_disabled_surfaces_searxng_degradation(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_fallback_mode_supplements_degraded_nonempty_results(monkeypatch):
+async def test_fallback_mode_keeps_degraded_nonempty_results_local(monkeypatch):
     monkeypatch.setattr(srv, "TAVILY_MODE", "fallback")
 
     async def fake_request(path, params, timeout=None):
         return {
             "results": [
-                {"title": f"Wrong town {index}", "url": f"https://wrong.example/{index}", "content": "irrelevant", "engine": "bing"}
-                for index in range(10)
+                {"title": f"Local result {index}", "url": f"https://local.example/{index}", "content": "result", "engine": "bing"}
+                for index in range(5)
             ],
             "suggestions": [],
             "unresponsive_engines": [["duckduckgo", "blocked"]],
         }
 
-    async def fake_tavily(query, num_results, api_key):
-        return [
-            {"title": "Primary source", "url": "https://town.example/code", "domain": "town.example", "snippet": "code", "engine": "tavily", "score": 0.9},
-        ], True
+    async def fail_tavily(*_args):
+        raise AssertionError("fallback mode must not egress when local results exist")
 
     monkeypatch.setattr(srv, "_searxng_request", fake_request)
-    monkeypatch.setattr(srv, "_tavily_search", fake_tavily)
+    monkeypatch.setattr(srv, "_tavily_search", fail_tavily)
     result = await _call_tool("web_search", {"query": "town zoning", "num_results": 5})
     payload = json.loads(_result_text(result))
-    assert payload["attempted"] == ["searxng", "tavily"]
-    assert payload["fallback_reason"] == "searxng_degraded"
-    assert payload["backend"] == "searxng+tavily"
+    assert payload["status"] == "degraded"
+    assert payload["attempted"] == ["searxng"]
+    assert payload["fallback_reason"] is None
+    assert payload["backend"] == "searxng"
     assert len(payload["results"]) == 5
-    assert payload["results"][-1]["url"] == "https://town.example/code"
 
 
 @pytest.mark.asyncio

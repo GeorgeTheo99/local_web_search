@@ -15,7 +15,7 @@ HTTP diagnostics:
 
 WEBSEARCH_TAVILY_MODE controls external Tavily egress:
   - disabled:   SearXNG only
-  - fallback:   Tavily when SearXNG is empty or reports degraded engines (default)
+  - fallback:   Tavily only when SearXNG has no usable results (default)
   - supplement: Tavily when SearXNG is below the configured result minimum
 
 Searches use one bounded 18-second-or-less budget, overfetch before URL dedupe,
@@ -33,6 +33,7 @@ Key configuration:
   WEBSEARCH_TOTAL_TIMEOUT             capped at 18 seconds
   WEBSEARCH_SEARXNG_TIMEOUT           default 7 seconds
   WEBSEARCH_TAVILY_TIMEOUT            default 8 seconds
+  WEBSEARCH_SEARCH_MAX_BYTES          default 2 MiB per provider response
   WEBSEARCH_SUPPLEMENT_MIN_RESULTS    default 5
   LOCAL_SEARCH_DATA_DIR               default ../data beside this package
   LOCAL_SEARCH_TELEMETRY_ENABLED      default true
@@ -136,8 +137,12 @@ SUPPLEMENT_MIN_RESULTS = _bounded_int(
 )
 MAX_NUM_RESULTS = 20
 RESULT_OVERFETCH_FACTOR = 2
+MAX_QUERY_CHARS = 512
+SEARCH_RESPONSE_MAX_BYTES = _bounded_int(
+    "WEBSEARCH_SEARCH_MAX_BYTES", 2 * 1024 * 1024, minimum=4096, maximum=10 * 1024 * 1024
+)
 BATCH_MAX_QUERIES = 3
-BATCH_MAX_QUERY_CHARS = 512
+BATCH_MAX_QUERY_CHARS = MAX_QUERY_CHARS
 BATCH_MAX_CONCURRENCY = 2
 BatchQueries = Annotated[
     list[str],
@@ -548,8 +553,10 @@ def _fetch_error(message: str) -> str:
 # Result normalization + dedupe.
 # --------------------------------------------------------------------------- #
 
-def _normalize_searxng_result(r: dict) -> dict[str, Any]:
-    url = r.get("url", "")
+def _normalize_searxng_result(r: dict) -> dict[str, Any] | None:
+    url = _public_http_url(r.get("url"))
+    if url is None:
+        return None
     return {
         "title": r.get("title", "Untitled"),
         "url": url,
@@ -585,6 +592,13 @@ def _public_http_url(value: Any) -> str | None:
             if _is_private_ip(ipaddress.ip_address(host)):
                 return None
         except ValueError:
+            # Browsers and URL stacks may reinterpret abbreviated, octal, or
+            # hexadecimal IPv4 forms (for example 127.1 or 0x7f.0.0.1).
+            if re.fullmatch(
+                r"(?i)(?:0x[0-9a-f]+|[0-9]+)(?:\.(?:0x[0-9a-f]+|[0-9]+))*",
+                host,
+            ):
+                return None
             labels = host.split(".")
             if len(labels) < 2 or any(
                 not label
@@ -691,8 +705,10 @@ def _normalize_searxng_image_result(r: dict[str, Any]) -> dict[str, Any] | None:
     }
 
 
-def _normalize_tavily_result(r: dict) -> dict[str, Any]:
-    url = str(r.get("url") or "")
+def _normalize_tavily_result(r: dict) -> dict[str, Any] | None:
+    url = _public_http_url(r.get("url"))
+    if url is None:
+        return None
     return {
         "title": r.get("title") or "Untitled",
         "url": url,
@@ -736,11 +752,17 @@ def _dedupe_and_rank(results: list[dict[str, Any]], num_results: int) -> list[di
     seen: set[str] = set()
     unique: list[dict[str, Any]] = []
     for result in results:
-        key = _canonical_result_url(str(result.get("url") or ""))
+        url = _public_http_url(result.get("url"))
+        if url is None:
+            continue
+        key = _canonical_result_url(url)
         if not key or key in seen:
             continue
         seen.add(key)
-        unique.append(dict(result))
+        normalized = dict(result)
+        normalized["url"] = url
+        normalized["domain"] = _domain(url)
+        unique.append(normalized)
         if len(unique) >= num_results:
             break
     for index, result in enumerate(unique, 1):
@@ -1281,6 +1303,45 @@ def _coerce_request_outcome(value: Any) -> _RequestOutcome:
     return _RequestOutcome(None, "error", 1, "request failed")
 
 
+async def _limited_json_object(response: httpx.Response, *, provider: str) -> dict[str, Any]:
+    """Decode one bounded, uncompressed provider response."""
+    content_encoding = response.headers.get("content-encoding", "identity").strip().lower()
+    if content_encoding not in {"", "identity"}:
+        raise ValueError(f"{provider} returned unsupported content encoding")
+    content_length = response.headers.get("content-length")
+    if content_length and content_length.isdigit() and int(content_length) > SEARCH_RESPONSE_MAX_BYTES:
+        raise ValueError(f"{provider} response exceeds {SEARCH_RESPONSE_MAX_BYTES} byte limit")
+    body = bytearray()
+    async for chunk in response.aiter_raw():
+        if len(body) + len(chunk) > SEARCH_RESPONSE_MAX_BYTES:
+            raise ValueError(f"{provider} response exceeds {SEARCH_RESPONSE_MAX_BYTES} byte limit")
+        body.extend(chunk)
+    data = json.loads(body)
+    if not isinstance(data, dict):
+        raise ValueError(f"{provider} returned an invalid JSON payload")
+    return data
+
+
+def _tavily_search_url() -> str:
+    """Return the configured Tavily endpoint only when credentials can be sent safely."""
+    parsed = urllib.parse.urlsplit(TAVILY_BASE_URL)
+    try:
+        _ = parsed.port
+    except ValueError as exc:
+        raise ValueError("TAVILY_BASE_URL must be a credential-free HTTPS origin") from exc
+    if (
+        parsed.scheme.lower() != "https"
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path not in {"", "/"}
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ValueError("TAVILY_BASE_URL must be a credential-free HTTPS origin")
+    return urllib.parse.urlunsplit(("https", parsed.netloc, "/search", "", ""))
+
+
 def _searxng_url_is_loopback() -> bool:
     try:
         parsed = urllib.parse.urlsplit(SEARXNG_URL)
@@ -1316,22 +1377,15 @@ async def _searxng_request(
         attempts = attempt + 1
         retryable = True
         try:
-            response = await client.get(
+            async with client.stream(
+                "GET",
                 url,
-                headers={"Accept": "application/json"},
+                headers={"Accept": "application/json", "Accept-Encoding": "identity"},
                 timeout=remaining,
-            )
-            response.raise_for_status()
-            data = response.json()
-            if not isinstance(data, dict):
-                return _RequestOutcome(
-                    None,
-                    "error",
-                    attempts,
-                    "invalid JSON payload",
-                    response.status_code,
-                )
-            return _RequestOutcome(data, "ok", attempts, http_status=response.status_code)
+            ) as response:
+                response.raise_for_status()
+                data = await _limited_json_object(response, provider="SearXNG")
+                return _RequestOutcome(data, "ok", attempts, http_status=response.status_code)
         except httpx.TimeoutException:
             last_state = "timeout"
             last_error = "request timed out"
@@ -1410,7 +1464,12 @@ async def _searxng_search(query: str, num_results: int) -> _BackendOutcome:
     raw_results = request.data.get("results", [])
     if not isinstance(raw_results, list):
         raw_results = []
-    results = [_normalize_searxng_result(item) for item in raw_results[:num_results] if isinstance(item, dict)]
+    results = [
+        normalized
+        for item in raw_results[:num_results]
+        if isinstance(item, dict)
+        and (normalized := _normalize_searxng_result(item)) is not None
+    ]
     suggestions = request.data.get("suggestions", [])
     if not isinstance(suggestions, list):
         suggestions = []
@@ -1554,22 +1613,22 @@ async def _tavily_search(query: str, num_results: int, api_key: str) -> _Backend
         "topic": "general",
     }
     headers = (
-        {"Authorization": f"Bearer {api_key}"}
+        {"Authorization": f"Bearer {api_key}", "Accept-Encoding": "identity"}
         if api_key
-        else {"X-Tavily-Access-Mode": "keyless"}
+        else {"X-Tavily-Access-Mode": "keyless", "Accept-Encoding": "identity"}
     )
     try:
+        search_url = _tavily_search_url()
         client = await _client()
-        response = await client.post(
-            f"{TAVILY_BASE_URL}/search",
+        async with client.stream(
+            "POST",
+            search_url,
             json=payload,
             headers=headers,
             timeout=TAVILY_TIMEOUT,
-        )
-        response.raise_for_status()
-        data = response.json()
-        if not isinstance(data, dict):
-            raise ValueError("invalid JSON payload")
+        ) as response:
+            response.raise_for_status()
+            data = await _limited_json_object(response, provider="Tavily")
     except asyncio.CancelledError:
         _breaker.record_aborted("tavily")
         raise
@@ -1601,9 +1660,10 @@ async def _tavily_search(query: str, num_results: int, api_key: str) -> _Backend
         if not isinstance(raw_results, list):
             raw_results = []
         results = [
-            _normalize_tavily_result(item)
+            normalized
             for item in raw_results[:num_results]
             if isinstance(item, dict)
+            and (normalized := _normalize_tavily_result(item)) is not None
         ]
         return _BackendOutcome(
             backend="tavily",
@@ -1895,6 +1955,24 @@ async def _web_search_impl(query: str, num_results: int = 8) -> str:
             result_count=0,
             timings_ms=timings_ms,
         )
+    if len(query) > MAX_QUERY_CHARS:
+        timings_ms = {
+            "total": round((time.monotonic() - started) * 1000, 1),
+            "searxng": None,
+            "tavily": None,
+        }
+        return _finish_search(
+            _search_error_payload(
+                "",
+                f"Search error: query must be at most {MAX_QUERY_CHARS} characters.",
+                timings_ms=timings_ms,
+            ),
+            status="error",
+            backend="none",
+            requested_count=requested,
+            result_count=0,
+            timings_ms=timings_ms,
+        )
 
     candidate_limit = min(MAX_NUM_RESULTS, requested * RESULT_OVERFETCH_FACTOR)
     attempted = ["searxng"]
@@ -1907,8 +1985,7 @@ async def _web_search_impl(query: str, num_results: int = 8) -> str:
     threshold = min(SUPPLEMENT_MIN_RESULTS, requested)
     provider_states = {"searxng": searxng.state}
     should_use_tavily = (
-        TAVILY_MODE == "fallback"
-        and (not searxng_candidates or searxng.state == "degraded")
+        TAVILY_MODE == "fallback" and not searxng_candidates
     ) or (
         TAVILY_MODE == "supplement" and len(searxng_candidates) < threshold
     )
@@ -2253,6 +2330,26 @@ async def image_search(query: str, num_results: int = 8) -> str:
             _search_error_payload(
                 query,
                 "Image search error: query must not be empty.",
+                timings_ms=timings_ms,
+                mode="disabled",
+            ),
+            status="error",
+            backend="none",
+            requested_count=requested,
+            result_count=0,
+            timings_ms=timings_ms,
+            mode="disabled",
+        )
+    if len(query) > MAX_QUERY_CHARS:
+        timings_ms = {
+            "total": round((time.monotonic() - started) * 1000, 1),
+            "searxng": None,
+            "tavily": None,
+        }
+        return _finish_search(
+            _search_error_payload(
+                "",
+                f"Image search error: query must be at most {MAX_QUERY_CHARS} characters.",
                 timings_ms=timings_ms,
                 mode="disabled",
             ),
