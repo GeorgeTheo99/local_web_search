@@ -148,6 +148,13 @@ PERPLEXITY_TIMEOUT = _bounded_float(
     "WEBSEARCH_PERPLEXITY_TIMEOUT", 12.0, minimum=0.25, maximum=SEARCH_TOTAL_TIMEOUT
 )
 SONAR_MODEL = os.environ.get("WEBSEARCH_SONAR_MODEL", "sonar").strip() or "sonar"
+# Default search routing mode (ADR 0002 Phase 5). Per-call overrides come via
+# the web_search `mode` argument. `sensitive` makes no external call (local KB
+# only or refuse; SearXNG is NOT no-egress). `maximum_recall` serially
+# escalates across all configured providers (opt-in; multiplies disclosure).
+_SEARCH_MODE = os.environ.get("WEBSEARCH_SEARCH_MODE", "normal").strip().lower()
+if _SEARCH_MODE not in {"normal", "sensitive", "maximum_recall"}:
+    raise RuntimeError("WEBSEARCH_SEARCH_MODE must be normal, sensitive, or maximum_recall")
 # Provider stack selection (ADR 0002). The default preserves the existing
 # SearXNG-first + Tavily-fallback behavior so deployments and tests are
 # unchanged until an operator opts into the Kagi stack. Phase 6 will flip the
@@ -549,8 +556,9 @@ def _search_metadata(
     unresponsive_engines: list[Any] | None,
     provider_states: dict[str, str] | None,
     mode: str | None = None,
+    search_mode: str | None = None,
 ) -> dict[str, Any]:
-    return {
+    meta = {
         "status": status,
         "backend": backend,
         "attempted": attempted or [],
@@ -560,6 +568,9 @@ def _search_metadata(
         "unresponsive_engines": (unresponsive_engines or [])[:10],
         "provider_states": provider_states or {},
     }
+    if search_mode:
+        meta["search_mode"] = search_mode
+    return meta
 
 
 def _record_last_search(payload: dict[str, Any]) -> None:
@@ -699,6 +710,7 @@ def _search_error_payload(
     unresponsive_engines: list[Any] | None = None,
     provider_states: dict[str, str] | None = None,
     mode: str | None = None,
+    search_mode: str | None = None,
 ) -> str:
     payload = {
         "query": query,
@@ -715,6 +727,7 @@ def _search_error_payload(
             unresponsive_engines=unresponsive_engines,
             provider_states=provider_states,
             mode=mode,
+            search_mode=search_mode,
         ),
     }
     _record_last_search(payload)
@@ -1063,6 +1076,7 @@ def _format_results(
     answer: str | None = None,
     citations: list[str] | None = None,
     mode: str | None = None,
+    search_mode: str | None = None,
 ) -> str:
     """Format results as the legacy contract plus additive provider metadata."""
     effective_status = status or ("ok" if results else "empty")
@@ -1101,6 +1115,7 @@ def _format_results(
             unresponsive_engines=unresponsive_engines,
             provider_states=provider_states,
             mode=mode,
+            search_mode=search_mode,
         ),
     }
     if answer:
@@ -2631,11 +2646,14 @@ def _timings(
     return timings
 
 
-async def _web_search_impl(query: str, num_results: int = 8) -> str:
+async def _web_search_impl(query: str, num_results: int = 8, *, mode: str | None = None) -> str:
     """Execute one web search using the public tool's stable payload contract."""
     started = time.monotonic()
     query = query.strip()
     requested = min(MAX_NUM_RESULTS, max(1, int(num_results)))
+    effective_mode = (mode or _SEARCH_MODE).strip().lower()
+    if effective_mode not in {"normal", "sensitive", "maximum_recall"}:
+        effective_mode = "normal"
     if not query:
         timings_ms = _default_timings_ms()
         timings_ms["total"] = round((time.monotonic() - started) * 1000, 1)
@@ -2644,6 +2662,7 @@ async def _web_search_impl(query: str, num_results: int = 8) -> str:
                 query,
                 "Search error: query must not be empty.",
                 timings_ms=timings_ms,
+                search_mode=effective_mode,
             ),
             status="error",
             backend="none",
@@ -2659,6 +2678,30 @@ async def _web_search_impl(query: str, num_results: int = 8) -> str:
                 "",
                 f"Search error: query must be at most {MAX_QUERY_CHARS} characters.",
                 timings_ms=timings_ms,
+                search_mode=effective_mode,
+            ),
+            status="error",
+            backend="none",
+            requested_count=requested,
+            result_count=0,
+            timings_ms=timings_ms,
+        )
+
+    # Sensitive / no-egress mode (ADR 0002 Phase 5): make no external call.
+    # SearXNG is not no-egress (upstream engines see the household IP), so it is
+    # not used here. A local KB/corpus index is not yet wired, so we refuse with
+    # a structured error rather than leak the query to any provider.
+    if effective_mode == "sensitive":
+        timings_ms = _default_timings_ms()
+        timings_ms["total"] = round((time.monotonic() - started) * 1000, 1)
+        return _finish_search(
+            _search_error_payload(
+                query,
+                "Search error: sensitive/no-egress mode forbids external search and no local corpus is configured.",
+                timings_ms=timings_ms,
+                attempted=[],
+                provider_states={},
+                search_mode=effective_mode,
             ),
             status="error",
             backend="none",
@@ -2668,6 +2711,71 @@ async def _web_search_impl(query: str, num_results: int = 8) -> str:
         )
 
     candidate_limit = min(MAX_NUM_RESULTS, requested * RESULT_OVERFETCH_FACTOR)
+
+    # Maximum-recall mode (ADR 0002 Phase 5): opt-in serial escalation across
+    # every configured provider. Multiplies disclosure, so it is never the
+    # default. Results are merged and deduped; a generated answer (Sonar) is
+    # surfaced separately. This path bypasses the quality gate by design.
+    if effective_mode == "maximum_recall" and len(_PROVIDERS) >= 1:
+        outcomes: list[_BackendOutcome] = []
+        attempted_mr: list[str] = []
+        merged: list[dict[str, Any]] = []
+        answer_mr: str | None = None
+        citations_mr: list[str] = []
+        provider_states_mr: dict[str, str] = {}
+        for provider in _PROVIDERS:
+            remaining = SEARCH_TOTAL_TIMEOUT - (time.monotonic() - started)
+            if remaining <= 0:
+                circuit = _breaker.snapshot(provider.name)
+                outcomes.append(_BackendOutcome(
+                    backend=provider.name, state="timeout",
+                    error="total deadline exceeded",
+                    circuit_before=str(circuit["state"]),
+                    circuit_after=str(circuit["state"]),
+                    circuit_failures=int(circuit["consecutive_failures"]),
+                ))
+            else:
+                outcome = await _run_backend(
+                    provider.name,
+                    provider.search(query, candidate_limit),
+                    min(provider.timeout, remaining),
+                )
+                if outcome.credential_mode == "none" and isinstance(provider, _TavilyProvider):
+                    outcome.credential_mode = provider.credential_label()
+                outcomes.append(outcome)
+            last = outcomes[-1]
+            attempted_mr.append(last.backend)
+            provider_states_mr[last.backend] = last.state
+            merged.extend(last.results)
+            if last.answer and not answer_mr:
+                answer_mr = last.answer
+            if last.citations and not citations_mr:
+                citations_mr = last.citations
+        results = _dedupe_and_rank(merged, requested)
+        timings_ms = _timings(started, outcomes)
+        backend = _result_backend(results)
+        if results or answer_mr:
+            status = "ok" if any(o.ok for o in outcomes) else "degraded"
+            rendered = _format_results(
+                query, results, [],
+                status=status, backend=backend, attempted=attempted_mr,
+                timings_ms=timings_ms, provider_states=provider_states_mr,
+                answer=answer_mr, citations=citations_mr or None,
+                search_mode=effective_mode,
+            )
+        else:
+            status = "empty" if any(o.ok for o in outcomes) else "error"
+            backend = "none"
+            rendered = _format_results(
+                query, [], [], status=status, backend=backend, attempted=attempted_mr,
+                timings_ms=timings_ms, provider_states=provider_states_mr,
+                search_mode=effective_mode,
+            )
+        return _finish_search(
+            rendered, status=status, backend=backend, requested_count=requested,
+            result_count=len(results), timings_ms=timings_ms, outcomes=outcomes,
+        )
+
     primary = _PROVIDERS[0]
     fallback = _PROVIDERS[1] if len(_PROVIDERS) > 1 else None
     attempted = [primary.name]
@@ -2856,9 +2964,14 @@ async def _web_search_impl(query: str, num_results: int = 8) -> str:
 
 
 @mcp.tool()
-async def web_search(query: str, num_results: int = 8) -> str:
-    """Search SearXNG first, then apply the configured Tavily egress policy."""
-    return await _web_search_impl(query, num_results)
+async def web_search(query: str, num_results: int = 8, mode: str | None = None) -> str:
+    """Search SearXNG first, then apply the configured Tavily egress policy.
+
+    Optional `mode` selects the ADR 0002 routing mode: `normal` (default),
+    `sensitive` (no external egress; refuses without a local corpus), or
+    `maximum_recall` (opt-in serial escalation across all configured providers).
+    """
+    return await _web_search_impl(query, num_results, mode=mode)
 
 
 @mcp.tool()
