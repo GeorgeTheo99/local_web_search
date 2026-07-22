@@ -225,6 +225,46 @@ Provider search responses default to a 2 MiB cap (`WEBSEARCH_SEARCH_MAX_BYTES`).
 budget retains transport/serialization margin. `WEBSEARCH_SEARCH_TIMEOUT`
 remains a deprecated alias for `WEBSEARCH_SEARXNG_TIMEOUT`.
 
+### Provider stack selection (ADR 0002)
+
+`WEBSEARCH_PROVIDER_STACK` selects the active search stack (default
+`searxng+tavily`, preserving legacy behavior):
+
+| Stack | Primary | Fallback | Notes |
+|---|---|---|---|
+| `searxng+tavily` | SearXNG | Tavily | Default; unchanged from pre-ADR behavior. |
+| `searxng` | SearXNG | none | SearXNG-only. |
+| `kagi` | Kagi | none | Kagi raw search; requires a Kagi key. |
+| `kagi+sonar` | Kagi | Perplexity Sonar | ADR target stack; quality-gated fallback to Sonar. |
+
+Credentials (manual bootstrap per ADR 0002; never stored in the repo or
+launchd plists):
+
+- **Kagi**: `X-Kagi-Key` header (per-call) → `KAGI_API_KEY` env → mode-`0600`
+  file at `$LOCAL_SEARCH_DATA_DIR/kagi_key`. Generate the key in the Kagi API
+  Portal (`help.kagi.com/kagi/api/overview.html`).
+- **Perplexity Sonar**: `X-Perplexity-Key` header → `PERPLEXITY_API_KEY` env →
+  mode-`0600` file at `$LOCAL_SEARCH_DATA_DIR/perplexity_key`. Create the API
+  group and first key at `console.perplexity.ai`.
+
+Secret files must be owner-only (`chmod 0600`); group/world-readable files are
+ignored. After onboarding both keys, switch the stack:
+
+```bash
+WEBSEARCH_PROVIDER_STACK=kagi+sonar ./install.sh
+```
+
+The quality gate (`WEBSEARCH_QUALITY_GATE=auto`) is enabled automatically for
+non-legacy stacks; it falls back to Sonar when Kagi returns thin, single-domain,
+or duplicate-dominated results. `WEBSEARCH_QUALITY_MIN_RESULTS` (default 3) and
+`WEBSEARCH_QUALITY_MIN_DOMAINS` (default 2) tune the gate.
+
+Routing modes (`web_search` `mode` argument or `WEBSEARCH_SEARCH_MODE`):
+`normal` (default), `sensitive` (no external egress; refuses without a local
+corpus — SearXNG is not no-egress), `maximum_recall` (opt-in serial escalation
+across all configured providers). The `answer_search` tool calls Sonar directly
+for a grounded answer with citations.
+
 ## Operator CLI
 
 All day-to-day operations go through `scripts/local-search`:

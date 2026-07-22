@@ -1060,6 +1060,38 @@ async def test_health_reflects_recent_provider_failure(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_health_exposes_provider_stack_and_providers(monkeypatch):
+    """ADR 0002 Phase 6: health reports the active stack and per-provider status."""
+    async def reachable():
+        return {"reachable": True, "latency_ms": 1.0}
+    monkeypatch.setattr(srv, "_probe_searxng", reachable)
+    monkeypatch.setattr(srv, "TAVILY_API_KEY_ENV", "")
+    health = await srv._health_payload()
+    assert health["provider_stack"] == "searxng+tavily"
+    names = [p["name"] for p in health["providers"]]
+    assert names == ["searxng", "tavily"]
+    assert all("credential_configured" in p for p in health["providers"])
+    assert all("circuit" in p for p in health["providers"])
+
+
+@pytest.mark.asyncio
+async def test_health_provider_stack_reflects_kagi_sonar(monkeypatch):
+    monkeypatch.setattr(srv, "_PROVIDER_STACK", "kagi+sonar")
+    monkeypatch.setattr(srv, "_PROVIDERS", srv._build_provider_stack())
+    monkeypatch.setattr(srv, "KAGI_API_KEY_ENV", "kagi-key")
+    monkeypatch.setattr(srv, "PERPLEXITY_API_KEY_ENV", "")
+    monkeypatch.setattr(srv, "get_http_headers", lambda: {})
+    health = await srv._health_payload()
+    assert health["provider_stack"] == "kagi+sonar"
+    names = [p["name"] for p in health["providers"]]
+    assert names == ["kagi", "sonar"]
+    kagi = next(p for p in health["providers"] if p["name"] == "kagi")
+    sonar = next(p for p in health["providers"] if p["name"] == "sonar")
+    assert kagi["credential_configured"] is True
+    assert sonar["credential_configured"] is False
+
+
+@pytest.mark.asyncio
 async def test_readiness_and_health_expose_safe_state(monkeypatch):
     async def unavailable():
         return {"reachable": False, "latency_ms": 1.0}

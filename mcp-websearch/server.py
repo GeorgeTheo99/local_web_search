@@ -496,6 +496,19 @@ def _build_provider_stack() -> list[SearchProvider]:
 _PROVIDERS: list[SearchProvider] = _build_provider_stack()
 
 
+def _provider_credential_configured(name: str) -> bool:
+    """Return whether a provider's credential is resolvable (without leaking it)."""
+    if name == "searxng":
+        return True  # loopback SearXNG is keyless.
+    if name == "tavily":
+        return bool(_resolve_tavily_key()) or True  # Tavily supports keyless mode.
+    if name == "kagi":
+        return bool(_resolve_kagi_key())
+    if name == "sonar":
+        return bool(_resolve_perplexity_key())
+    return False
+
+
 def _default_timings_ms() -> dict[str, float | None]:
     """Baseline timings dict with every provider's key present and unset."""
     timings: dict[str, float | None] = {"total": 0.0}
@@ -2414,6 +2427,18 @@ async def _health_payload() -> dict[str, Any]:
             "last_state": provider_states.get("tavily"),
             "circuit": tavily_breaker,
         },
+        "provider_stack": _PROVIDER_STACK,
+        "providers": [
+            {
+                "name": p.name,
+                "output": p.output,
+                "timeout_s": p.timeout,
+                "credential_configured": _provider_credential_configured(p.name),
+                "circuit": _breaker.snapshot(p.name),
+                "last_state": (_last_search or {}).get("provider_states", {}).get(p.name),
+            }
+            for p in _PROVIDERS
+        ],
         "telemetry": _get_telemetry().status(),
         "last_search": _last_search,
     }
