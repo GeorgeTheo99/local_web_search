@@ -152,6 +152,27 @@ if _PROVIDER_STACK not in {"searxng+tavily", "kagi", "kagi+sonar", "searxng"}:
 SUPPLEMENT_MIN_RESULTS = _bounded_int(
     "WEBSEARCH_SUPPLEMENT_MIN_RESULTS", 5, minimum=1, maximum=20
 )
+# Quality gate (ADR 0002 Phase 3). When enabled, a nonempty primary result set
+# can still trigger fallback if it is thin, single-domain-dominated, or
+# duplicate/generic. Defaults are conservative starting points to be tuned
+# against the local smoke set. "auto" enables the gate for every stack except
+# the legacy searxng+tavily default so existing behavior is preserved until
+# Phase 6 flips the default.
+_QUALITY_GATE_MODE = os.environ.get("WEBSEARCH_QUALITY_GATE", "auto").strip().lower()
+if _QUALITY_GATE_MODE not in {"auto", "on", "off"}:
+    raise RuntimeError("WEBSEARCH_QUALITY_GATE must be auto, on, or off")
+QUALITY_MIN_RESULTS = _bounded_int(
+    "WEBSEARCH_QUALITY_MIN_RESULTS", 3, minimum=1, maximum=10
+)
+QUALITY_MIN_DOMAINS = _bounded_int(
+    "WEBSEARCH_QUALITY_MIN_DOMAINS", 2, minimum=1, maximum=10
+)
+# Snippet near-duplicate threshold (Jaccard on whitespace token sets). A result
+# set is duplicate-dominated when the share of near-duplicate snippets exceeds
+# this fraction.
+QUALITY_DUPLICATE_FRACTION = _bounded_float(
+    "WEBSEARCH_QUALITY_DUPLICATE_FRACTION", 0.6, minimum=0.1, maximum=0.95
+)
 MAX_NUM_RESULTS = 20
 RESULT_OVERFETCH_FACTOR = 2
 MAX_QUERY_CHARS = 512
@@ -2246,6 +2267,75 @@ async def _run_backend(backend: str, awaitable: Any, timeout: float) -> _Backend
     )
 
 
+def _snippet_jaccard(a: str, b: str) -> float:
+    """Whitespace-token Jaccard similarity; transient, never persisted."""
+    ta = set(a.lower().split())
+    tb = set(b.lower().split())
+    if not ta and not tb:
+        return 1.0
+    if not ta or not tb:
+        return 0.0
+    return len(ta & tb) / len(ta | tb)
+
+
+def _quality_gate(
+    candidates: list[dict[str, Any]], *, news_intent: bool = False
+) -> tuple[bool, str | None]:
+    """Evaluate the primary provider's deduped candidates in memory.
+
+    Returns (passed, reason). A None reason means the gate passed. The reason
+    is a query-free label safe for telemetry. No snippet/title text is ever
+    persisted; only transient similarity counts are computed here.
+    """
+    if not candidates:
+        return True, None  # emptiness is handled by the existing fallback rules.
+
+    if len(candidates) < QUALITY_MIN_RESULTS:
+        return False, "quality_below_min_results"
+
+    domains = {item.get("domain") for item in candidates if item.get("domain")}
+    if len(domains) < QUALITY_MIN_DOMAINS:
+        return False, "quality_low_domain_diversity"
+
+    # Duplicate/generic detection: near-identical snippets dominating the set.
+    snippets = [(item.get("snippet") or "").strip() for item in candidates]
+    snippets = [s for s in snippets if s]
+    if len(snippets) >= 2:
+        near_dup_pairs = 0
+        total_pairs = 0
+        for i in range(len(snippets)):
+            for j in range(i + 1, len(snippets)):
+                total_pairs += 1
+                if _snippet_jaccard(snippets[i], snippets[j]) >= 0.8:
+                    near_dup_pairs += 1
+        if total_pairs and near_dup_pairs / total_pairs >= QUALITY_DUPLICATE_FRACTION:
+            return False, "quality_duplicate_dominated"
+
+    # Freshness for current/news intent. Intent is inferred only from explicit
+    # request metadata, never from stored query content. Phase 3 wires the hook;
+    # the staleness window is evaluated against result `published` hints when
+    # present and news_intent is True.
+    if news_intent:
+        fresh = 0
+        for item in candidates:
+            snippet = item.get("snippet") or ""
+            if "published " in snippet:  # set by _normalize_kagi_result
+                fresh += 1
+        if fresh == 0:
+            return False, "quality_stale_for_news_intent"
+
+    return True, None
+
+
+def _quality_gate_enabled() -> bool:
+    if _QUALITY_GATE_MODE == "on":
+        return True
+    if _QUALITY_GATE_MODE == "off":
+        return False
+    # auto: enabled for every stack except the legacy searxng+tavily default.
+    return _PROVIDER_STACK != "searxng+tavily"
+
+
 def _fallback_reason(primary: _BackendOutcome, result_count: int, threshold: int) -> str:
     name = primary.backend
     if primary.state == "degraded":
@@ -2332,10 +2422,20 @@ async def _web_search_impl(query: str, num_results: int = 8) -> str:
     primary_candidates = _dedupe_and_rank(primary_outcome.results, candidate_limit)
     threshold = min(SUPPLEMENT_MIN_RESULTS, requested)
     provider_states = {primary.name: primary_outcome.state}
-    should_use_fallback = fallback is not None and (
+    policy_triggers_fallback = fallback is not None and (
         (TAVILY_MODE == "fallback" and not primary_candidates)
         or (TAVILY_MODE == "supplement" and len(primary_candidates) < threshold)
     )
+    # Quality gate (ADR 0002 Phase 3): only evaluated when the policy rules did
+    # not already trigger fallback, and only on a nonempty, reachable primary.
+    # The gate is transient and query-free; it never persists snippets/titles.
+    quality_reason: str | None = None
+    if not policy_triggers_fallback and fallback is not None and primary_outcome.ok:
+        if _quality_gate_enabled():
+            passed, quality_reason = _quality_gate(primary_candidates)
+            if passed:
+                quality_reason = None
+    should_use_fallback = policy_triggers_fallback or quality_reason is not None
 
     if not should_use_fallback:
         results = _dedupe_and_rank(primary_candidates, requested)
@@ -2401,7 +2501,9 @@ async def _web_search_impl(query: str, num_results: int = 8) -> str:
         )
 
     attempted.append(fallback.name)
-    reason = _fallback_reason(primary_outcome, len(primary_candidates), threshold)
+    reason = quality_reason if quality_reason is not None else _fallback_reason(
+        primary_outcome, len(primary_candidates), threshold
+    )
     remaining = SEARCH_TOTAL_TIMEOUT - (time.monotonic() - started)
     if remaining <= 0:
         circuit = _breaker.snapshot(fallback.name)
