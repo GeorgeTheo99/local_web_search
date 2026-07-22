@@ -62,7 +62,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from threading import Lock
-from typing import Annotated, Any
+from typing import Annotated, Any, Awaitable, Protocol
 
 import httpx
 from fastmcp import FastMCP
@@ -327,6 +327,75 @@ class _CircuitBreaker:
 _breaker = _CircuitBreaker()
 
 
+# --------------------------------------------------------------------------- #
+# Provider abstraction (ADR 0002). Raw ranked-search backends implement one
+# contract so the broker can route, gate, and fail over without naming each
+# provider inline. Module-level search functions remain the implementation
+# seam so existing tests that monkeypatch _searxng_search / _tavily_search /
+# _searxng_request keep working unchanged.
+# --------------------------------------------------------------------------- #
+
+
+class SearchProvider(Protocol):
+    """Contract for a raw ranked-search backend."""
+
+    name: str
+    output: str
+    timeout: float
+
+    def search(self, query: str, num_results: int) -> Awaitable[_BackendOutcome]:
+        ...
+
+
+class _SearXNGProvider:
+    """Loopback SearXNG raw-search provider."""
+
+    name = "searxng"
+    output = "raw"
+
+    @property
+    def timeout(self) -> float:
+        return SEARCH_TIMEOUT
+
+    @staticmethod
+    def search(query: str, num_results: int) -> Awaitable[_BackendOutcome]:
+        # Module-global lookup so tests monkeypatching srv._searxng_search win.
+        return _searxng_search(query, num_results)
+
+
+class _TavilyProvider:
+    """Tavily raw-search provider with per-call credential resolution."""
+
+    name = "tavily"
+    output = "raw"
+
+    @property
+    def timeout(self) -> float:
+        return TAVILY_TIMEOUT
+
+    @staticmethod
+    def search(query: str, num_results: int) -> Awaitable[_BackendOutcome]:
+        return _tavily_search(query, num_results, _resolve_tavily_key())
+
+    @staticmethod
+    def credential_label() -> str:
+        return "keyed" if _resolve_tavily_key() else "keyless"
+
+
+# Ordered provider list for the default web-search path. The first entry is
+# the primary; the second is the policy-controlled fallback. Phase 2 (Kagi)
+# will make this configurable.
+_PROVIDERS: list[SearchProvider] = [_SearXNGProvider(), _TavilyProvider()]
+
+
+def _default_timings_ms() -> dict[str, float | None]:
+    """Baseline timings dict with every provider's key present and unset."""
+    timings: dict[str, float | None] = {"total": 0.0}
+    for provider in _PROVIDERS:
+        timings[provider.name] = None
+    return timings
+
+
 @dataclass
 class _RequestOutcome:
     data: dict[str, Any] | None
@@ -380,7 +449,7 @@ def _search_metadata(
         "backend": backend,
         "attempted": attempted or [],
         "fallback_reason": fallback_reason,
-        "timings_ms": timings_ms or {"total": 0.0, "searxng": None, "tavily": None},
+        "timings_ms": timings_ms or _default_timings_ms(),
         "mode": mode or TAVILY_MODE,
         "unresponsive_engines": (unresponsive_engines or [])[:10],
         "provider_states": provider_states or {},
@@ -451,16 +520,19 @@ def _record_search_telemetry(
     result_count: int,
     fallback_reason: str | None,
     total_latency_ms: float,
-    searxng: _BackendOutcome | None,
-    tavily: _BackendOutcome | None,
+    outcomes: list[_BackendOutcome | None] | None = None,
     mode: str | None = None,
 ) -> None:
     """Queue only explicitly allowlisted operational fields, never a search payload."""
     try:
+        outcomes = outcomes or []
         providers = tuple(
             _provider_event(outcome)
-            for outcome in (searxng, tavily)
+            for outcome in outcomes
             if outcome is not None
+        )
+        searxng = next(
+            (o for o in outcomes if o is not None and o.backend == "searxng"), None
         )
         engine_failures = normalize_engine_failures(
             searxng.unresponsive_engines if searxng is not None else []
@@ -492,8 +564,7 @@ def _finish_search(
     result_count: int,
     fallback_reason: str | None = None,
     timings_ms: dict[str, float | None] | None = None,
-    searxng: _BackendOutcome | None = None,
-    tavily: _BackendOutcome | None = None,
+    outcomes: list[_BackendOutcome | None] | None = None,
     mode: str | None = None,
 ) -> str:
     total_latency_ms = float((timings_ms or {}).get("total") or 0.0)
@@ -504,8 +575,7 @@ def _finish_search(
         result_count=result_count,
         fallback_reason=fallback_reason,
         total_latency_ms=total_latency_ms,
-        searxng=searxng,
-        tavily=tavily,
+        outcomes=outcomes,
         mode=mode,
     )
     return rendered
@@ -563,6 +633,7 @@ def _normalize_searxng_result(r: dict) -> dict[str, Any] | None:
         "domain": _domain(url),
         "snippet": (r.get("content") or "").strip(),
         "engine": r.get("engine") if isinstance(r.get("engine"), str) else "searxng",
+        "provider": "searxng",
         "score": None,
     }
 
@@ -715,6 +786,7 @@ def _normalize_tavily_result(r: dict) -> dict[str, Any] | None:
         "domain": _domain(url),
         "snippet": str(r.get("content") or r.get("raw_content") or ""),
         "engine": "tavily",
+        "provider": "tavily",
         "score": r.get("score"),
     }
 
@@ -1924,12 +1996,17 @@ def _result_backend(results: list[dict[str, Any]]) -> str:
     return "none"
 
 
-def _timings(started: float, searxng: _BackendOutcome, tavily: _BackendOutcome | None) -> dict[str, float | None]:
-    return {
-        "total": round((time.monotonic() - started) * 1000, 1),
-        "searxng": searxng.elapsed_ms,
-        "tavily": tavily.elapsed_ms if tavily else None,
-    }
+def _timings(
+    started: float, outcomes: list[_BackendOutcome | None]
+) -> dict[str, float | None]:
+    timings: dict[str, float | None] = {"total": round((time.monotonic() - started) * 1000, 1)}
+    # Every provider key is always present so callers and tests see a stable shape.
+    for provider in _PROVIDERS:
+        timings[provider.name] = None
+    for outcome in outcomes:
+        if outcome is not None:
+            timings[outcome.backend] = outcome.elapsed_ms
+    return timings
 
 
 async def _web_search_impl(query: str, num_results: int = 8) -> str:
@@ -1938,11 +2015,8 @@ async def _web_search_impl(query: str, num_results: int = 8) -> str:
     query = query.strip()
     requested = min(MAX_NUM_RESULTS, max(1, int(num_results)))
     if not query:
-        timings_ms = {
-            "total": round((time.monotonic() - started) * 1000, 1),
-            "searxng": None,
-            "tavily": None,
-        }
+        timings_ms = _default_timings_ms()
+        timings_ms["total"] = round((time.monotonic() - started) * 1000, 1)
         return _finish_search(
             _search_error_payload(
                 query,
@@ -1956,11 +2030,8 @@ async def _web_search_impl(query: str, num_results: int = 8) -> str:
             timings_ms=timings_ms,
         )
     if len(query) > MAX_QUERY_CHARS:
-        timings_ms = {
-            "total": round((time.monotonic() - started) * 1000, 1),
-            "searxng": None,
-            "tavily": None,
-        }
+        timings_ms = _default_timings_ms()
+        timings_ms["total"] = round((time.monotonic() - started) * 1000, 1)
         return _finish_search(
             _search_error_payload(
                 "",
@@ -1975,67 +2046,68 @@ async def _web_search_impl(query: str, num_results: int = 8) -> str:
         )
 
     candidate_limit = min(MAX_NUM_RESULTS, requested * RESULT_OVERFETCH_FACTOR)
-    attempted = ["searxng"]
-    searxng = await _run_backend(
-        "searxng",
-        _searxng_search(query, candidate_limit),
-        min(SEARCH_TIMEOUT, SEARCH_TOTAL_TIMEOUT),
+    primary = _PROVIDERS[0]
+    fallback = _PROVIDERS[1] if len(_PROVIDERS) > 1 else None
+    attempted = [primary.name]
+    primary_outcome = await _run_backend(
+        primary.name,
+        primary.search(query, candidate_limit),
+        min(primary.timeout, SEARCH_TOTAL_TIMEOUT),
     )
-    searxng_candidates = _dedupe_and_rank(searxng.results, candidate_limit)
+    primary_candidates = _dedupe_and_rank(primary_outcome.results, candidate_limit)
     threshold = min(SUPPLEMENT_MIN_RESULTS, requested)
-    provider_states = {"searxng": searxng.state}
-    should_use_tavily = (
-        TAVILY_MODE == "fallback" and not searxng_candidates
-    ) or (
-        TAVILY_MODE == "supplement" and len(searxng_candidates) < threshold
+    provider_states = {primary.name: primary_outcome.state}
+    should_use_fallback = fallback is not None and (
+        (TAVILY_MODE == "fallback" and not primary_candidates)
+        or (TAVILY_MODE == "supplement" and len(primary_candidates) < threshold)
     )
 
-    if not should_use_tavily:
-        results = _dedupe_and_rank(searxng_candidates, requested)
-        timings_ms = _timings(started, searxng, None)
+    if not should_use_fallback:
+        results = _dedupe_and_rank(primary_candidates, requested)
+        timings_ms = _timings(started, [primary_outcome])
         fallback_reason: str | None = None
         backend = "none"
         if results:
-            status = "degraded" if searxng.state == "degraded" else "ok"
-            backend = "searxng"
+            status = "degraded" if primary_outcome.state == "degraded" else "ok"
+            backend = primary.name
             rendered = _format_results(
                 query,
                 results,
-                searxng.suggestions,
+                primary_outcome.suggestions,
                 status=status,
                 backend=backend,
                 attempted=attempted,
                 timings_ms=timings_ms,
-                unresponsive_engines=searxng.unresponsive_engines,
+                unresponsive_engines=primary_outcome.unresponsive_engines,
                 provider_states=provider_states,
             )
-        elif searxng.ok:
-            degraded = searxng.state == "degraded"
+        elif primary_outcome.ok:
+            degraded = primary_outcome.state == "degraded"
             status = "degraded" if degraded else "empty"
             fallback_reason = "searxng_degraded" if degraded else None
             rendered = _format_results(
                 query,
                 [],
-                searxng.suggestions,
+                primary_outcome.suggestions,
                 status=status,
                 backend=backend,
                 attempted=attempted,
                 fallback_reason=fallback_reason,
                 timings_ms=timings_ms,
-                unresponsive_engines=searxng.unresponsive_engines,
+                unresponsive_engines=primary_outcome.unresponsive_engines,
                 provider_states=provider_states,
             )
         else:
             status = "error"
-            fallback_reason = _fallback_reason(searxng, 0, threshold)
+            fallback_reason = _fallback_reason(primary_outcome, 0, threshold)
             rendered = _search_error_payload(
                 query,
                 "Search error: SearXNG failed and Tavily is disabled by policy.",
-                searxng.suggestions,
+                primary_outcome.suggestions,
                 attempted=attempted,
                 fallback_reason=fallback_reason,
                 timings_ms=timings_ms,
-                unresponsive_engines=searxng.unresponsive_engines,
+                unresponsive_engines=primary_outcome.unresponsive_engines,
                 provider_states=provider_states,
             )
         return _finish_search(
@@ -2046,16 +2118,16 @@ async def _web_search_impl(query: str, num_results: int = 8) -> str:
             result_count=len(results),
             fallback_reason=fallback_reason,
             timings_ms=timings_ms,
-            searxng=searxng,
+            outcomes=[primary_outcome],
         )
 
-    attempted.append("tavily")
-    reason = _fallback_reason(searxng, len(searxng_candidates), threshold)
+    attempted.append(fallback.name)
+    reason = _fallback_reason(primary_outcome, len(primary_candidates), threshold)
     remaining = SEARCH_TOTAL_TIMEOUT - (time.monotonic() - started)
     if remaining <= 0:
-        circuit = _breaker.snapshot("tavily")
-        tavily = _BackendOutcome(
-            backend="tavily",
+        circuit = _breaker.snapshot(fallback.name)
+        fallback_outcome = _BackendOutcome(
+            backend=fallback.name,
             state="timeout",
             error="total deadline exceeded",
             circuit_before=str(circuit["state"]),
@@ -2063,64 +2135,63 @@ async def _web_search_impl(query: str, num_results: int = 8) -> str:
             circuit_failures=int(circuit["consecutive_failures"]),
         )
     else:
-        # Tavily credentials are resolved only when policy permits external egress.
-        tavily_key = _resolve_tavily_key()
-        tavily = await _run_backend(
-            "tavily",
-            _tavily_search(query, candidate_limit, tavily_key),
-            min(TAVILY_TIMEOUT, remaining),
+        # Credentials are resolved only when policy permits external egress.
+        fallback_outcome = await _run_backend(
+            fallback.name,
+            fallback.search(query, candidate_limit),
+            min(fallback.timeout, remaining),
         )
-        if tavily.credential_mode == "none":
-            tavily.credential_mode = "keyed" if tavily_key else "keyless"
-    provider_states["tavily"] = tavily.state
+        if fallback_outcome.credential_mode == "none" and isinstance(fallback, _TavilyProvider):
+            fallback_outcome.credential_mode = fallback.credential_label()
+    provider_states[fallback.name] = fallback_outcome.state
 
     if TAVILY_MODE == "supplement" or (
-        TAVILY_MODE == "fallback" and searxng.state == "degraded"
+        TAVILY_MODE == "fallback" and primary_outcome.state == "degraded"
     ):
-        results = _merge_with_secondary_reserve(searxng_candidates, tavily.results, requested)
+        results = _merge_with_secondary_reserve(primary_candidates, fallback_outcome.results, requested)
     else:
-        results = _dedupe_and_rank(tavily.results, requested)
+        results = _dedupe_and_rank(fallback_outcome.results, requested)
     backend = _result_backend(results)
-    timings_ms = _timings(started, searxng, tavily)
+    timings_ms = _timings(started, [primary_outcome, fallback_outcome])
     if results:
         status = "degraded"
         rendered = _format_results(
             query,
             results,
-            searxng.suggestions,
+            primary_outcome.suggestions,
             status=status,
             backend=backend,
             attempted=attempted,
             fallback_reason=reason,
             timings_ms=timings_ms,
-            unresponsive_engines=searxng.unresponsive_engines,
+            unresponsive_engines=primary_outcome.unresponsive_engines,
             provider_states=provider_states,
         )
-    elif not searxng.ok and not tavily.ok:
+    elif not primary_outcome.ok and not fallback_outcome.ok:
         status = "error"
         rendered = _search_error_payload(
             query,
             "Search error: SearXNG unreachable and Tavily failed.",
-            searxng.suggestions,
+            primary_outcome.suggestions,
             attempted=attempted,
             fallback_reason=reason,
             timings_ms=timings_ms,
-            unresponsive_engines=searxng.unresponsive_engines,
+            unresponsive_engines=primary_outcome.unresponsive_engines,
             provider_states=provider_states,
         )
     else:
-        status = "empty" if searxng.ok and tavily.ok else "degraded"
+        status = "empty" if primary_outcome.ok and fallback_outcome.ok else "degraded"
         backend = "none"
         rendered = _format_results(
             query,
             [],
-            searxng.suggestions,
+            primary_outcome.suggestions,
             status=status,
             backend=backend,
             attempted=attempted,
             fallback_reason=reason,
             timings_ms=timings_ms,
-            unresponsive_engines=searxng.unresponsive_engines,
+            unresponsive_engines=primary_outcome.unresponsive_engines,
             provider_states=provider_states,
         )
     return _finish_search(
@@ -2131,8 +2202,7 @@ async def _web_search_impl(query: str, num_results: int = 8) -> str:
         result_count=len(results),
         fallback_reason=reason,
         timings_ms=timings_ms,
-        searxng=searxng,
-        tavily=tavily,
+        outcomes=[primary_outcome, fallback_outcome],
     )
 
 
@@ -2151,8 +2221,7 @@ def _batch_error_payload(message: str, started: float, requested: int) -> str:
         result_count=0,
         fallback_reason=None,
         total_latency_ms=float(timings_ms["total"]),
-        searxng=None,
-        tavily=None,
+        outcomes=[],
     )
     return json.dumps(
         {
@@ -2181,8 +2250,7 @@ def _batch_timeout_item(query: str, requested: int, elapsed_ms: float) -> dict[s
         result_count=0,
         fallback_reason="batch_deadline",
         total_latency_ms=elapsed_ms,
-        searxng=None,
-        tavily=None,
+        outcomes=[],
     )
     return {
         "query": query,
@@ -2256,8 +2324,7 @@ async def batch_web_search(queries: BatchQueries, num_results: int = 8) -> str:
                 result_count=0,
                 fallback_reason=None,
                 total_latency_ms=elapsed_ms,
-                searxng=None,
-                tavily=None,
+                outcomes=[],
             )
             return {
                 "query": query,
@@ -2321,11 +2388,8 @@ async def image_search(query: str, num_results: int = 8) -> str:
     query = query.strip()
     requested = min(MAX_NUM_RESULTS, max(1, int(num_results)))
     if not query:
-        timings_ms = {
-            "total": round((time.monotonic() - started) * 1000, 1),
-            "searxng": None,
-            "tavily": None,
-        }
+        timings_ms = _default_timings_ms()
+        timings_ms["total"] = round((time.monotonic() - started) * 1000, 1)
         return _finish_search(
             _search_error_payload(
                 query,
@@ -2341,11 +2405,8 @@ async def image_search(query: str, num_results: int = 8) -> str:
             mode="disabled",
         )
     if len(query) > MAX_QUERY_CHARS:
-        timings_ms = {
-            "total": round((time.monotonic() - started) * 1000, 1),
-            "searxng": None,
-            "tavily": None,
-        }
+        timings_ms = _default_timings_ms()
+        timings_ms["total"] = round((time.monotonic() - started) * 1000, 1)
         return _finish_search(
             _search_error_payload(
                 "",
@@ -2371,7 +2432,7 @@ async def image_search(query: str, num_results: int = 8) -> str:
         min(SEARCH_TIMEOUT, SEARCH_TOTAL_TIMEOUT),
     )
     results = _dedupe_and_rank_images(searxng.results, requested)
-    timings_ms = _timings(started, searxng, None)
+    timings_ms = _timings(started, [searxng])
     provider_states = {"searxng": searxng.state}
     fallback_reason: str | None = None
 
@@ -2433,7 +2494,7 @@ async def image_search(query: str, num_results: int = 8) -> str:
         result_count=len(results),
         fallback_reason=fallback_reason,
         timings_ms=timings_ms,
-        searxng=searxng,
+        outcomes=[searxng],
         mode="disabled",
     )
 

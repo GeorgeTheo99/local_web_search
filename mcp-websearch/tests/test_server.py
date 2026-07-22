@@ -1481,3 +1481,75 @@ async def test_tavily_failover_uses_per_call_header_key(monkeypatch):
     payload = json.loads(_result_text(result))
     assert seen_key.get("k") == "tvly-header"
     assert payload["results"][0]["engine"] == "tavily"
+
+
+# --------------------------------------------------------------------------- #
+# Provider abstraction (ADR 0002 Phase 1).
+# --------------------------------------------------------------------------- #
+
+@pytest.mark.asyncio
+async def test_provider_list_default_order_and_names():
+    """The default provider list is SearXNG primary + Tavily fallback."""
+    names = [p.name for p in srv._PROVIDERS]
+    assert names == ["searxng", "tavily"]
+    assert all(p.output == "raw" for p in srv._PROVIDERS)
+
+
+def test_default_timings_ms_has_all_provider_keys():
+    timings = srv._default_timings_ms()
+    assert set(timings) == {"total", "searxng", "tavily"}
+    assert timings["total"] == 0.0
+    assert timings["searxng"] is None
+    assert timings["tavily"] is None
+
+
+def test_provider_timeout_reads_current_module_global(monkeypatch):
+    """Provider.timeout must reflect monkeypatched SEARCH_TIMEOUT/TAVILY_TIMEOUT."""
+    monkeypatch.setattr(srv, "SEARCH_TIMEOUT", 0.5)
+    monkeypatch.setattr(srv, "TAVILY_TIMEOUT", 0.7)
+    searxng = srv._SearXNGProvider()
+    tavily = srv._TavilyProvider()
+    assert searxng.timeout == 0.5
+    assert tavily.timeout == 0.7
+
+
+@pytest.mark.asyncio
+async def test_searxng_provider_delegates_to_monkeypatched_search(monkeypatch):
+    """Provider.search must call the module-level _searxng_search so tests win."""
+    sentinel = srv._BackendOutcome(backend="searxng", ok=True, state="ok")
+    called = {}
+    async def fake_searxng_search(query, num_results):
+        called["args"] = (query, num_results)
+        return sentinel
+    monkeypatch.setattr(srv, "_searxng_search", fake_searxng_search)
+    outcome = await srv._SearXNGProvider().search("q", 5)
+    assert outcome is sentinel
+    assert called["args"] == ("q", 5)
+
+
+@pytest.mark.asyncio
+async def test_tavily_provider_delegates_and_resolves_key(monkeypatch):
+    """Provider.search must call _tavily_search with the resolved key."""
+    monkeypatch.setattr(srv, "TAVILY_API_KEY_ENV", "tvly-x")
+    monkeypatch.setattr(srv, "get_http_headers", lambda: {})
+    seen = {}
+    async def fake_tavily_search(query, num_results, api_key):
+        seen["key"] = api_key
+        return srv._BackendOutcome(backend="tavily", ok=True, state="ok")
+    monkeypatch.setattr(srv, "_tavily_search", fake_tavily_search)
+    await srv._TavilyProvider().search("q", 5)
+    assert seen["key"] == "tvly-x"
+    assert srv._TavilyProvider.credential_label() == "keyed"
+
+
+@pytest.mark.asyncio
+async def test_web_search_result_carries_provider_field(monkeypatch):
+    """Normalized results expose a 'provider' field naming the API backend."""
+    async def fake_request(path, params, timeout=None):
+        return {"results": [{"title": "T", "url": "https://example.com/a", "content": "c", "engine": "brave"}], "suggestions": []}
+    monkeypatch.setattr(srv, "_searxng_request", fake_request)
+    monkeypatch.setattr(srv, "TAVILY_API_KEY_ENV", "")
+    result = await _call_tool("web_search", {"query": "q", "num_results": 1})
+    payload = json.loads(_result_text(result))
+    assert payload["results"][0]["provider"] == "searxng"
+    assert payload["results"][0]["engine"] == "brave"
