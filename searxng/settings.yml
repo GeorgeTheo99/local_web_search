@@ -1,10 +1,7 @@
 use_default_settings:
   engines:
     keep_only:
-      - google cse
-      - duckduckgo
       - bing
-      - startpage
       - mwmbl
       - wikipedia
       - github
@@ -47,15 +44,13 @@ outgoing:
   pool_maxsize: 20
 
 engines:
-  # Broad indexes verified from this host. Keep the custom defensive Mwmbl
-  # adapter; upstream defaults provide the other implementations.
-  - name: google cse
-    disabled: false
-  - name: duckduckgo
-    disabled: false
+  # Broad indexes verified from this host. The scrape-based engines that were
+  # chronically suspended from this home IP (duckduckgo, google cse, startpage,
+  # and mojeek) are removed: they only ever contributed a degraded flag. Bing
+  # carries the general-web load reliably; Mwmbl is a keyless API-backed
+  # independent index. Keep the custom defensive Mwmbl adapter; upstream
+  # defaults provide the other implementations.
   - name: bing
-    disabled: false
-  - name: startpage
     disabled: false
   - name: mwmbl
     engine: mwmbl_safe

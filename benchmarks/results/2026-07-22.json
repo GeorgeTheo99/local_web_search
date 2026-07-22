@@ -1,0 +1,627 @@
+{
+  "method": "official-domain retrieval, 12 synthetic navigational queries, top 10",
+  "providers": [
+    "searxng",
+    "tavily_basic_keyless"
+  ],
+  "summary": {
+    "searxng": {
+      "queries": 12,
+      "success_at_5": 8,
+      "success_at_10": 8,
+      "mrr_at_10": 0.4375,
+      "average_latency_ms": 290.3,
+      "degraded_or_error": 12
+    },
+    "tavily_basic_keyless": {
+      "queries": 12,
+      "success_at_5": 0,
+      "success_at_10": 0,
+      "mrr_at_10": 0.0,
+      "average_latency_ms": 19.8,
+      "degraded_or_error": 12
+    }
+  },
+  "rows": [
+    {
+      "query": "Python packaging installing packages tutorial",
+      "expected_domain": "packaging.python.org",
+      "searxng": {
+        "state": "degraded",
+        "latency_ms": 1048.2,
+        "result_count": 10,
+        "rank": null,
+        "domains": [
+          "python.org",
+          "github.com",
+          "w3schools.com",
+          "til.simonwillison.net",
+          "online-python.com",
+          "docs.python.org",
+          "lists.gnu.org",
+          "python.org",
+          "en.wikipedia.org",
+          "aws.amazon.com"
+        ],
+        "unresponsive_engines": [
+          [
+            "wikipedia",
+            "Suspended: too many requests"
+          ]
+        ],
+        "error": null,
+        "http_status": 200,
+        "credential_mode": "none",
+        "circuit_before": "closed",
+        "circuit_after": "closed",
+        "circuit_transition": "none",
+        "circuit_failures": 0
+      },
+      "tavily_basic_keyless": {
+        "state": "error",
+        "latency_ms": 70.9,
+        "result_count": 0,
+        "rank": null,
+        "domains": [],
+        "unresponsive_engines": [],
+        "error": "HTTP 429",
+        "http_status": 429,
+        "credential_mode": "keyless",
+        "circuit_before": "closed",
+        "circuit_after": "closed",
+        "circuit_transition": "none",
+        "circuit_failures": 1
+      }
+    },
+    {
+      "query": "RFC 9110 HTTP Semantics official",
+      "expected_domain": "rfc-editor.org",
+      "searxng": {
+        "state": "degraded",
+        "latency_ms": 265.0,
+        "result_count": 10,
+        "rank": 1,
+        "domains": [
+          "rfc-editor.org",
+          "bortzmeyer.org",
+          "datatracker.ietf.org",
+          "rfc-editor.org",
+          "rfc-editor.org",
+          "ietf.org",
+          "redmine.lighttpd.net",
+          "rfcinfo.com",
+          "en.wikipedia.org",
+          "rfc.blacklabs.team"
+        ],
+        "unresponsive_engines": [
+          [
+            "wikipedia",
+            "Suspended: too many requests"
+          ]
+        ],
+        "error": null,
+        "http_status": 200,
+        "credential_mode": "none",
+        "circuit_before": "closed",
+        "circuit_after": "closed",
+        "circuit_transition": "none",
+        "circuit_failures": 0
+      },
+      "tavily_basic_keyless": {
+        "state": "error",
+        "latency_ms": 67.2,
+        "result_count": 0,
+        "rank": null,
+        "domains": [],
+        "unresponsive_engines": [],
+        "error": "HTTP 429",
+        "http_status": 429,
+        "credential_mode": "keyless",
+        "circuit_before": "closed",
+        "circuit_after": "closed",
+        "circuit_transition": "none",
+        "circuit_failures": 2
+      }
+    },
+    {
+      "query": "SearXNG why use a private instance documentation",
+      "expected_domain": "docs.searxng.org",
+      "searxng": {
+        "state": "degraded",
+        "latency_ms": 170.8,
+        "result_count": 10,
+        "rank": 4,
+        "domains": [
+          "github.com",
+          "en.wikipedia.org",
+          "en.wikipedia.org",
+          "docs.searxng.org",
+          "aws.amazon.com",
+          "priv.au",
+          "docs.searxng.org",
+          "searx.space",
+          "github.com",
+          "searx.tiekoetter.com"
+        ],
+        "unresponsive_engines": [
+          [
+            "wikipedia",
+            "Suspended: too many requests"
+          ]
+        ],
+        "error": null,
+        "http_status": 200,
+        "credential_mode": "none",
+        "circuit_before": "closed",
+        "circuit_after": "closed",
+        "circuit_transition": "none",
+        "circuit_failures": 0
+      },
+      "tavily_basic_keyless": {
+        "state": "error",
+        "latency_ms": 99.9,
+        "result_count": 0,
+        "rank": null,
+        "domains": [],
+        "unresponsive_engines": [],
+        "error": "HTTP 429",
+        "http_status": 429,
+        "credential_mode": "keyless",
+        "circuit_before": "closed",
+        "circuit_after": "open",
+        "circuit_transition": "opened",
+        "circuit_failures": 3
+      }
+    },
+    {
+      "query": "Tavily API credits pricing documentation",
+      "expected_domain": "docs.tavily.com",
+      "searxng": {
+        "state": "degraded",
+        "latency_ms": 391.1,
+        "result_count": 10,
+        "rank": null,
+        "domains": [
+          "reddit.com",
+          "quicknode.com",
+          "reddit.com",
+          "nanoly.com",
+          "reddit.com",
+          "reddit.com",
+          "signicat.com",
+          "reddit.com",
+          "quicknode.com",
+          "reddit.com"
+        ],
+        "unresponsive_engines": [
+          [
+            "wikipedia",
+            "Suspended: too many requests"
+          ]
+        ],
+        "error": null,
+        "http_status": 200,
+        "credential_mode": "none",
+        "circuit_before": "closed",
+        "circuit_after": "closed",
+        "circuit_transition": "none",
+        "circuit_failures": 0
+      },
+      "tavily_basic_keyless": {
+        "state": "circuit_open",
+        "latency_ms": 0.0,
+        "result_count": 0,
+        "rank": null,
+        "domains": [],
+        "unresponsive_engines": [],
+        "error": null,
+        "http_status": null,
+        "credential_mode": "keyless",
+        "circuit_before": "open",
+        "circuit_after": "open",
+        "circuit_transition": "none",
+        "circuit_failures": 3
+      }
+    },
+    {
+      "query": "Perplexity Search API pricing documentation",
+      "expected_domain": "docs.perplexity.ai",
+      "searxng": {
+        "state": "degraded",
+        "latency_ms": 170.1,
+        "result_count": 10,
+        "rank": null,
+        "domains": [
+          "perplexity.ai",
+          "en.wikipedia.org",
+          "boltai.com",
+          "perplexity.ai",
+          "sapling.ai",
+          "perplexityai.app",
+          "mastodon.social",
+          "apps.microsoft.com",
+          "cnet.com",
+          "en.wikipedia.org"
+        ],
+        "unresponsive_engines": [
+          [
+            "wikipedia",
+            "Suspended: too many requests"
+          ]
+        ],
+        "error": null,
+        "http_status": 200,
+        "credential_mode": "none",
+        "circuit_before": "closed",
+        "circuit_after": "closed",
+        "circuit_transition": "none",
+        "circuit_failures": 0
+      },
+      "tavily_basic_keyless": {
+        "state": "circuit_open",
+        "latency_ms": 0.0,
+        "result_count": 0,
+        "rank": null,
+        "domains": [],
+        "unresponsive_engines": [],
+        "error": null,
+        "http_status": null,
+        "credential_mode": "keyless",
+        "circuit_before": "open",
+        "circuit_after": "open",
+        "circuit_transition": "none",
+        "circuit_failures": 3
+      }
+    },
+    {
+      "query": "Caddy reverse_proxy directive documentation",
+      "expected_domain": "caddyserver.com",
+      "searxng": {
+        "state": "degraded",
+        "latency_ms": 215.9,
+        "result_count": 10,
+        "rank": 1,
+        "domains": [
+          "caddyserver.com",
+          "caddyserver.com",
+          "nvent.com",
+          "caddyserver.com",
+          "nvent.com",
+          "github.com",
+          "stackoverflow.com",
+          "caddyserver.com",
+          "caddyserver.com",
+          "en.wikipedia.org"
+        ],
+        "unresponsive_engines": [
+          [
+            "wikipedia",
+            "Suspended: too many requests"
+          ]
+        ],
+        "error": null,
+        "http_status": 200,
+        "credential_mode": "none",
+        "circuit_before": "closed",
+        "circuit_after": "closed",
+        "circuit_transition": "none",
+        "circuit_failures": 0
+      },
+      "tavily_basic_keyless": {
+        "state": "circuit_open",
+        "latency_ms": 0.0,
+        "result_count": 0,
+        "rank": null,
+        "domains": [],
+        "unresponsive_engines": [],
+        "error": null,
+        "http_status": null,
+        "credential_mode": "keyless",
+        "circuit_before": "open",
+        "circuit_after": "open",
+        "circuit_transition": "none",
+        "circuit_failures": 3
+      }
+    },
+    {
+      "query": "uv sync command documentation",
+      "expected_domain": "docs.astral.sh",
+      "searxng": {
+        "state": "degraded",
+        "latency_ms": 265.9,
+        "result_count": 10,
+        "rank": 2,
+        "domains": [
+          "uvdrop.com",
+          "docs.astral.sh",
+          "uvi.today",
+          "en.wikipedia.org",
+          "cdc.gov",
+          "uvi.today",
+          "weather.gov",
+          "scienceinsights.org",
+          "fda.gov",
+          "uvindex.app"
+        ],
+        "unresponsive_engines": [
+          [
+            "wikipedia",
+            "Suspended: too many requests"
+          ]
+        ],
+        "error": null,
+        "http_status": 200,
+        "credential_mode": "none",
+        "circuit_before": "closed",
+        "circuit_after": "closed",
+        "circuit_transition": "none",
+        "circuit_failures": 0
+      },
+      "tavily_basic_keyless": {
+        "state": "circuit_open",
+        "latency_ms": 0.0,
+        "result_count": 0,
+        "rank": null,
+        "domains": [],
+        "unresponsive_engines": [],
+        "error": null,
+        "http_status": null,
+        "credential_mode": "keyless",
+        "circuit_before": "open",
+        "circuit_after": "open",
+        "circuit_transition": "none",
+        "circuit_failures": 3
+      }
+    },
+    {
+      "query": "SQLite write-ahead logging documentation",
+      "expected_domain": "sqlite.org",
+      "searxng": {
+        "state": "degraded",
+        "latency_ms": 181.2,
+        "result_count": 10,
+        "rank": 2,
+        "domains": [
+          "en.wikipedia.org",
+          "sqlite.org",
+          "sqlite.org",
+          "sqlite.org",
+          "sqlitebrowser.org",
+          "smotko.si",
+          "geeksforgeeks.org",
+          "sqlite.org",
+          "www2.sqlite.org",
+          "sqlitetutorial.net"
+        ],
+        "unresponsive_engines": [
+          [
+            "wikipedia",
+            "Suspended: too many requests"
+          ]
+        ],
+        "error": null,
+        "http_status": 200,
+        "credential_mode": "none",
+        "circuit_before": "closed",
+        "circuit_after": "closed",
+        "circuit_transition": "none",
+        "circuit_failures": 0
+      },
+      "tavily_basic_keyless": {
+        "state": "circuit_open",
+        "latency_ms": 0.0,
+        "result_count": 0,
+        "rank": null,
+        "domains": [],
+        "unresponsive_engines": [],
+        "error": null,
+        "http_status": null,
+        "credential_mode": "keyless",
+        "circuit_before": "open",
+        "circuit_after": "open",
+        "circuit_transition": "none",
+        "circuit_failures": 3
+      }
+    },
+    {
+      "query": "FastMCP tools documentation",
+      "expected_domain": "gofastmcp.com",
+      "searxng": {
+        "state": "degraded",
+        "latency_ms": 148.5,
+        "result_count": 10,
+        "rank": 1,
+        "domains": [
+          "gofastmcp.com",
+          "docs.jboss.org",
+          "pypi.org",
+          "kpm-tools.readthedocs.io",
+          "gofastmcp.com",
+          "github.com",
+          "kasim.readthedocs.io",
+          "fastmcp.wiki",
+          "rubydoc.info",
+          "fastmcp.wiki"
+        ],
+        "unresponsive_engines": [
+          [
+            "wikipedia",
+            "Suspended: too many requests"
+          ]
+        ],
+        "error": null,
+        "http_status": 200,
+        "credential_mode": "none",
+        "circuit_before": "closed",
+        "circuit_after": "closed",
+        "circuit_transition": "none",
+        "circuit_failures": 0
+      },
+      "tavily_basic_keyless": {
+        "state": "circuit_open",
+        "latency_ms": 0.0,
+        "result_count": 0,
+        "rank": null,
+        "domains": [],
+        "unresponsive_engines": [],
+        "error": null,
+        "http_status": null,
+        "credential_mode": "keyless",
+        "circuit_before": "open",
+        "circuit_after": "open",
+        "circuit_transition": "none",
+        "circuit_failures": 3
+      }
+    },
+    {
+      "query": "GitHub Actions macOS runner documentation",
+      "expected_domain": "docs.github.com",
+      "searxng": {
+        "state": "degraded",
+        "latency_ms": 184.3,
+        "result_count": 10,
+        "rank": null,
+        "domains": [
+          "github.com",
+          "github.com",
+          "en.wikipedia.org",
+          "github.blog",
+          "github.blog",
+          "github.com",
+          "git.kernel.dk",
+          "github.careers",
+          "pantsbuild.org",
+          "gizmodo.com"
+        ],
+        "unresponsive_engines": [
+          [
+            "wikipedia",
+            "Suspended: too many requests"
+          ]
+        ],
+        "error": null,
+        "http_status": 200,
+        "credential_mode": "none",
+        "circuit_before": "closed",
+        "circuit_after": "closed",
+        "circuit_transition": "none",
+        "circuit_failures": 0
+      },
+      "tavily_basic_keyless": {
+        "state": "circuit_open",
+        "latency_ms": 0.0,
+        "result_count": 0,
+        "rank": null,
+        "domains": [],
+        "unresponsive_engines": [],
+        "error": null,
+        "http_status": null,
+        "credential_mode": "keyless",
+        "circuit_before": "open",
+        "circuit_after": "open",
+        "circuit_transition": "none",
+        "circuit_failures": 3
+      }
+    },
+    {
+      "query": "Python 3.13 what's new documentation",
+      "expected_domain": "docs.python.org",
+      "searxng": {
+        "state": "degraded",
+        "latency_ms": 219.9,
+        "result_count": 10,
+        "rank": 2,
+        "domains": [
+          "python.org",
+          "docs.python.org",
+          "w3schools.com",
+          "en.wikipedia.org",
+          "python.org",
+          "online-python.com",
+          "docs.python.org",
+          "news.ycombinator.com",
+          "python.org",
+          "docs.python.org"
+        ],
+        "unresponsive_engines": [
+          [
+            "wikipedia",
+            "Suspended: too many requests"
+          ]
+        ],
+        "error": null,
+        "http_status": 200,
+        "credential_mode": "none",
+        "circuit_before": "closed",
+        "circuit_after": "closed",
+        "circuit_transition": "none",
+        "circuit_failures": 0
+      },
+      "tavily_basic_keyless": {
+        "state": "circuit_open",
+        "latency_ms": 0.0,
+        "result_count": 0,
+        "rank": null,
+        "domains": [],
+        "unresponsive_engines": [],
+        "error": null,
+        "http_status": null,
+        "credential_mode": "keyless",
+        "circuit_before": "open",
+        "circuit_after": "open",
+        "circuit_transition": "none",
+        "circuit_failures": 3
+      }
+    },
+    {
+      "query": "Apple launchd property list documentation",
+      "expected_domain": "developer.apple.com",
+      "searxng": {
+        "state": "degraded",
+        "latency_ms": 223.2,
+        "result_count": 10,
+        "rank": 2,
+        "domains": [
+          "apple.com",
+          "developer.apple.com",
+          "apple.com",
+          "docs.chef.io",
+          "en.wikipedia.org",
+          "macrumors.com",
+          "stackoverflow.com",
+          "bestbuy.com",
+          "blog.scottlowe.org",
+          "youtube.com"
+        ],
+        "unresponsive_engines": [
+          [
+            "wikipedia",
+            "Suspended: too many requests"
+          ]
+        ],
+        "error": null,
+        "http_status": 200,
+        "credential_mode": "none",
+        "circuit_before": "closed",
+        "circuit_after": "closed",
+        "circuit_transition": "none",
+        "circuit_failures": 0
+      },
+      "tavily_basic_keyless": {
+        "state": "circuit_open",
+        "latency_ms": 0.0,
+        "result_count": 0,
+        "rank": null,
+        "domains": [],
+        "unresponsive_engines": [],
+        "error": null,
+        "http_status": null,
+        "credential_mode": "keyless",
+        "circuit_before": "open",
+        "circuit_after": "open",
+        "circuit_transition": "none",
+        "circuit_failures": 3
+      }
+    }
+  ]
+}
