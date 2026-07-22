@@ -87,6 +87,7 @@ logger = logging.getLogger("websearch-mcp")
 SEARXNG_URL = os.environ.get("SEARXNG_URL", "http://127.0.0.1:8888").rstrip("/")
 TAVILY_BASE_URL = os.environ.get("TAVILY_BASE_URL", "https://api.tavily.com").rstrip("/")
 KAGI_BASE_URL = os.environ.get("KAGI_BASE_URL", "https://kagi.com").rstrip("/")
+PERPLEXITY_BASE_URL = os.environ.get("PERPLEXITY_BASE_URL", "https://api.perplexity.ai").rstrip("/")
 # Environment fallback for stdio clients. HTTP clients should forward a Tavily
 # key only through X-Tavily-Key; broker authentication is a separate concern.
 TAVILY_API_KEY_ENV = os.environ.get("TAVILY_API_KEY", "").strip()
@@ -94,6 +95,9 @@ TAVILY_API_KEY_ENV = os.environ.get("TAVILY_API_KEY", "").strip()
 # stdio/server-side fallback. A mode-0600 secret file beside the data dir is
 # also consulted so keys can live outside the repo and process environment.
 KAGI_API_KEY_ENV = os.environ.get("KAGI_API_KEY", "").strip()
+# Perplexity Sonar API key. HTTP clients should forward it via X-Perplexity-Key;
+# the env var is a stdio/server-side fallback, then a mode-0600 secret file.
+PERPLEXITY_API_KEY_ENV = os.environ.get("PERPLEXITY_API_KEY", "").strip()
 _DEFAULT_DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 LOCAL_SEARCH_DATA_DIR = Path(
     os.environ.get("LOCAL_SEARCH_DATA_DIR", str(_DEFAULT_DATA_DIR))
@@ -140,6 +144,10 @@ TAVILY_TIMEOUT = _bounded_float(
 KAGI_TIMEOUT = _bounded_float(
     "WEBSEARCH_KAGI_TIMEOUT", 8.0, minimum=0.25, maximum=SEARCH_TOTAL_TIMEOUT
 )
+PERPLEXITY_TIMEOUT = _bounded_float(
+    "WEBSEARCH_PERPLEXITY_TIMEOUT", 12.0, minimum=0.25, maximum=SEARCH_TOTAL_TIMEOUT
+)
+SONAR_MODEL = os.environ.get("WEBSEARCH_SONAR_MODEL", "sonar").strip() or "sonar"
 # Provider stack selection (ADR 0002). The default preserves the existing
 # SearXNG-first + Tavily-fallback behavior so deployments and tests are
 # unchanged until an operator opts into the Kagi stack. Phase 6 will flip the
@@ -439,10 +447,33 @@ class _KagiProvider:
         return "keyed" if _resolve_kagi_key() else "none"
 
 
+class _PerplexityProvider:
+    """Perplexity Sonar generated-output provider (answer + search_results).
+
+    Requires an API key (no keyless mode). Its `output` is "generated" so the
+    broker never silently merges a Sonar answer into a raw result list.
+    """
+
+    name = "sonar"
+    output = "generated"
+
+    @property
+    def timeout(self) -> float:
+        return PERPLEXITY_TIMEOUT
+
+    @staticmethod
+    def search(query: str, num_results: int) -> Awaitable[_BackendOutcome]:
+        return _sonar_search(query, num_results, _resolve_perplexity_key())
+
+    @staticmethod
+    def credential_label() -> str:
+        return "keyed" if _resolve_perplexity_key() else "none"
+
+
 # Ordered provider list for the default web-search path. The first entry is
 # the primary; the second (when present) is the policy-controlled fallback.
 # WEBSEARCH_PROVIDER_STACK selects the active stack; the default preserves the
-# existing SearXNG-first + Tavily-fallback behavior. Sonar is wired in Phase 4.
+# existing SearXNG-first + Tavily-fallback behavior.
 def _build_provider_stack() -> list[SearchProvider]:
     if _PROVIDER_STACK == "searxng+tavily":
         return [_SearXNGProvider(), _TavilyProvider()]
@@ -451,8 +482,7 @@ def _build_provider_stack() -> list[SearchProvider]:
     if _PROVIDER_STACK == "kagi":
         return [_KagiProvider()]
     if _PROVIDER_STACK == "kagi+sonar":
-        # Sonar is wired in Phase 4; until then Kagi runs without a fallback.
-        return [_KagiProvider()]
+        return [_KagiProvider(), _PerplexityProvider()]
     return [_SearXNGProvider(), _TavilyProvider()]
 
 
@@ -493,6 +523,11 @@ class _BackendOutcome:
     circuit_after: str = "unknown"
     circuit_transition: str = "none"
     circuit_failures: int = 0
+    # Generated-output providers (Sonar) carry a synthesized answer and
+    # citation URLs alongside their ranked search_results. Empty for raw
+    # providers so the contract stays single-type.
+    answer: str = ""
+    citations: list[str] = field(default_factory=list)
 
 
 _last_search: dict[str, Any] | None = None
@@ -892,6 +927,32 @@ def _normalize_kagi_result(r: dict) -> dict[str, Any] | None:
     }
 
 
+def _normalize_sonar_result(r: dict) -> dict[str, Any] | None:
+    """Normalize one Perplexity Sonar `search_results` entry.
+
+    Sonar is a generated-output provider: it returns a generated answer plus a
+    `search_results` array of `{title, url, snippet, date, last_updated}`.
+    These normalized results carry `provider="sonar"` so callers can
+    distinguish raw-ranked from generated-sourced links.
+    """
+    url = _public_http_url(r.get("url"))
+    if url is None:
+        return None
+    snippet = str(r.get("snippet") or "")
+    date = r.get("date") or r.get("last_updated")
+    if isinstance(date, str) and date and not snippet.endswith(date):
+        snippet = f"{snippet} (published {date})".strip()
+    return {
+        "title": r.get("title") or "Untitled",
+        "url": url,
+        "domain": _domain(url),
+        "snippet": snippet,
+        "engine": "sonar",
+        "provider": "sonar",
+        "score": None,
+    }
+
+
 def _domain(url: str) -> str:
     if not url:
         return ""
@@ -999,6 +1060,9 @@ def _format_results(
     timings_ms: dict[str, float | None] | None = None,
     unresponsive_engines: list[Any] | None = None,
     provider_states: dict[str, str] | None = None,
+    answer: str | None = None,
+    citations: list[str] | None = None,
+    mode: str | None = None,
 ) -> str:
     """Format results as the legacy contract plus additive provider metadata."""
     effective_status = status or ("ok" if results else "empty")
@@ -1018,6 +1082,10 @@ def _format_results(
         text = "\n".join(lines)
     else:
         text = f"No results found for: {query}"
+    # Generated-output providers (Sonar) surface a synthesized answer that is
+    # never merged into the raw result list; it travels as its own field.
+    if answer:
+        text = f"{answer}\n\n---\n\n{text}" if results else answer
 
     payload = {
         "query": query,
@@ -1032,8 +1100,13 @@ def _format_results(
             timings_ms=timings_ms,
             unresponsive_engines=unresponsive_engines,
             provider_states=provider_states,
+            mode=mode,
         ),
     }
+    if answer:
+        payload["answer"] = answer
+    if citations:
+        payload["citations"] = list(citations)
     _record_last_search(payload)
     return json.dumps(payload)
 
@@ -1516,6 +1589,29 @@ def _resolve_kagi_key() -> str:
     if value and value.strip():
         return value.strip()
     return KAGI_API_KEY_ENV or _read_secret_file(_KAGI_SECRET_FILE)
+
+
+_PERPLEXITY_SECRET_FILE = LOCAL_SEARCH_DATA_DIR / "perplexity_key"
+
+
+def _resolve_perplexity_key() -> str:
+    """Return the Perplexity API key from the current HTTP request, env var, or
+    a mode-0600 secret file. Empty if none.
+
+    Header precedence (standard `Authorization` is reserved for MCP transport):
+      1. X-Perplexity-Key   (explicit Perplexity credential)
+    Then env var PERPLEXITY_API_KEY, then the secret file at
+    $LOCAL_SEARCH_DATA_DIR/perplexity_key. Generic X-Api-Key and Authorization
+    values are never repurposed as Perplexity keys.
+    """
+    try:
+        headers = get_http_headers()
+    except LookupError:
+        return PERPLEXITY_API_KEY_ENV or _read_secret_file(_PERPLEXITY_SECRET_FILE)
+    value = headers.get("x-perplexity-key")
+    if value and value.strip():
+        return value.strip()
+    return PERPLEXITY_API_KEY_ENV or _read_secret_file(_PERPLEXITY_SECRET_FILE)
 
 
 # --------------------------------------------------------------------------- #
@@ -2069,6 +2165,164 @@ async def _kagi_search(query: str, num_results: int, api_key: str) -> _BackendOu
 
 
 # --------------------------------------------------------------------------- #
+# Backend: Perplexity Sonar (ADR 0002). Generated output + search_results.
+# --------------------------------------------------------------------------- #
+
+
+def _sonar_completions_url() -> str:
+    """Return the Perplexity chat-completions endpoint only when credentials
+    can be sent safely. Mirrors the Kagi/Tavily credential-free-origin guard.
+    """
+    parsed = urllib.parse.urlsplit(PERPLEXITY_BASE_URL)
+    try:
+        _ = parsed.port
+    except ValueError as exc:
+        raise ValueError("PERPLEXITY_BASE_URL must be a credential-free HTTPS origin") from exc
+    if (
+        parsed.scheme.lower() != "https"
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path not in {"", "/"}
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ValueError("PERPLEXITY_BASE_URL must be a credential-free HTTPS origin")
+    return urllib.parse.urlunsplit(("https", parsed.netloc, "/chat/completions", "", ""))
+
+
+async def _sonar_search(query: str, num_results: int, api_key: str) -> _BackendOutcome:
+    """Call Perplexity Sonar and return normalized search_results plus answer.
+
+    Sonar is a generated-output provider (OpenAI-compatible chat completions).
+    The generated answer is surfaced separately so it is never silently merged
+    into a raw result list; the ranked `search_results` are normalized and ride
+    the standard BackendOutcome contract. Requires an API key (no keyless mode).
+    """
+    started = time.monotonic()
+    credential_mode = "keyed" if api_key else "none"
+    circuit_before = _breaker.snapshot("sonar")
+    if not api_key:
+        logger.info("Sonar search skipped: no API key configured")
+        circuit_after = _breaker.snapshot("sonar")
+        return _BackendOutcome(
+            backend="sonar",
+            state="error",
+            elapsed_ms=round((time.monotonic() - started) * 1000, 1),
+            error="missing API key",
+            credential_mode="none",
+            circuit_before=str(circuit_before["state"]),
+            circuit_after=str(circuit_after["state"]),
+            circuit_failures=int(circuit_after["consecutive_failures"]),
+        )
+    if not _breaker.allow("sonar"):
+        logger.info("Sonar circuit open; skipping")
+        circuit_after = _breaker.snapshot("sonar")
+        return _BackendOutcome(
+            backend="sonar",
+            state="circuit_open",
+            elapsed_ms=round((time.monotonic() - started) * 1000, 1),
+            credential_mode=credential_mode,
+            circuit_before=str(circuit_before["state"]),
+            circuit_after=str(circuit_after["state"]),
+            circuit_failures=int(circuit_after["consecutive_failures"]),
+        )
+
+    payload = {
+        "model": SONAR_MODEL,
+        "messages": [{"role": "user", "content": query}],
+        "return_search_results": True,
+        "search_recency_filter": "month",
+    }
+    headers = {"Authorization": f"Bearer {api_key}", "Accept-Encoding": "identity"}
+    try:
+        url = _sonar_completions_url()
+        client = await _client()
+        async with client.stream(
+            "POST", url, json=payload, headers=headers, timeout=PERPLEXITY_TIMEOUT,
+        ) as response:
+            response.raise_for_status()
+            data = await _limited_json_object(response, provider="Sonar")
+    except asyncio.CancelledError:
+        _breaker.record_aborted("sonar")
+        raise
+    except httpx.TimeoutException:
+        circuit_transition = _breaker.record_failure("sonar")
+        state = "timeout"
+        error = "request timed out"
+        http_status = None
+    except httpx.HTTPStatusError as exc:
+        status_code = exc.response.status_code
+        http_status = status_code
+        if status_code in {400, 401, 403, 404, 422}:
+            circuit_transition = _breaker.record_success("sonar")
+        else:
+            circuit_transition = _breaker.record_failure("sonar")
+        state = "error"
+        error = f"HTTP {status_code}"
+    except Exception as exc:
+        circuit_transition = _breaker.record_failure("sonar")
+        state = "error"
+        error = type(exc).__name__
+        http_status = None
+    else:
+        circuit_transition = _breaker.record_success("sonar")
+        circuit_after = _breaker.snapshot("sonar")
+        choices = data.get("choices") if isinstance(data, dict) else None
+        answer = ""
+        if isinstance(choices, list) and choices:
+            message = choices[0].get("message") if isinstance(choices[0], dict) else None
+            if isinstance(message, dict):
+                answer = str(message.get("content") or "")
+        citations = data.get("citations") if isinstance(data, dict) else None
+        if not isinstance(citations, list):
+            citations = []
+        raw_results = data.get("search_results") if isinstance(data, dict) else None
+        if not isinstance(raw_results, list):
+            raw_results = []
+        results = [
+            normalized
+            for item in raw_results[:num_results]
+            if isinstance(item, dict)
+            and (normalized := _normalize_sonar_result(item)) is not None
+        ]
+        state = "ok" if (results or answer) else "empty"
+        return _BackendOutcome(
+            backend="sonar",
+            results=results,
+            suggestions=[],
+            ok=bool(results or answer),
+            state=state,
+            elapsed_ms=round((time.monotonic() - started) * 1000, 1),
+            attempts=1,
+            http_status=response.status_code,
+            credential_mode=credential_mode,
+            circuit_before=str(circuit_before["state"]),
+            circuit_after=str(circuit_after["state"]),
+            circuit_transition=circuit_transition,
+            circuit_failures=int(circuit_after["consecutive_failures"]),
+            answer=answer,
+            citations=[str(c) for c in citations if isinstance(c, str)],
+        )
+
+    circuit_after = _breaker.snapshot("sonar")
+    logger.warning("Sonar search failed (%s): %s", credential_mode, error)
+    return _BackendOutcome(
+        backend="sonar",
+        state=state,
+        elapsed_ms=round((time.monotonic() - started) * 1000, 1),
+        attempts=1,
+        error=error,
+        http_status=http_status,
+        credential_mode=credential_mode,
+        circuit_before=str(circuit_before["state"]),
+        circuit_after=str(circuit_after["state"]),
+        circuit_transition=circuit_transition,
+        circuit_failures=int(circuit_after["consecutive_failures"]),
+    )
+
+
+# --------------------------------------------------------------------------- #
 # Health probe.
 # --------------------------------------------------------------------------- #
 
@@ -2350,15 +2604,18 @@ def _fallback_reason(primary: _BackendOutcome, result_count: int, threshold: int
 
 
 def _result_backend(results: list[dict[str, Any]]) -> str:
-    has_tavily = any(result.get("engine") == "tavily" for result in results)
-    has_searxng = any(result.get("engine") != "tavily" for result in results)
-    if has_tavily and has_searxng:
-        return "searxng+tavily"
-    if has_tavily:
-        return "tavily"
-    if has_searxng:
-        return "searxng"
-    return "none"
+    # Derive the backend label from the distinct provider names on the results,
+    # preserving provider order. This generalizes the old tavily/searxng split
+    # to any provider pair (e.g. kagi+sonar) while producing identical labels
+    # for the legacy stack.
+    names: list[str] = []
+    for result in results:
+        name = result.get("provider") or result.get("engine")
+        if isinstance(name, str) and name not in names:
+            names.append(name)
+    if not names:
+        return "none"
+    return "+".join(names)
 
 
 def _timings(
@@ -2534,6 +2791,8 @@ async def _web_search_impl(query: str, num_results: int = 8) -> str:
         results = _dedupe_and_rank(fallback_outcome.results, requested)
     backend = _result_backend(results)
     timings_ms = _timings(started, [primary_outcome, fallback_outcome])
+    answer = fallback_outcome.answer or None
+    citations = fallback_outcome.citations or None
     if results:
         status = "degraded"
         rendered = _format_results(
@@ -2547,12 +2806,19 @@ async def _web_search_impl(query: str, num_results: int = 8) -> str:
             timings_ms=timings_ms,
             unresponsive_engines=primary_outcome.unresponsive_engines,
             provider_states=provider_states,
+            answer=answer,
+            citations=citations,
         )
     elif not primary_outcome.ok and not fallback_outcome.ok:
         status = "error"
+        both_failed_msg = (
+            "Search error: SearXNG unreachable and Tavily failed."
+            if primary.name == "searxng" and fallback.name == "tavily"
+            else f"Search error: {primary.name} and {fallback.name} both failed."
+        )
         rendered = _search_error_payload(
             query,
-            "Search error: SearXNG unreachable and Tavily failed.",
+            both_failed_msg,
             primary_outcome.suggestions,
             attempted=attempted,
             fallback_reason=reason,
@@ -2574,6 +2840,8 @@ async def _web_search_impl(query: str, num_results: int = 8) -> str:
             timings_ms=timings_ms,
             unresponsive_engines=primary_outcome.unresponsive_engines,
             provider_states=provider_states,
+            answer=answer,
+            citations=citations,
         )
     return _finish_search(
         rendered,
@@ -2591,6 +2859,80 @@ async def _web_search_impl(query: str, num_results: int = 8) -> str:
 async def web_search(query: str, num_results: int = 8) -> str:
     """Search SearXNG first, then apply the configured Tavily egress policy."""
     return await _web_search_impl(query, num_results)
+
+
+@mcp.tool()
+async def answer_search(query: str, num_results: int = 8) -> str:
+    """Ask Perplexity Sonar directly for a grounded answer with citations.
+
+    This is the ADR 0002 `answer`/`research` route: it bypasses the raw ranked
+    providers and returns Sonar's generated answer plus its `search_results`.
+    Requires a Perplexity API key. The generated answer is never merged into a
+    raw result list; it travels as the `answer` field with `citations`.
+    """
+    started = time.monotonic()
+    query = query.strip()
+    requested = min(MAX_NUM_RESULTS, max(1, int(num_results)))
+    if not query:
+        timings_ms = _default_timings_ms()
+        timings_ms["total"] = round((time.monotonic() - started) * 1000, 1)
+        return _finish_search(
+            _search_error_payload(
+                query, "Answer search error: query must not be empty.",
+                timings_ms=timings_ms, mode="answer",
+            ),
+            status="error", backend="none",
+            requested_count=requested, result_count=0, timings_ms=timings_ms,
+        )
+    if len(query) > MAX_QUERY_CHARS:
+        timings_ms = _default_timings_ms()
+        timings_ms["total"] = round((time.monotonic() - started) * 1000, 1)
+        return _finish_search(
+            _search_error_payload(
+                "",
+                f"Answer search error: query must be at most {MAX_QUERY_CHARS} characters.",
+                timings_ms=timings_ms, mode="answer",
+            ),
+            status="error", backend="none",
+            requested_count=requested, result_count=0, timings_ms=timings_ms,
+        )
+    outcome = await _run_backend(
+        "sonar",
+        _sonar_search(query, requested, _resolve_perplexity_key()),
+        min(PERPLEXITY_TIMEOUT, SEARCH_TOTAL_TIMEOUT),
+    )
+    provider_states = {"sonar": outcome.state}
+    results = _dedupe_and_rank(outcome.results, requested)
+    timings_ms = _timings(started, [outcome])
+    if results or outcome.answer:
+        status = "ok" if outcome.ok else "degraded"
+        backend = "sonar"
+        rendered = _format_results(
+            query, results, [],
+            status=status, backend=backend, attempted=["sonar"],
+            timings_ms=timings_ms, provider_states=provider_states,
+            answer=outcome.answer or None, citations=outcome.citations or None,
+            mode="answer",
+        )
+    elif outcome.ok:
+        status = "empty"
+        backend = "none"
+        rendered = _format_results(
+            query, [], [], status=status, backend=backend, attempted=["sonar"],
+            timings_ms=timings_ms, provider_states=provider_states, mode="answer",
+        )
+    else:
+        status = "error"
+        backend = "none"
+        rendered = _search_error_payload(
+            query, "Answer search error: Sonar failed and no fallback is configured.",
+            attempted=["sonar"], fallback_reason=_fallback_reason(outcome, 0, requested),
+            timings_ms=timings_ms, provider_states=provider_states, mode="answer",
+        )
+    return _finish_search(
+        rendered, status=status, backend=backend, requested_count=requested,
+        result_count=len(results), timings_ms=timings_ms, outcomes=[outcome], mode="answer",
+    )
 
 
 def _batch_error_payload(message: str, started: float, requested: int) -> str:

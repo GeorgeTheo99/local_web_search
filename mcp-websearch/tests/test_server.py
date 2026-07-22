@@ -1236,7 +1236,7 @@ async def test_tools_list_exposes_expected_tools():
     async with Client(srv.mcp) as client:
         tools = await client.list_tools()
     names = {t.name for t in tools}
-    assert names == {"web_search", "batch_web_search", "image_search", "web_fetch"}
+    assert names == {"web_search", "batch_web_search", "image_search", "web_fetch", "answer_search"}
     batch_tool = next(tool for tool in tools if tool.name == "batch_web_search")
     batch_schema = batch_tool.model_dump(by_alias=True)["inputSchema"]
     assert batch_schema["required"] == ["queries"]
