@@ -2111,14 +2111,15 @@ async def _kagi_search(query: str, num_results: int, api_key: str) -> _BackendOu
             circuit_failures=int(circuit_after["consecutive_failures"]),
         )
 
-    params = {"q": query}
+    body = {"query": query}
     headers = {"Authorization": f"Bot {api_key}", "Accept-Encoding": "identity"}
     try:
         search_url = _kagi_search_url()
         client = await _client()
         async with client.stream(
-            "GET",
-            f"{search_url}?{urllib.parse.urlencode(params)}",
+            "POST",
+            search_url,
+            json=body,
             headers=headers,
             timeout=KAGI_TIMEOUT,
         ) as response:
@@ -2348,6 +2349,65 @@ async def _sonar_search(query: str, num_results: int, api_key: str) -> _BackendO
         circuit_transition=circuit_transition,
         circuit_failures=int(circuit_after["consecutive_failures"]),
     )
+
+
+# --------------------------------------------------------------------------- #
+# Kagi Extract (ADR 0002 Phase 7) — server-side page content verification.
+# --------------------------------------------------------------------------- #
+
+
+def _kagi_extract_url() -> str:
+    """Return the Kagi extract endpoint with the same credential-free-origin guard."""
+    parsed = urllib.parse.urlsplit(KAGI_BASE_URL)
+    try:
+        _ = parsed.port
+    except ValueError as exc:
+        raise ValueError("KAGI_BASE_URL must be a credential-free HTTPS origin") from exc
+    if (
+        parsed.scheme.lower() != "https"
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path not in {"", "/"}
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ValueError("KAGI_BASE_URL must be a credential-free HTTPS origin")
+    return urllib.parse.urlunsplit(("https", parsed.netloc, "/api/v1/extract", "", ""))
+
+
+async def _kagi_extract(url: str, api_key: str) -> dict[str, Any]:
+    """Fetch clean markdown content for one URL via the Kagi Extract API.
+
+    Returns {"ok": bool, "markdown": str, "error": str | None}. Used as a
+    server-side verification/content layer after search discovery; never used to
+    automate consumer SERPs. Requires a Kagi key (no keyless mode).
+    """
+    if not api_key:
+        return {"ok": False, "markdown": "", "error": "missing API key"}
+    body = {"pages": [{"url": url}], "format": "json"}
+    headers = {"Authorization": f"Bot {api_key}", "Accept-Encoding": "identity"}
+    try:
+        extract_url = _kagi_extract_url()
+        client = await _client()
+        async with client.stream(
+            "POST", extract_url, json=body, headers=headers, timeout=FETCH_TIMEOUT,
+        ) as response:
+            response.raise_for_status()
+            data = await _limited_json_object(response, provider="Kagi")
+    except asyncio.CancelledError:
+        raise
+    except httpx.TimeoutException:
+        return {"ok": False, "markdown": "", "error": "request timed out"}
+    except httpx.HTTPStatusError as exc:
+        return {"ok": False, "markdown": "", "error": f"HTTP {exc.response.status_code}"}
+    except Exception as exc:
+        return {"ok": False, "markdown": "", "error": type(exc).__name__}
+    entries = data.get("data") if isinstance(data, dict) else None
+    if not isinstance(entries, list) or not entries:
+        return {"ok": False, "markdown": "", "error": "no extract data"}
+    first = entries[0] if isinstance(entries[0], dict) else {}
+    return {"ok": True, "markdown": str(first.get("markdown") or ""), "error": None}
 
 
 # --------------------------------------------------------------------------- #
@@ -3476,6 +3536,48 @@ async def web_fetch(url: str, max_chars: int = 20000) -> str:
         return text
 
     return _truncate_text(decoded, max_chars, "\n\n... (truncated)")
+
+
+@mcp.tool()
+async def verify_url(url: str, max_chars: int = 20000) -> str:
+    """Verify/retrieve content for one URL: direct fetch first, then Kagi Extract.
+
+    ADR 0002 Phase 7 verification layer. Direct fetch (the same path as
+    web_fetch) is tried first. If it errors or returns very little text
+    (JS-heavy or fetch-blocked pages), and a Kagi key is configured, Kagi's
+    server-side Extract API is tried as a content fallback. Browser-based
+    verification for pages that defeat both is handled by the Pi agent's shared
+    browser_* tools, not by this broker. This tool never automates consumer
+    SERPs and never bypasses CAPTCHAs, logins, or rate limits.
+    """
+    max_chars = min(50000, max(1, int(max_chars)))
+    direct = await web_fetch(url, max_chars)
+    # web_fetch returns either a JSON string (success) or a "Fetch error: ..." string.
+    direct_ok = not direct.startswith("Fetch error:")
+    direct_text = ""
+    if direct_ok:
+        try:
+            parsed = json.loads(direct)
+            direct_text = str(parsed.get("text") or "")
+        except Exception:
+            direct_text = direct
+    if direct_ok:
+        # Direct fetch yielded content; return it tagged as direct.
+        return json.dumps({"url": url, "method": "direct", "text": direct_text[:max_chars], "error": None})
+    # Direct fetch failed or yielded no text: try Kagi Extract if a key is set.
+    kagi_key = _resolve_kagi_key()
+    if kagi_key:
+        extract = await _kagi_extract(url, kagi_key)
+        if extract["ok"] and extract["markdown"]:
+            return json.dumps({"url": url, "method": "kagi_extract",
+                               "text": extract["markdown"][:max_chars], "error": None})
+        # Both failed: return the direct-fetch error with an extract-error note.
+        return json.dumps({"url": url, "method": "none", "text": "",
+                           "error": direct if not direct_ok else "empty direct fetch",
+                           "extract_error": extract["error"]})
+    return json.dumps({"url": url, "method": "direct" if direct_ok else "none",
+                       "text": direct_text[:max_chars] if direct_ok else "",
+                       "error": None if direct_ok else direct})
 
 
 if __name__ == "__main__":

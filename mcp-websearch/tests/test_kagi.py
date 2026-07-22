@@ -207,7 +207,7 @@ async def test_kagi_search_normalizes_data_array(monkeypatch):
     ]}
 
     class FakeClient:
-        def stream(self, method, url, headers=None, timeout=None):
+        def stream(self, method, url, headers=None, timeout=None, json=None):
             return _FakeStreamResponse(payload)
 
     monkeypatch.setattr(srv, "_client", _async_client(FakeClient()))
@@ -223,7 +223,7 @@ async def test_kagi_search_normalizes_data_array(monkeypatch):
 @pytest.mark.asyncio
 async def test_kagi_search_empty_data_is_empty_state(monkeypatch):
     class FakeClient:
-        def stream(self, method, url, headers=None, timeout=None):
+        def stream(self, method, url, headers=None, timeout=None, json=None):
             return _FakeStreamResponse({"data": []})
 
     monkeypatch.setattr(srv, "_client", _async_client(FakeClient()))
@@ -235,7 +235,7 @@ async def test_kagi_search_empty_data_is_empty_state(monkeypatch):
 @pytest.mark.asyncio
 async def test_kagi_search_timeout_records_failure(monkeypatch):
     class FakeClient:
-        def stream(self, method, url, headers=None, timeout=None):
+        def stream(self, method, url, headers=None, timeout=None, json=None):
             raise httpx.TimeoutException("slow")
 
     monkeypatch.setattr(srv, "_client", _async_client(FakeClient()))
@@ -249,7 +249,7 @@ async def test_kagi_search_timeout_records_failure(monkeypatch):
 @pytest.mark.asyncio
 async def test_kagi_search_401_does_not_circuit_break(monkeypatch):
     class FakeClient:
-        def stream(self, method, url, headers=None, timeout=None):
+        def stream(self, method, url, headers=None, timeout=None, json=None):
             return _FakeStreamResponse({}, status=401)
 
     monkeypatch.setattr(srv, "_client", _async_client(FakeClient()))
@@ -266,7 +266,7 @@ async def test_kagi_search_response_is_size_bounded(monkeypatch):
     monkeypatch.setattr(srv, "SEARCH_RESPONSE_MAX_BYTES", 8)
 
     class FakeClient:
-        def stream(self, method, url, headers=None, timeout=None):
+        def stream(self, method, url, headers=None, timeout=None, json=None):
             return _FakeStreamResponse({"data": [{"t": 0, "url": "https://x.example/"}]})
 
     monkeypatch.setattr(srv, "_client", _async_client(FakeClient()))

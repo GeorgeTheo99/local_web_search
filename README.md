@@ -263,7 +263,12 @@ Routing modes (`web_search` `mode` argument or `WEBSEARCH_SEARCH_MODE`):
 `normal` (default), `sensitive` (no external egress; refuses without a local
 corpus — SearXNG is not no-egress), `maximum_recall` (opt-in serial escalation
 across all configured providers). The `answer_search` tool calls Sonar directly
-for a grounded answer with citations.
+for a grounded answer with citations. The `verify_url` tool is the ADR 0002
+verification layer: it tries direct fetch first and falls back to the Kagi
+Extract API (server-side markdown extraction) for JS-heavy or fetch-blocked
+pages; browser-based verification for pages that defeat both is handled by the
+Pi agent's shared `browser_*` tools, not by this broker. It never automates
+consumer SERPs or bypasses CAPTCHAs/logins/rate limits.
 
 ## Operator CLI
 
