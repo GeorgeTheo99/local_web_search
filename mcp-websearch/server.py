@@ -86,9 +86,14 @@ logger = logging.getLogger("websearch-mcp")
 
 SEARXNG_URL = os.environ.get("SEARXNG_URL", "http://127.0.0.1:8888").rstrip("/")
 TAVILY_BASE_URL = os.environ.get("TAVILY_BASE_URL", "https://api.tavily.com").rstrip("/")
+KAGI_BASE_URL = os.environ.get("KAGI_BASE_URL", "https://kagi.com").rstrip("/")
 # Environment fallback for stdio clients. HTTP clients should forward a Tavily
 # key only through X-Tavily-Key; broker authentication is a separate concern.
 TAVILY_API_KEY_ENV = os.environ.get("TAVILY_API_KEY", "").strip()
+# Kagi API key. HTTP clients should forward it via X-Kagi-Key; the env var is a
+# stdio/server-side fallback. A mode-0600 secret file beside the data dir is
+# also consulted so keys can live outside the repo and process environment.
+KAGI_API_KEY_ENV = os.environ.get("KAGI_API_KEY", "").strip()
 _DEFAULT_DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 LOCAL_SEARCH_DATA_DIR = Path(
     os.environ.get("LOCAL_SEARCH_DATA_DIR", str(_DEFAULT_DATA_DIR))
@@ -132,6 +137,18 @@ SEARCH_TIMEOUT = _bounded_float(
 TAVILY_TIMEOUT = _bounded_float(
     "WEBSEARCH_TAVILY_TIMEOUT", 8.0, minimum=0.25, maximum=SEARCH_TOTAL_TIMEOUT
 )
+KAGI_TIMEOUT = _bounded_float(
+    "WEBSEARCH_KAGI_TIMEOUT", 8.0, minimum=0.25, maximum=SEARCH_TOTAL_TIMEOUT
+)
+# Provider stack selection (ADR 0002). The default preserves the existing
+# SearXNG-first + Tavily-fallback behavior so deployments and tests are
+# unchanged until an operator opts into the Kagi stack. Phase 6 will flip the
+# default to "kagi+sonar" once Sonar is wired.
+_PROVIDER_STACK = os.environ.get("WEBSEARCH_PROVIDER_STACK", "searxng+tavily").strip().lower()
+if _PROVIDER_STACK not in {"searxng+tavily", "kagi", "kagi+sonar", "searxng"}:
+    raise RuntimeError(
+        "WEBSEARCH_PROVIDER_STACK must be one of: searxng+tavily, kagi, kagi+sonar, searxng"
+    )
 SUPPLEMENT_MIN_RESULTS = _bounded_int(
     "WEBSEARCH_SUPPLEMENT_MIN_RESULTS", 5, minimum=1, maximum=20
 )
@@ -382,10 +399,43 @@ class _TavilyProvider:
         return "keyed" if _resolve_tavily_key() else "keyless"
 
 
+class _KagiProvider:
+    """Kagi raw-search provider (requires an API key; no keyless mode)."""
+
+    name = "kagi"
+    output = "raw"
+
+    @property
+    def timeout(self) -> float:
+        return KAGI_TIMEOUT
+
+    @staticmethod
+    def search(query: str, num_results: int) -> Awaitable[_BackendOutcome]:
+        return _kagi_search(query, num_results, _resolve_kagi_key())
+
+    @staticmethod
+    def credential_label() -> str:
+        return "keyed" if _resolve_kagi_key() else "none"
+
+
 # Ordered provider list for the default web-search path. The first entry is
-# the primary; the second is the policy-controlled fallback. Phase 2 (Kagi)
-# will make this configurable.
-_PROVIDERS: list[SearchProvider] = [_SearXNGProvider(), _TavilyProvider()]
+# the primary; the second (when present) is the policy-controlled fallback.
+# WEBSEARCH_PROVIDER_STACK selects the active stack; the default preserves the
+# existing SearXNG-first + Tavily-fallback behavior. Sonar is wired in Phase 4.
+def _build_provider_stack() -> list[SearchProvider]:
+    if _PROVIDER_STACK == "searxng+tavily":
+        return [_SearXNGProvider(), _TavilyProvider()]
+    if _PROVIDER_STACK == "searxng":
+        return [_SearXNGProvider()]
+    if _PROVIDER_STACK == "kagi":
+        return [_KagiProvider()]
+    if _PROVIDER_STACK == "kagi+sonar":
+        # Sonar is wired in Phase 4; until then Kagi runs without a fallback.
+        return [_KagiProvider()]
+    return [_SearXNGProvider(), _TavilyProvider()]
+
+
+_PROVIDERS: list[SearchProvider] = _build_provider_stack()
 
 
 def _default_timings_ms() -> dict[str, float | None]:
@@ -788,6 +838,36 @@ def _normalize_tavily_result(r: dict) -> dict[str, Any] | None:
         "engine": "tavily",
         "provider": "tavily",
         "score": r.get("score"),
+    }
+
+
+def _normalize_kagi_result(r: dict) -> dict[str, Any] | None:
+    """Normalize one Kagi Search API result object.
+
+    Kagi returns a `data` array whose entries with `t == 0` are web results
+    carrying `url`, `title`, `snippet`, and optional `published`. Entries with
+    `t == 1` are related-search lists and are ignored here.
+    """
+    if r.get("t") not in (0, None):
+        # t == 1 is a related-searches list; t == 2/3 are teasers/infoboxes.
+        return None
+    url = _public_http_url(r.get("url"))
+    if url is None:
+        return None
+    snippet = str(r.get("snippet") or "")
+    published = r.get("published")
+    if isinstance(published, str) and published and not snippet.endswith(published):
+        # Preserve the publication timestamp as a trailing hint without
+        # duplicating it; normalization never stores the query itself.
+        snippet = f"{snippet} (published {published})".strip()
+    return {
+        "title": r.get("title") or "Untitled",
+        "url": url,
+        "domain": _domain(url),
+        "snippet": snippet,
+        "engine": "kagi",
+        "provider": "kagi",
+        "score": None,
     }
 
 
@@ -1363,6 +1443,61 @@ def _resolve_tavily_key() -> str:
 
 
 # --------------------------------------------------------------------------- #
+# Kagi key resolution (per-call header > env var > mode-0600 secret file).
+# --------------------------------------------------------------------------- #
+
+_KAGI_SECRET_FILE = LOCAL_SEARCH_DATA_DIR / "kagi_key"
+
+
+def _read_secret_file(path: Path) -> str:
+    """Return the first non-empty stripped line from a mode-0600 secret file.
+
+    The file must live outside the repository and be readable only by the
+    owner; otherwise it is ignored. Secrets are never logged or returned to
+    clients.
+    """
+    try:
+        if not path.is_file():
+            return ""
+        stat = path.stat()
+        # Require owner-only read/write (0o600 or stricter on the owner bits).
+        if stat.st_mode & 0o077:
+            logger.warning("Ignoring world/group-readable secret file %s", path)
+            return ""
+        with path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if line:
+                    return line
+    except OSError:
+        pass
+    return ""
+
+
+def _resolve_kagi_key() -> str:
+    """Return the Kagi API key from the current HTTP request, env var, or a
+    mode-0600 secret file. Empty if none.
+
+    Header precedence (custom headers pass through to tools; standard
+    `Authorization` is reserved exclusively for MCP transport authentication):
+      1. X-Kagi-Key   (explicit Kagi credential)
+    Then env var KAGI_API_KEY, then the secret file at
+    $LOCAL_SEARCH_DATA_DIR/kagi_key. Generic X-Api-Key and Authorization values
+    are never repurposed as Kagi keys.
+    """
+    try:
+        headers = get_http_headers()
+    except LookupError:
+        # stdio transport / no HTTP context — env var / file only.
+        env_or_file = KAGI_API_KEY_ENV or _read_secret_file(_KAGI_SECRET_FILE)
+        return env_or_file
+    value = headers.get("x-kagi-key")
+    if value and value.strip():
+        return value.strip()
+    return KAGI_API_KEY_ENV or _read_secret_file(_KAGI_SECRET_FILE)
+
+
+# --------------------------------------------------------------------------- #
 # Backend: SearXNG.
 # --------------------------------------------------------------------------- #
 
@@ -1774,6 +1909,145 @@ async def _tavily_search(query: str, num_results: int, api_key: str) -> _Backend
 
 
 # --------------------------------------------------------------------------- #
+# Backend: Kagi (ADR 0002).
+# --------------------------------------------------------------------------- #
+
+
+def _kagi_search_url() -> str:
+    """Return the configured Kagi search endpoint only when credentials can be
+    sent safely. Mirrors the Tavily credential-free-origin guard.
+    """
+    parsed = urllib.parse.urlsplit(KAGI_BASE_URL)
+    try:
+        _ = parsed.port
+    except ValueError as exc:
+        raise ValueError("KAGI_BASE_URL must be a credential-free HTTPS origin") from exc
+    if (
+        parsed.scheme.lower() != "https"
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path not in {"", "/"}
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ValueError("KAGI_BASE_URL must be a credential-free HTTPS origin")
+    return urllib.parse.urlunsplit(("https", parsed.netloc, "/api/v1/search", "", ""))
+
+
+async def _kagi_search(query: str, num_results: int, api_key: str) -> _BackendOutcome:
+    """Search Kagi. Requires an API key (no keyless mode)."""
+    started = time.monotonic()
+    credential_mode = "keyed" if api_key else "none"
+    circuit_before = _breaker.snapshot("kagi")
+    if not api_key:
+        logger.info("Kagi search skipped: no API key configured")
+        circuit_after = _breaker.snapshot("kagi")
+        return _BackendOutcome(
+            backend="kagi",
+            state="error",
+            elapsed_ms=round((time.monotonic() - started) * 1000, 1),
+            error="missing API key",
+            credential_mode="none",
+            circuit_before=str(circuit_before["state"]),
+            circuit_after=str(circuit_after["state"]),
+            circuit_failures=int(circuit_after["consecutive_failures"]),
+        )
+    if not _breaker.allow("kagi"):
+        logger.info("Kagi circuit open; skipping")
+        circuit_after = _breaker.snapshot("kagi")
+        return _BackendOutcome(
+            backend="kagi",
+            state="circuit_open",
+            elapsed_ms=round((time.monotonic() - started) * 1000, 1),
+            credential_mode=credential_mode,
+            circuit_before=str(circuit_before["state"]),
+            circuit_after=str(circuit_after["state"]),
+            circuit_failures=int(circuit_after["consecutive_failures"]),
+        )
+
+    params = {"q": query}
+    headers = {"Authorization": f"Bot {api_key}", "Accept-Encoding": "identity"}
+    try:
+        search_url = _kagi_search_url()
+        client = await _client()
+        async with client.stream(
+            "GET",
+            f"{search_url}?{urllib.parse.urlencode(params)}",
+            headers=headers,
+            timeout=KAGI_TIMEOUT,
+        ) as response:
+            response.raise_for_status()
+            data = await _limited_json_object(response, provider="Kagi")
+    except asyncio.CancelledError:
+        _breaker.record_aborted("kagi")
+        raise
+    except httpx.TimeoutException:
+        circuit_transition = _breaker.record_failure("kagi")
+        state = "timeout"
+        error = "request timed out"
+        http_status = None
+    except httpx.HTTPStatusError as exc:
+        status_code = exc.response.status_code
+        http_status = status_code
+        # Auth/client errors prove reachability; do not circuit-break a valid key.
+        if status_code in {400, 401, 403, 404, 422}:
+            circuit_transition = _breaker.record_success("kagi")
+        else:
+            circuit_transition = _breaker.record_failure("kagi")
+        state = "error"
+        error = f"HTTP {status_code}"
+    except Exception as exc:
+        circuit_transition = _breaker.record_failure("kagi")
+        state = "error"
+        error = type(exc).__name__
+        http_status = None
+    else:
+        circuit_transition = _breaker.record_success("kagi")
+        circuit_after = _breaker.snapshot("kagi")
+        raw_results = data.get("data") if isinstance(data, dict) else None
+        # Defensively accept a `results` key as well in case v1 renames `data`.
+        if not isinstance(raw_results, list):
+            raw_results = data.get("results", []) if isinstance(data, dict) else []
+        results = [
+            normalized
+            for item in raw_results[:num_results]
+            if isinstance(item, dict)
+            and (normalized := _normalize_kagi_result(item)) is not None
+        ]
+        return _BackendOutcome(
+            backend="kagi",
+            results=results,
+            ok=True,
+            state="ok" if results else "empty",
+            elapsed_ms=round((time.monotonic() - started) * 1000, 1),
+            attempts=1,
+            http_status=response.status_code,
+            credential_mode=credential_mode,
+            circuit_before=str(circuit_before["state"]),
+            circuit_after=str(circuit_after["state"]),
+            circuit_transition=circuit_transition,
+            circuit_failures=int(circuit_after["consecutive_failures"]),
+        )
+
+    circuit_after = _breaker.snapshot("kagi")
+    logger.warning("Kagi search failed (%s): %s", credential_mode, error)
+    return _BackendOutcome(
+        backend="kagi",
+        state=state,
+        elapsed_ms=round((time.monotonic() - started) * 1000, 1),
+        attempts=1,
+        error=error,
+        http_status=http_status,
+        credential_mode=credential_mode,
+        circuit_before=str(circuit_before["state"]),
+        circuit_after=str(circuit_after["state"]),
+        circuit_transition=circuit_transition,
+        circuit_failures=int(circuit_after["consecutive_failures"]),
+    )
+
+
+# --------------------------------------------------------------------------- #
 # Health probe.
 # --------------------------------------------------------------------------- #
 
@@ -1972,16 +2246,17 @@ async def _run_backend(backend: str, awaitable: Any, timeout: float) -> _Backend
     )
 
 
-def _fallback_reason(searxng: _BackendOutcome, result_count: int, threshold: int) -> str:
-    if searxng.state == "degraded":
-        return "searxng_degraded"
+def _fallback_reason(primary: _BackendOutcome, result_count: int, threshold: int) -> str:
+    name = primary.backend
+    if primary.state == "degraded":
+        return f"{name}_degraded"
     if result_count and result_count < threshold:
         return "below_minimum"
     return {
-        "empty": "searxng_empty",
-        "timeout": "searxng_timeout",
-        "circuit_open": "searxng_circuit_open",
-    }.get(searxng.state, "searxng_error")
+        "empty": f"{name}_empty",
+        "timeout": f"{name}_timeout",
+        "circuit_open": f"{name}_circuit_open",
+    }.get(primary.state, f"{name}_error")
 
 
 def _result_backend(results: list[dict[str, Any]]) -> str:
@@ -2084,7 +2359,7 @@ async def _web_search_impl(query: str, num_results: int = 8) -> str:
         elif primary_outcome.ok:
             degraded = primary_outcome.state == "degraded"
             status = "degraded" if degraded else "empty"
-            fallback_reason = "searxng_degraded" if degraded else None
+            fallback_reason = f"{primary.name}_degraded" if degraded else None
             rendered = _format_results(
                 query,
                 [],
@@ -2100,9 +2375,13 @@ async def _web_search_impl(query: str, num_results: int = 8) -> str:
         else:
             status = "error"
             fallback_reason = _fallback_reason(primary_outcome, 0, threshold)
+            if fallback is None:
+                message = f"Search error: {primary.name} search failed and no fallback provider is configured."
+            else:
+                message = "Search error: SearXNG failed and Tavily is disabled by policy."
             rendered = _search_error_payload(
                 query,
-                "Search error: SearXNG failed and Tavily is disabled by policy.",
+                message,
                 primary_outcome.suggestions,
                 attempted=attempted,
                 fallback_reason=fallback_reason,
