@@ -30,8 +30,8 @@ SCHEMA_VERSION = 1
 VALID_WINDOWS = {"24h": 24 * 60 * 60, "7d": 7 * 24 * 60 * 60, "30d": 30 * 24 * 60 * 60}
 
 _SEARCH_STATUSES = {"ok", "empty", "degraded", "error", "timeout"}
-_BACKENDS = {"none", "searxng", "tavily", "searxng+tavily"}
-_MODES = {"disabled", "fallback", "supplement"}
+_BACKENDS = {"none", "searxng", "brave"}
+_MODES = {"normal", "sensitive", "maximum_recall", "disabled"}
 _FALLBACK_REASONS = {
     "searxng_degraded",
     "below_minimum",
@@ -40,6 +40,15 @@ _FALLBACK_REASONS = {
     "searxng_circuit_open",
     "searxng_error",
     "batch_deadline",
+    "brave_degraded",
+    "brave_empty",
+    "brave_timeout",
+    "brave_circuit_open",
+    "brave_error",
+    "quality_below_min_results",
+    "quality_low_domain_diversity",
+    "quality_duplicate_dominated",
+    "quality_stale_for_news_intent",
 }
 _PROVIDER_STATES = {"ok", "empty", "degraded", "error", "timeout", "circuit_open"}
 _CIRCUIT_STATES = {"closed", "open", "half_open", "unknown"}
@@ -416,7 +425,7 @@ class TelemetryStore:
                 search_id = int(cursor.lastrowid)
                 seen_providers: set[str] = set()
                 for provider in event.providers:
-                    if provider.provider not in {"searxng", "tavily"} or provider.provider in seen_providers:
+                    if provider.provider in seen_providers:
                         continue
                     seen_providers.add(provider.provider)
                     http_status = provider.http_status
@@ -535,10 +544,7 @@ class TelemetryStore:
                 SELECT COALESCE(s.fallback_reason, 'unspecified') AS name, COUNT(*) AS count
                 FROM search_events s
                 WHERE s.created_at >= ? AND s.created_at <= ?
-                  AND EXISTS (
-                    SELECT 1 FROM provider_events p
-                    WHERE p.search_event_id = s.id AND p.provider = 'tavily'
-                  )
+                  AND s.fallback_reason IS NOT NULL
                 GROUP BY COALESCE(s.fallback_reason, 'unspecified')
                 ORDER BY count DESC, name
                 """,
@@ -574,16 +580,6 @@ class TelemetryStore:
                 JOIN search_events s ON s.id = p.search_event_id
                 WHERE s.created_at >= ? AND s.created_at <= ?
                 GROUP BY p.provider, p.state ORDER BY p.provider, p.state
-                """,
-                (since, until),
-            ).fetchall()
-            credential_rows = conn.execute(
-                """
-                SELECT p.credential_mode, COUNT(*) AS count
-                FROM provider_events p
-                JOIN search_events s ON s.id = p.search_event_id
-                WHERE s.created_at >= ? AND s.created_at <= ? AND p.provider = 'tavily'
-                GROUP BY p.credential_mode ORDER BY p.credential_mode
                 """,
                 (since, until),
             ).fetchall()
@@ -633,26 +629,6 @@ class TelemetryStore:
                     "maximum": round(float(row["max_latency"] or 0.0), 1),
                 },
             }
-        tavily = providers.setdefault(
-            "tavily",
-            {
-                "selected_searches": 0,
-                "attempted_searches": 0,
-                "attempts": 0,
-                "errors": 0,
-                "rate_limited_429s": 0,
-                "circuit_open_skips": 0,
-                "circuit_trips": 0,
-                "circuit_recoveries": 0,
-                "states": {},
-                "latency_ms": {"average": 0.0, "minimum": 0.0, "maximum": 0.0},
-            },
-        )
-        tavily["credential_modes"] = _count_map(credential_rows, "credential_mode")
-        tavily["credit_usage"] = {
-            "available": False,
-            "reason": "Tavily usage API is not configured",
-        }
         providers.setdefault(
             "searxng",
             {

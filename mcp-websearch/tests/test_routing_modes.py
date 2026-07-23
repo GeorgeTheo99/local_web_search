@@ -5,7 +5,7 @@ Covers:
     with a structured error because no local corpus is configured. SearXNG is
     not used (it is not no-egress).
   - maximum_recall: opt-in serial escalation across every configured provider;
-    results are merged and deduped; a Sonar answer is surfaced separately.
+    results are merged and deduped.
   - normal mode (default) is unchanged.
   - WEBSEARCH_SEARCH_MODE default and per-call `mode` argument.
 
@@ -15,6 +15,7 @@ Run:  cd mcp-websearch && uv run pytest -q
 from __future__ import annotations
 
 import json
+import sqlite3
 from typing import Any
 
 import pytest
@@ -38,8 +39,14 @@ def _result_text(result: Any) -> str:
 
 @pytest.fixture(autouse=True)
 def _reset_runtime(monkeypatch, tmp_path):
+    telemetry = srv.TelemetryStore(tmp_path / "telemetry")
     monkeypatch.setattr(srv, "_breaker", srv._CircuitBreaker())
     monkeypatch.setattr(srv, "_last_search", None)
+    monkeypatch.setattr(srv, "_telemetry", telemetry)
+    monkeypatch.setattr(srv, "_PROVIDER_STACK", "brave")
+    monkeypatch.setattr(srv, "_PROVIDERS", srv._build_provider_stack())
+    yield
+    telemetry.close()
 
 
 # --------------------------------------------------------------------------- #
@@ -48,26 +55,23 @@ def _reset_runtime(monkeypatch, tmp_path):
 
 @pytest.mark.asyncio
 async def test_sensitive_mode_makes_no_external_call(monkeypatch):
-    """sensitive mode must not contact any provider, including SearXNG."""
-    contacted = {"searxng": False, "tavily": False}
+    """sensitive mode must not contact any provider."""
+    contacted = {"brave": False}
 
-    async def fake_searxng_request(path, params, timeout=None):
-        contacted["searxng"] = True
-        return {"results": []}
-    monkeypatch.setattr(srv, "_searxng_request", fake_searxng_request)
-
-    async def fake_tavily(query, num_results, api_key):
-        contacted["tavily"] = True
-        return ([], False)
-    monkeypatch.setattr(srv, "_tavily_search", fake_tavily)
-    monkeypatch.setattr(srv, "TAVILY_API_KEY_ENV", "")
+    async def fake_brave_search(query, num_results, api_key):
+        contacted["brave"] = True
+        return srv._BackendOutcome(backend="brave", ok=True, state="ok")
+    monkeypatch.setattr(srv, "_brave_search", fake_brave_search)
+    monkeypatch.setattr(srv, "BRAVE_API_KEY_ENV", "brave-env")
+    monkeypatch.setattr(srv, "get_http_headers", lambda: {})
 
     result = await _call_tool("web_search", {"query": "private query", "mode": "sensitive"})
     payload = json.loads(_result_text(result))
     assert payload["status"] == "error"
     assert "no local corpus" in payload["error"]
+    assert payload["mode"] == "sensitive"
     assert payload["search_mode"] == "sensitive"
-    assert contacted == {"searxng": False, "tavily": False}
+    assert contacted == {"brave": False}
 
 
 @pytest.mark.asyncio
@@ -83,69 +87,59 @@ async def test_sensitive_mode_empty_query_still_errors(monkeypatch):
 # --------------------------------------------------------------------------- #
 
 @pytest.mark.asyncio
-async def test_maximum_recall_serially_escalates_all_providers(monkeypatch):
+async def test_maximum_recall_contacts_all_providers_in_stack(monkeypatch):
     """maximum_recall contacts every provider in the stack and merges results."""
-    monkeypatch.setattr(srv, "_PROVIDER_STACK", "searxng+tavily")
-    monkeypatch.setattr(srv, "_PROVIDERS", srv._build_provider_stack())
     contacted = []
 
-    async def fake_request(path, params, timeout=None):
-        contacted.append("searxng")
-        return {"results": [{"title": "S", "url": "https://s.example/a",
-                              "content": "s", "engine": "brave"}], "suggestions": []}
-    monkeypatch.setattr(srv, "_searxng_request", fake_request)
-    monkeypatch.setattr(srv, "TAVILY_API_KEY_ENV", "")
-
-    async def fake_tavily(query, num_results, api_key):
-        contacted.append("tavily")
-        return ([{"title": "T", "url": "https://t.example/b", "domain": "t.example",
-                  "snippet": "t", "engine": "tavily", "score": None}], True)
-    monkeypatch.setattr(srv, "_tavily_search", fake_tavily)
+    async def fake_brave_search(query, num_results, api_key):
+        contacted.append("brave")
+        return srv._BackendOutcome(
+            backend="brave", ok=True, state="ok", attempts=1,
+            results=[{"title": "B", "url": "https://b.example/a", "domain": "b.example",
+                      "snippet": "b", "engine": "brave", "provider": "brave", "score": None}],
+        )
+    monkeypatch.setattr(srv, "_brave_search", fake_brave_search)
+    monkeypatch.setattr(srv, "BRAVE_API_KEY_ENV", "brave-env")
+    monkeypatch.setattr(srv, "get_http_headers", lambda: {})
 
     result = await _call_tool("web_search", {"query": "q", "mode": "maximum_recall"})
     payload = json.loads(_result_text(result))
-    assert contacted == ["searxng", "tavily"]  # serial, both attempted
-    assert payload["attempted"] == ["searxng", "tavily"]
+    assert contacted == ["brave"]
+    assert payload["attempted"] == ["brave"]
+    assert payload["mode"] == "maximum_recall"
     assert payload["search_mode"] == "maximum_recall"
     urls = [r["url"] for r in payload["results"]]
-    assert "https://s.example/a" in urls
-    assert "https://t.example/b" in urls
+    assert "https://b.example/a" in urls
+    assert srv._telemetry.flush()
+    with sqlite3.connect(srv._telemetry.db_path) as conn:
+        persisted_mode = conn.execute(
+            "SELECT mode FROM search_events ORDER BY id DESC LIMIT 1"
+        ).fetchone()[0]
+    assert persisted_mode == "maximum_recall"
 
 
 @pytest.mark.asyncio
-async def test_maximum_recall_kagi_sonar_surfaces_answer(monkeypatch):
-    """maximum_recall on kagi+sonar merges results and surfaces Sonar's answer."""
-    monkeypatch.setattr(srv, "_PROVIDER_STACK", "kagi+sonar")
-    monkeypatch.setattr(srv, "_PROVIDERS", srv._build_provider_stack())
-    monkeypatch.setattr(srv, "KAGI_API_KEY_ENV", "kagi-key")
-    monkeypatch.setattr(srv, "PERPLEXITY_API_KEY_ENV", "px-key")
+async def test_maximum_recall_all_providers_fail_returns_structured_error(monkeypatch):
+    async def fake_brave_search(query, num_results, api_key):
+        return srv._BackendOutcome(
+            backend="brave",
+            state="error",
+            attempts=1,
+            error="HTTP 503",
+            http_status=503,
+        )
+
+    monkeypatch.setattr(srv, "_brave_search", fake_brave_search)
+    monkeypatch.setattr(srv, "BRAVE_API_KEY_ENV", "brave-env")
     monkeypatch.setattr(srv, "get_http_headers", lambda: {})
-
-    async def fake_kagi_search(query, num_results, api_key):
-        return srv._BackendOutcome(
-            backend="kagi", ok=True, state="ok",
-            results=[{"title": "K", "url": "https://k.example/", "domain": "k.example",
-                      "snippet": "k", "engine": "kagi", "provider": "kagi", "score": None}],
-        )
-    monkeypatch.setattr(srv, "_kagi_search", fake_kagi_search)
-
-    async def fake_sonar_search(query, num_results, api_key):
-        return srv._BackendOutcome(
-            backend="sonar", ok=True, state="ok", answer="Merged answer.",
-            citations=["https://s.example/cite"],
-            results=[{"title": "S", "url": "https://s.example/a", "domain": "s.example",
-                      "snippet": "s", "engine": "sonar", "provider": "sonar", "score": None}],
-        )
-    monkeypatch.setattr(srv, "_sonar_search", fake_sonar_search)
-
     result = await _call_tool("web_search", {"query": "q", "mode": "maximum_recall"})
     payload = json.loads(_result_text(result))
-    assert payload["attempted"] == ["kagi", "sonar"]
-    assert payload["answer"] == "Merged answer."
-    assert payload["citations"] == ["https://s.example/cite"]
-    urls = [r["url"] for r in payload["results"]]
-    assert "https://k.example/" in urls
-    assert "https://s.example/a" in urls
+    assert payload["status"] == "error"
+    assert payload["error"] == "Search error: all configured providers failed."
+    assert payload["text"] == payload["error"]
+    assert payload["fallback_reason"] == "brave_error"
+    assert payload["attempted"] == ["brave"]
+    assert payload["estimated_cost_usd"] == 0.005
 
 
 # --------------------------------------------------------------------------- #
@@ -154,29 +148,30 @@ async def test_maximum_recall_kagi_sonar_surfaces_answer(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_normal_mode_default_is_unchanged(monkeypatch):
-    """normal mode still routes SearXNG-first with no extra provider contact."""
+    """normal mode routes to the default (Brave) provider with no extra contact."""
     contacted = []
 
-    async def fake_request(path, params, timeout=None):
-        contacted.append("searxng")
-        return {"results": [{"title": "S", "url": "https://s.example/a",
-                              "content": "s", "engine": "brave"},
-                             {"title": "S2", "url": "https://s2.example/b",
-                              "content": "s2", "engine": "brave"},
-                             {"title": "S3", "url": "https://s3.example/c",
-                              "content": "s3", "engine": "brave"}], "suggestions": []}
-    monkeypatch.setattr(srv, "_searxng_request", fake_request)
-    monkeypatch.setattr(srv, "TAVILY_API_KEY_ENV", "")
-
-    async def fake_tavily(query, num_results, api_key):
-        contacted.append("tavily")
-        return ([], False)
-    monkeypatch.setattr(srv, "_tavily_search", fake_tavily)
+    async def fake_brave_search(query, num_results, api_key):
+        contacted.append("brave")
+        return srv._BackendOutcome(
+            backend="brave", ok=True, state="ok", attempts=1,
+            results=[
+                {"title": "B", "url": "https://b.example/a", "domain": "b.example",
+                 "snippet": "b", "engine": "brave", "provider": "brave", "score": None},
+                {"title": "B2", "url": "https://b2.example/b", "domain": "b2.example",
+                 "snippet": "b2", "engine": "brave", "provider": "brave", "score": None},
+                {"title": "B3", "url": "https://b3.example/c", "domain": "b3.example",
+                 "snippet": "b3", "engine": "brave", "provider": "brave", "score": None},
+            ],
+        )
+    monkeypatch.setattr(srv, "_brave_search", fake_brave_search)
+    monkeypatch.setattr(srv, "BRAVE_API_KEY_ENV", "brave-env")
+    monkeypatch.setattr(srv, "get_http_headers", lambda: {})
 
     result = await _call_tool("web_search", {"query": "q", "num_results": 3})
     payload = json.loads(_result_text(result))
-    assert payload["backend"] == "searxng"
-    assert contacted == ["searxng"]  # Tavily not contacted in normal mode on success
+    assert payload["backend"] == "brave"
+    assert contacted == ["brave"]
 
 
 def test_search_mode_env_default_is_normal():

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sqlite3
 from typing import Any
 
 import pytest
@@ -47,11 +48,11 @@ def _single_payload(query: str, *, status: str = "ok") -> str:
             "suggestions": [],
             "text": f"rendered text for {query}",
             "status": status,
-            "backend": "searxng",
-            "attempted": ["searxng"],
+            "backend": "brave",
+            "attempted": ["brave"],
             "fallback_reason": None,
-            "timings_ms": {"total": 1.0, "searxng": 1.0, "tavily": None},
-            "mode": "fallback",
+            "timings_ms": {"total": 1.0, "brave": 1.0},
+            "mode": "normal",
             "unresponsive_engines": [],
             "provider_states": {"searxng": "ok"},
         }
@@ -64,6 +65,8 @@ def _reset_runtime_state(monkeypatch, tmp_path):
     monkeypatch.setattr(srv, "_breaker", srv._CircuitBreaker())
     monkeypatch.setattr(srv, "_last_search", None)
     monkeypatch.setattr(srv, "_telemetry", telemetry)
+    monkeypatch.setattr(srv, "_PROVIDER_STACK", "brave")
+    monkeypatch.setattr(srv, "_PROVIDERS", srv._build_provider_stack())
     yield telemetry
     telemetry.close()
 
@@ -111,6 +114,21 @@ async def test_batch_search_rejects_invalid_input(queries, message):
 
 
 @pytest.mark.asyncio
+async def test_batch_invalid_input_uses_configured_mode(monkeypatch, _reset_runtime_state):
+    monkeypatch.setattr(srv, "_SEARCH_MODE", "maximum_recall")
+    result = await _call_tool("batch_web_search", {"queries": []})
+    payload = json.loads(_result_text(result))
+    assert payload["mode"] == "maximum_recall"
+    telemetry = _reset_runtime_state
+    assert telemetry.flush(timeout=2)
+    with sqlite3.connect(telemetry.db_path) as conn:
+        persisted_mode = conn.execute(
+            "SELECT mode FROM search_events ORDER BY id DESC LIMIT 1"
+        ).fetchone()[0]
+    assert persisted_mode == "maximum_recall"
+
+
+@pytest.mark.asyncio
 async def test_batch_search_bounds_concurrency(monkeypatch):
     active = 0
     maximum = 0
@@ -138,6 +156,7 @@ async def test_batch_search_returns_partial_results_at_shared_deadline(
     monkeypatch, _reset_runtime_state
 ):
     monkeypatch.setattr(srv, "SEARCH_TOTAL_TIMEOUT", 0.05)
+    monkeypatch.setattr(srv, "_SEARCH_MODE", "sensitive")
 
     async def fake_search(query: str, num_results: int = 8) -> str:
         if query == "fast":
@@ -157,10 +176,16 @@ async def test_batch_search_returns_partial_results_at_shared_deadline(
     assert [item["status"] for item in payload["results"]] == ["ok", "timeout", "timeout"]
     assert all("batch deadline exceeded" in item.get("error", "") for item in payload["results"][1:])
     assert all(item["fallback_reason"] == "batch_deadline" for item in payload["results"][1:])
+    assert all(item["mode"] == "sensitive" for item in payload["results"][1:])
     telemetry = _reset_runtime_state
     assert telemetry.flush(timeout=2)
     stats = telemetry.stats("24h")
     assert stats["searches"]["statuses"]["timeout"] == 2
+    with sqlite3.connect(telemetry.db_path) as conn:
+        timeout_modes = conn.execute(
+            "SELECT mode FROM search_events WHERE fallback_reason = 'batch_deadline'"
+        ).fetchall()
+    assert timeout_modes == [("sensitive",), ("sensitive",)]
 
 
 @pytest.mark.asyncio
@@ -207,11 +232,20 @@ async def test_batch_search_reuses_provider_policy_and_telemetry_stays_query_fre
             "suggestions": [],
         }
 
-    monkeypatch.setattr(srv, "_searxng_request", fake_request)
+    async def fake_brave_search(query, num_results, api_key):
+        return srv._BackendOutcome(
+            backend="brave", ok=True, state="ok",
+            results=[{"title": "Result", "url": f"https://example.com/{query}",
+                      "domain": "example.com", "snippet": "ok",
+                      "engine": "brave", "provider": "brave", "score": None}],
+        )
+    monkeypatch.setattr(srv, "_brave_search", fake_brave_search)
+    monkeypatch.setattr(srv, "BRAVE_API_KEY_ENV", "brave-env")
+    monkeypatch.setattr(srv, "get_http_headers", lambda: {})
     result = await _call_tool("batch_web_search", {"queries": secrets})
     payload = json.loads(_result_text(result))
     assert payload["status"] == "ok"
-    assert all(item["backend"] == "searxng" for item in payload["results"])
+    assert all(item["backend"] == "brave" for item in payload["results"])
 
     telemetry = _reset_runtime_state
     assert telemetry.flush(timeout=2)

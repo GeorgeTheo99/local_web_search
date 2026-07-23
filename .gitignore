@@ -13,6 +13,12 @@ searxng/src/
 data/*.sqlite3*
 data/install.env
 
+# Provider API keys (mode-0600 secret files, never committed)
+data/*_key
+data/brave_key
+data/kagi_key
+data/perplexity_key
+
 # pytest
 .pytest_cache/
 

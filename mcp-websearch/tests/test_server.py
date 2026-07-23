@@ -5,8 +5,8 @@ Covers:
     link-local, IPv6 local, localhost domains, redirect-to-private; allows
     public hosts.
   - web_fetch tool error contract for rejected URLs.
-  - web_search error payload shape when SearXNG is unreachable.
-  - web_search success payload shape (mocked SearXNG) matches the contract
+  - web_search error payload shape when Brave fails.
+  - web_search success payload shape (mocked Brave) matches the contract
     that Home Automation's McpSearchProvider expects (result.content[].text
     is JSON with results/suggestions/text).
 
@@ -66,13 +66,39 @@ def _result_text(result: Any) -> str:
     return json.dumps(result, default=str)
 
 
+def _brave_outcome(results=None, *, state="ok", **extra) -> srv._BackendOutcome:
+    """Build a Brave _BackendOutcome with normalized results."""
+    if results is None:
+        results = []
+    return srv._BackendOutcome(
+        backend="brave",
+        ok=state in {"ok", "empty"},
+        state=state,
+        results=results,
+        attempts=extra.pop("attempts", 1),
+        **extra,
+    )
+
+
 @pytest.fixture(autouse=True)
 def _reset_runtime_state(monkeypatch, tmp_path):
-    """Keep breaker, diagnostics, and telemetry isolated between tests."""
+    """Keep breaker, diagnostics, and telemetry isolated between tests.
+
+    Pin the provider stack to the default Brave stack. Tests that need a
+    different stack (e.g. searxng) monkeypatch _PROVIDER_STACK and
+    _PROVIDERS explicitly.
+    """
     telemetry = srv.TelemetryStore(tmp_path / "telemetry")
     monkeypatch.setattr(srv, "_breaker", srv._CircuitBreaker())
     monkeypatch.setattr(srv, "_last_search", None)
     monkeypatch.setattr(srv, "_telemetry", telemetry)
+    monkeypatch.setattr(srv, "_PROVIDER_STACK", "brave")
+    monkeypatch.setattr(srv, "_PROVIDERS", srv._build_provider_stack())
+    monkeypatch.setattr(srv, "BRAVE_API_KEY_ENV", "brave-env")
+    monkeypatch.setattr(srv, "get_http_headers", lambda: {})
+    # Isolate the Brave secret file to a tmp dir so real filesystem state can't leak in.
+    monkeypatch.setattr(srv, "LOCAL_SEARCH_DATA_DIR", tmp_path)
+    monkeypatch.setattr(srv, "_BRAVE_SECRET_FILE", tmp_path / "brave_key")
 
     async def test_public_fetch_client():
         return await srv._client()
@@ -660,17 +686,12 @@ async def test_web_fetch_rejects_binary_mislabeled_as_text(monkeypatch):
 # --------------------------------------------------------------------------- #
 
 @pytest.mark.asyncio
-async def test_web_search_error_payload_when_searxng_down(monkeypatch):
-    """When SearXNG is unreachable and Tavily also fails, the tool returns a
-    structured error payload (not an exception) with the keys consumers expect."""
-    async def fake_searxng(path, params, timeout=None):
-        return None
-    monkeypatch.setattr(srv, "_searxng_request", fake_searxng)
-    monkeypatch.setattr(srv, "TAVILY_API_KEY_ENV", "")
-    async def fake_tavily(query, num_results, api_key):
-        # Keyless path attempted, but simulate Tavily failure.
-        return [], False
-    monkeypatch.setattr(srv, "_tavily_search", fake_tavily)
+async def test_web_search_error_payload_when_brave_fails(monkeypatch):
+    """When Brave fails (no fallback configured), the tool returns a structured
+    error payload (not an exception) with the keys consumers expect."""
+    async def fake_brave_search(query, num_results, api_key):
+        return srv._BackendOutcome(backend="brave", state="error", error="boom")
+    monkeypatch.setattr(srv, "_brave_search", fake_brave_search)
     result = await _call_tool("web_search", {"query": "test", "num_results": 3})
     payload = json.loads(_result_text(result))
     assert payload["query"] == "test"
@@ -683,7 +704,7 @@ async def test_web_search_error_payload_when_searxng_down(monkeypatch):
 async def test_web_search_rejects_oversized_query_before_provider_access(monkeypatch):
     monkeypatch.setattr(
         srv,
-        "_searxng_search",
+        "_brave_search",
         lambda *_args: (_ for _ in ()).throw(AssertionError("provider must not run")),
     )
     secret_suffix = "PRIVATE_SUFFIX"
@@ -709,18 +730,19 @@ def test_public_result_urls_reject_noncanonical_private_ip_literals():
         ) is None
 
 
-def test_tavily_base_url_requires_credential_free_https(monkeypatch):
-    assert srv._tavily_search_url() == "https://api.tavily.com/search"
+@pytest.mark.asyncio
+async def test_brave_base_url_requires_credential_free_https(monkeypatch):
+    assert srv._brave_search_url() == "https://api.search.brave.com/res/v1/web/search"
     for invalid in (
-        "http://api.tavily.com",
-        "https://user:pass@api.tavily.com",
-        "https://api.tavily.com/v1",
-        "https://api.tavily.com:bad",
-        "https://api.tavily.com?token=secret",
+        "http://api.search.brave.com",
+        "https://user:pass@api.search.brave.com",
+        "https://api.search.brave.com/v1",
+        "https://api.search.brave.com:bad",
+        "https://api.search.brave.com?token=secret",
     ):
-        monkeypatch.setattr(srv, "TAVILY_BASE_URL", invalid)
+        monkeypatch.setattr(srv, "BRAVE_BASE_URL", invalid)
         with pytest.raises(ValueError, match="credential-free HTTPS"):
-            srv._tavily_search_url()
+            srv._brave_search_url()
 
 
 @pytest.mark.asyncio
@@ -758,7 +780,7 @@ async def test_search_provider_requests_disable_compression(monkeypatch):
             200,
             headers={"Content-Type": "application/json"},
             stream=srv.httpx.ByteStream(
-                b'{"results": [{"title": "safe", "url": "https://example.com/"}]}'
+                b'{"web": {"results": [{"title": "safe", "url": "https://example.com/"}]}}'
             ),
         )
 
@@ -768,45 +790,36 @@ async def test_search_provider_requests_disable_compression(monkeypatch):
         return client
 
     monkeypatch.setattr(srv, "_client", fake_client)
-    monkeypatch.setattr(srv, "TAVILY_BASE_URL", "https://api.tavily.com")
     try:
         searxng = await srv._searxng_request("/search", {"q": "test"})
-        tavily = await srv._tavily_search("test", 1, "")
+        brave = await srv._brave_search("test", 1, "brave-key")
     finally:
         await client.aclose()
 
     assert searxng.data == {"results": []}
-    assert tavily.state == "ok"
-    assert seen == [("/search", "identity"), ("/search", "identity")]
+    assert brave.state == "ok"
+    assert seen == [("/search", "identity"), ("/res/v1/web/search", "identity")]
 
 
 @pytest.mark.asyncio
-async def test_web_search_filters_unsafe_urls_and_falls_back_when_none_are_usable(monkeypatch):
-    monkeypatch.setattr(srv, "TAVILY_MODE", "fallback")
-
-    async def fake_request(path, params, timeout=None):
-        return {
-            "results": [
-                {"title": "relative", "url": "/private", "content": "bad"},
-                {"title": "script", "url": "javascript:alert(1)", "content": "bad"},
-                {"title": "local", "url": "http://127.0.0.1/secret", "content": "bad"},
-                {"title": "short local", "url": "http://127.1/secret", "content": "bad"},
-            ],
-            "unresponsive_engines": [["duckduckgo", "blocked"]],
-        }
-
-    async def fake_tavily(query, num_results, api_key):
-        return [
-            {"title": "safe", "url": "https://example.com/", "content": "good"},
-            {"title": "credential", "url": "https://u:p@example.com/private", "content": "bad"},
-        ], True
-
-    monkeypatch.setattr(srv, "_searxng_request", fake_request)
-    monkeypatch.setattr(srv, "_tavily_search", fake_tavily)
+async def test_web_search_filters_unsafe_urls_and_errors_when_none_are_usable(monkeypatch):
+    async def fake_brave_search(query, num_results, api_key):
+        return _brave_outcome([
+            {"title": "relative", "url": "/private", "snippet": "bad",
+             "domain": None, "engine": "brave", "provider": "brave", "score": None},
+            {"title": "script", "url": "javascript:alert(1)", "snippet": "bad",
+             "domain": None, "engine": "brave", "provider": "brave", "score": None},
+            {"title": "local", "url": "http://127.0.0.1/secret", "snippet": "bad",
+             "domain": "127.0.0.1", "engine": "brave", "provider": "brave", "score": None},
+            {"title": "short local", "url": "http://127.1/secret", "snippet": "bad",
+             "domain": "127.1", "engine": "brave", "provider": "brave", "score": None},
+        ])
+    monkeypatch.setattr(srv, "_brave_search", fake_brave_search)
     result = await _call_tool("web_search", {"query": "safe sources", "num_results": 5})
     payload = json.loads(_result_text(result))
-    assert payload["attempted"] == ["searxng", "tavily"]
-    assert [item["url"] for item in payload["results"]] == ["https://example.com/"]
+    assert payload["attempted"] == ["brave"]
+    # All results filtered as unsafe → empty results.
+    assert [item["url"] for item in payload["results"]] == []
 
 
 @pytest.mark.asyncio
@@ -830,15 +843,14 @@ async def test_web_search_success_payload_shape(monkeypatch):
     """Success payload matches the contract Home Automation's McpSearchProvider
     relies on: result.content[].text is JSON with results/suggestions/text,
     and each result has rank/title/url/domain/snippet/engine."""
-    async def fake_request(path, params, timeout=None):
-        return {
-            "results": [
-                {"title": "Example", "url": "https://example.com/a", "content": "snippet a", "engine": "brave"},
-                {"title": "Other", "url": "https://other.com/b", "content": "snippet b", "engine": "qwant"},
-            ],
-            "suggestions": ["related"],
-        }
-    monkeypatch.setattr(srv, "_searxng_request", fake_request)
+    async def fake_brave_search(query, num_results, api_key):
+        return _brave_outcome([
+            {"title": "Example", "url": "https://example.com/a", "snippet": "snippet a",
+             "domain": "example.com", "engine": "brave", "provider": "brave", "score": None},
+            {"title": "Other", "url": "https://other.com/b", "snippet": "snippet b",
+             "domain": "other.com", "engine": "brave", "provider": "brave", "score": None},
+        ])
+    monkeypatch.setattr(srv, "_brave_search", fake_brave_search)
     result = await _call_tool("web_search", {"query": "hello", "num_results": 8})
     payload = json.loads(_result_text(result))
     assert payload["query"] == "hello"
@@ -847,45 +859,19 @@ async def test_web_search_success_payload_shape(monkeypatch):
     for key in ("rank", "title", "url", "domain", "snippet", "engine"):
         assert key in first
     assert first["domain"] == "example.com"
-    assert payload["suggestions"] == ["related"]
+    assert payload["suggestions"] == []
     assert "## Search: hello" in payload["text"]
 
+
 @pytest.mark.asyncio
-async def test_web_search_empty_results_surfaces_unresponsive_engines(monkeypatch):
-    """When SearXNG returns empty with unresponsive engines AND Tavily keyless
-    also returns empty, the unresponsive-engine detail is preserved in text."""
-    async def fake_request(path, params, timeout=None):
-        return {"results": [], "suggestions": [], "unresponsive_engines": [{"name": "brave"}]}
-    monkeypatch.setattr(srv, "_searxng_request", fake_request)
-    monkeypatch.setattr(srv, "TAVILY_API_KEY_ENV", "")
-    # Tavily keyless returns empty too.
-    async def fake_tavily(query, num_results, api_key):
-        return [], True
-    monkeypatch.setattr(srv, "_tavily_search", fake_tavily)
+async def test_web_search_empty_results_returns_empty(monkeypatch):
+    async def fake_brave_search(query, num_results, api_key):
+        return _brave_outcome([], state="empty")
+    monkeypatch.setattr(srv, "_brave_search", fake_brave_search)
     result = await _call_tool("web_search", {"query": "x"})
     payload = json.loads(_result_text(result))
     assert payload["results"] == []
-    # Both backends empty → returns _format_results empty (no engine_msg),
-    # but the keyless path was attempted. Verify no crash + empty payload.
     assert "No results found" in payload["text"]
-
-@pytest.mark.asyncio
-async def test_searxng_empty_unresponsive_shown_when_tavily_unreachable(monkeypatch):
-    """When SearXNG is empty (with unresponsive engines) and Tavily FAILS,
-    the SearXNG unresponsive-engine detail is surfaced (SearXNG was the only
-    reachable source)."""
-    async def fake_searxng(path, params, timeout=None):
-        return {"results": [], "suggestions": [], "unresponsive_engines": [{"name": "brave"}]}
-    monkeypatch.setattr(srv, "_searxng_request", fake_searxng)
-    monkeypatch.setattr(srv, "TAVILY_API_KEY_ENV", "")
-    async def fake_tavily(query, num_results, api_key):
-        return [], False  # Tavily fails
-    monkeypatch.setattr(srv, "_tavily_search", fake_tavily)
-    result = await _call_tool("web_search", {"query": "x"})
-    payload = json.loads(_result_text(result))
-    # SearXNG was ok=True (reachable, just empty) + Tavily failed → both
-    # reachable-but-empty branch does NOT apply; falls to error payload.
-    assert "error" in payload or "No results" in payload["text"]
 
 
 # --------------------------------------------------------------------------- #
@@ -894,169 +880,56 @@ async def test_searxng_empty_unresponsive_shown_when_tavily_unreachable(monkeypa
 
 @pytest.mark.asyncio
 async def test_success_payload_includes_provider_metadata(monkeypatch):
-    async def fake_request(path, params, timeout=None):
-        return {
-            "results": [{"title": "S", "url": "https://s.example/a", "content": "s", "engine": "brave"}],
-            "suggestions": [],
-        }
-    monkeypatch.setattr(srv, "_searxng_request", fake_request)
+    async def fake_brave_search(query, num_results, api_key):
+        return _brave_outcome([
+            {"title": "B", "url": "https://b.example/a", "snippet": "s",
+             "domain": "b.example", "engine": "brave", "provider": "brave", "score": None},
+        ])
+    monkeypatch.setattr(srv, "_brave_search", fake_brave_search)
     result = await _call_tool("web_search", {"query": "q", "num_results": 3})
     payload = json.loads(_result_text(result))
     assert payload["status"] == "ok"
-    assert payload["backend"] == "searxng"
-    assert payload["attempted"] == ["searxng"]
+    assert payload["backend"] == "brave"
+    assert payload["attempted"] == ["brave"]
     assert payload["fallback_reason"] is None
-    assert set(payload["timings_ms"]) == {"total", "searxng", "tavily"}
-    assert payload["mode"] == "fallback"
-    assert payload["provider_states"] == {"searxng": "ok"}
+    assert set(payload["timings_ms"]) == {"total", "brave"}
+    assert payload["provider_states"] == {"brave": "ok"}
     assert "query" not in srv._last_search
     assert srv._last_search["result_count"] == 1
 
 
 @pytest.mark.asyncio
-async def test_tavily_disabled_never_resolves_key_or_egresses(monkeypatch):
-    monkeypatch.setattr(srv, "TAVILY_MODE", "disabled")
-    async def fake_request(path, params, timeout=None):
-        return {"results": [], "suggestions": []}
-    monkeypatch.setattr(srv, "_searxng_request", fake_request)
-    monkeypatch.setattr(
-        srv,
-        "_resolve_tavily_key",
-        lambda: (_ for _ in ()).throw(AssertionError("Tavily key must not be resolved")),
-    )
-    result = await _call_tool("web_search", {"query": "private query"})
-    payload = json.loads(_result_text(result))
-    assert payload["status"] == "empty"
-    assert payload["attempted"] == ["searxng"]
-    assert payload["mode"] == "disabled"
-
-
-@pytest.mark.asyncio
-async def test_tavily_disabled_surfaces_searxng_degradation(monkeypatch):
-    monkeypatch.setattr(srv, "TAVILY_MODE", "disabled")
-    async def fake_request(path, params, timeout=None):
-        return {"results": [], "suggestions": [], "unresponsive_engines": [["brave", "rate limited"]]}
-    monkeypatch.setattr(srv, "_searxng_request", fake_request)
-    result = await _call_tool("web_search", {"query": "private query"})
-    payload = json.loads(_result_text(result))
-    assert payload["status"] == "degraded"
-    assert payload["attempted"] == ["searxng"]
-    assert payload["fallback_reason"] == "searxng_degraded"
-
-
-@pytest.mark.asyncio
-async def test_fallback_mode_keeps_degraded_nonempty_results_local(monkeypatch):
-    monkeypatch.setattr(srv, "TAVILY_MODE", "fallback")
-
-    async def fake_request(path, params, timeout=None):
-        return {
-            "results": [
-                {"title": f"Local result {index}", "url": f"https://local.example/{index}", "content": "result", "engine": "bing"}
-                for index in range(5)
-            ],
-            "suggestions": [],
-            "unresponsive_engines": [["duckduckgo", "blocked"]],
-        }
-
-    async def fail_tavily(*_args):
-        raise AssertionError("fallback mode must not egress when local results exist")
-
-    monkeypatch.setattr(srv, "_searxng_request", fake_request)
-    monkeypatch.setattr(srv, "_tavily_search", fail_tavily)
-    result = await _call_tool("web_search", {"query": "town zoning", "num_results": 5})
-    payload = json.loads(_result_text(result))
-    assert payload["status"] == "degraded"
-    assert payload["attempted"] == ["searxng"]
-    assert payload["fallback_reason"] is None
-    assert payload["backend"] == "searxng"
-    assert len(payload["results"]) == 5
-
-
-@pytest.mark.asyncio
-async def test_supplement_mode_combines_dedupes_and_overfetches(monkeypatch):
-    monkeypatch.setattr(srv, "TAVILY_MODE", "supplement")
-    monkeypatch.setattr(srv, "SUPPLEMENT_MIN_RESULTS", 3)
-    async def fake_request(path, params, timeout=None):
-        return {
-            "results": [{"title": "S", "url": "https://example.com/a?utm_source=x", "content": "s", "engine": "brave"}],
-            "suggestions": ["related"],
-        }
-    monkeypatch.setattr(srv, "_searxng_request", fake_request)
-    seen = {}
-    async def fake_tavily(query, num_results, api_key):
-        seen["num_results"] = num_results
-        return [
-            {"title": "duplicate", "url": "https://example.com/a", "domain": "example.com", "snippet": "d", "engine": "tavily", "score": 0.9},
-            {"title": "T", "url": "https://t.example/b", "domain": "t.example", "snippet": "t", "engine": "tavily", "score": 0.8},
-        ], True
-    monkeypatch.setattr(srv, "_tavily_search", fake_tavily)
-    result = await _call_tool("web_search", {"query": "q", "num_results": 3})
-    payload = json.loads(_result_text(result))
-    assert seen["num_results"] == 6
-    assert [item["url"] for item in payload["results"]] == [
-        "https://example.com/a?utm_source=x",
-        "https://t.example/b",
-    ]
-    assert payload["status"] == "degraded"
-    assert payload["backend"] == "searxng+tavily"
-    assert payload["fallback_reason"] == "below_minimum"
-    assert payload["attempted"] == ["searxng", "tavily"]
-
-
-@pytest.mark.asyncio
-async def test_searxng_stage_timeout_still_reaches_tavily(monkeypatch):
-    monkeypatch.setattr(srv, "SEARCH_TIMEOUT", 0.01)
-    async def slow_searxng(query, num_results):
-        await asyncio.sleep(0.1)
-        return srv._BackendOutcome(backend="searxng", ok=True, state="empty")
-    async def fake_tavily(query, num_results, api_key):
-        return [{"title": "T", "url": "https://t.example/", "domain": "t.example", "snippet": "t", "engine": "tavily", "score": None}], True
-    monkeypatch.setattr(srv, "_searxng_search", slow_searxng)
-    monkeypatch.setattr(srv, "_tavily_search", fake_tavily)
-    result = await _call_tool("web_search", {"query": "q", "num_results": 1})
-    payload = json.loads(_result_text(result))
-    assert payload["status"] == "degraded"
-    assert payload["backend"] == "tavily"
-    assert payload["fallback_reason"] == "searxng_timeout"
-    assert payload["timings_ms"]["total"] < 1000
-
-
-@pytest.mark.asyncio
 async def test_degraded_is_distinct_from_empty_and_error(monkeypatch):
-    async def fake_request(path, params, timeout=None):
-        return {"results": [], "suggestions": [], "unresponsive_engines": [["brave", "rate limited"]]}
-    async def fake_tavily(query, num_results, api_key):
-        return [], False
-    monkeypatch.setattr(srv, "_searxng_request", fake_request)
-    monkeypatch.setattr(srv, "_tavily_search", fake_tavily)
+    """Brave error state surfaces as error (no fallback provider exists)."""
+    async def fake_brave_search(query, num_results, api_key):
+        return srv._BackendOutcome(backend="brave", state="error", error="boom")
+    monkeypatch.setattr(srv, "_brave_search", fake_brave_search)
     result = await _call_tool("web_search", {"query": "q"})
     payload = json.loads(_result_text(result))
-    assert payload["status"] == "degraded"
-    assert "error" not in payload
-    assert payload["unresponsive_engines"] == [["brave", "rate limited"]]
-    assert payload["provider_states"] == {"searxng": "degraded", "tavily": "error"}
+    assert payload["status"] == "error"
+    assert "error" in payload
+    assert payload["provider_states"] == {"brave": "error"}
 
 
 @pytest.mark.asyncio
-async def test_health_reflects_recent_provider_failure(monkeypatch):
-    async def reachable():
-        return {"reachable": True, "latency_ms": 1.0}
-    monkeypatch.setattr(srv, "_probe_searxng", reachable)
+async def test_health_readiness_recovers_after_recent_provider_failure(monkeypatch):
+    async def unavailable():
+        return {"reachable": False, "latency_ms": 1.0}
+
+    monkeypatch.setattr(srv, "_probe_searxng", unavailable)
     monkeypatch.setattr(
         srv,
         "_last_search",
         {
-            "status": "degraded",
-            "provider_states": {"searxng": "degraded", "tavily": "error"},
+            "status": "error",
+            "provider_states": {"brave": "error"},
         },
     )
     health = await srv._health_payload()
+    # Readiness is current credential/circuit state, not stale last-search state.
     assert health["ready"] is True
     assert health["status"] == "degraded"
-    assert health["searxng"]["available"] is True
-    assert health["tavily"]["available"] is False
-    assert health["tavily"]["keyless_available"] is False
-    assert health["tavily"]["last_state"] == "error"
+    assert "searxng" in health
 
 
 @pytest.mark.asyncio
@@ -1065,30 +938,75 @@ async def test_health_exposes_provider_stack_and_providers(monkeypatch):
     async def reachable():
         return {"reachable": True, "latency_ms": 1.0}
     monkeypatch.setattr(srv, "_probe_searxng", reachable)
-    monkeypatch.setattr(srv, "TAVILY_API_KEY_ENV", "")
     health = await srv._health_payload()
-    assert health["provider_stack"] == "searxng+tavily"
+    assert health["provider_stack"] == "brave"
     names = [p["name"] for p in health["providers"]]
-    assert names == ["searxng", "tavily"]
+    assert names == ["brave"]
     assert all("credential_configured" in p for p in health["providers"])
     assert all("circuit" in p for p in health["providers"])
 
 
 @pytest.mark.asyncio
-async def test_health_provider_stack_reflects_kagi_sonar(monkeypatch):
-    monkeypatch.setattr(srv, "_PROVIDER_STACK", "kagi+sonar")
+async def test_searxng_web_stack_rejects_non_loopback_url_without_request(monkeypatch):
+    monkeypatch.setattr(srv, "_PROVIDER_STACK", "searxng")
     monkeypatch.setattr(srv, "_PROVIDERS", srv._build_provider_stack())
-    monkeypatch.setattr(srv, "KAGI_API_KEY_ENV", "kagi-key")
-    monkeypatch.setattr(srv, "PERPLEXITY_API_KEY_ENV", "")
+    monkeypatch.setattr(srv, "SEARXNG_URL", "https://search.example.com")
+
+    async def forbidden_request(*args, **kwargs):
+        raise AssertionError("non-loopback SearXNG must not be contacted")
+
+    monkeypatch.setattr(srv, "_searxng_request", forbidden_request)
+    result = await _call_tool("web_search", {"query": "q"})
+    payload = json.loads(_result_text(result))
+    assert payload["status"] == "error"
+    assert payload["provider_states"] == {"searxng": "error"}
+    assert payload["attempted"] == []
+    assert payload["estimated_cost_usd"] == 0.0
+
+
+@pytest.mark.asyncio
+async def test_searxng_health_rejects_non_loopback_url_without_probe(monkeypatch):
+    monkeypatch.setattr(srv, "_PROVIDER_STACK", "searxng")
+    monkeypatch.setattr(srv, "_PROVIDERS", srv._build_provider_stack())
+    monkeypatch.setattr(srv, "SEARXNG_URL", "https://search.example.com")
+
+    async def forbidden_client():
+        raise AssertionError("non-loopback SearXNG health must not be contacted")
+
+    monkeypatch.setattr(srv, "_client", forbidden_client)
+    health = await srv._health_payload()
+    assert health["ready"] is False
+    assert health["status"] == "down"
+    assert health["searxng"]["reachable"] is False
+    assert health["searxng"]["error"] == "SearXNG URL is not loopback"
+
+
+@pytest.mark.asyncio
+async def test_health_brave_stack_requires_brave_credential_even_when_searxng_is_healthy(monkeypatch):
+    async def reachable():
+        return {"reachable": True, "latency_ms": 1.0}
+
+    monkeypatch.setattr(srv, "_probe_searxng", reachable)
+    monkeypatch.setattr(srv, "BRAVE_API_KEY_ENV", "")
     monkeypatch.setattr(srv, "get_http_headers", lambda: {})
     health = await srv._health_payload()
-    assert health["provider_stack"] == "kagi+sonar"
+    assert health["provider_stack"] == "brave"
+    assert health["searxng"]["available"] is True
+    assert health["ready"] is False
+    assert health["status"] == "down"
+
+
+@pytest.mark.asyncio
+async def test_health_searxng_stack_reports_searxng_provider(monkeypatch):
+    monkeypatch.setattr(srv, "_PROVIDER_STACK", "searxng")
+    monkeypatch.setattr(srv, "_PROVIDERS", srv._build_provider_stack())
+    async def reachable():
+        return {"reachable": True, "latency_ms": 1.0}
+    monkeypatch.setattr(srv, "_probe_searxng", reachable)
+    health = await srv._health_payload()
+    assert health["provider_stack"] == "searxng"
     names = [p["name"] for p in health["providers"]]
-    assert names == ["kagi", "sonar"]
-    kagi = next(p for p in health["providers"] if p["name"] == "kagi")
-    sonar = next(p for p in health["providers"] if p["name"] == "sonar")
-    assert kagi["credential_configured"] is True
-    assert sonar["credential_configured"] is False
+    assert names == ["searxng"]
 
 
 @pytest.mark.asyncio
@@ -1096,11 +1014,13 @@ async def test_readiness_and_health_expose_safe_state(monkeypatch):
     async def unavailable():
         return {"reachable": False, "latency_ms": 1.0}
     monkeypatch.setattr(srv, "_probe_searxng", unavailable)
-    monkeypatch.setattr(srv, "TAVILY_MODE", "disabled")
+    # No Brave credential configured → not ready.
+    monkeypatch.setattr(srv, "BRAVE_API_KEY_ENV", "")
+    monkeypatch.setattr(srv, "get_http_headers", lambda: {})
     health = await srv._health_payload()
     assert health["ready"] is False
     assert health["status"] == "down"
-    assert health["policy"]["tavily_mode"] == "disabled"
+    assert "tavily_mode" not in health["policy"]
     response = await srv.ready(None)
     assert response.status_code == 503
     assert b'"ready":false' in response.body
@@ -1111,11 +1031,11 @@ async def test_circuit_breaker_admits_one_half_open_probe(monkeypatch):
     monkeypatch.setattr(srv, "BREAKER_COOLDOWN", 10.0)
     monkeypatch.setattr(srv.time, "monotonic", lambda: 20.0)
     breaker = srv._CircuitBreaker()
-    breaker._tripped["searxng"] = 0.0
-    breaker._fails["searxng"] = 3
-    assert breaker.allow("searxng") is True
-    assert breaker.allow("searxng") is False
-    assert breaker.snapshot("searxng")["state"] == "half_open"
+    breaker._tripped["brave"] = 0.0
+    breaker._fails["brave"] = 3
+    assert breaker.allow("brave") is True
+    assert breaker.allow("brave") is False
+    assert breaker.snapshot("brave")["state"] == "half_open"
 
 
 def test_circuit_breaker_reports_one_atomic_open_transition(monkeypatch):
@@ -1124,10 +1044,10 @@ def test_circuit_breaker_reports_one_atomic_open_transition(monkeypatch):
     monkeypatch.setattr(srv, "BREAKER_FAIL_THRESHOLD", 2)
     breaker = srv._CircuitBreaker()
     with ThreadPoolExecutor(max_workers=8) as executor:
-        transitions = list(executor.map(lambda _: breaker.record_failure("tavily"), range(20)))
+        transitions = list(executor.map(lambda _: breaker.record_failure("brave"), range(20)))
     assert transitions.count("opened") == 1
     assert transitions.count("reopened") == 0
-    assert breaker.snapshot("tavily")["state"] == "open"
+    assert breaker.snapshot("brave")["state"] == "open"
 
 
 # --------------------------------------------------------------------------- #
@@ -1141,20 +1061,13 @@ async def test_search_telemetry_never_persists_query_or_result_content(monkeypat
     secret_query = "SECRET_QUERY_4cb09b"
     secret_result = "SECRET_RESULT_78a2f1"
 
-    async def fake_request(path, params, timeout=None):
-        return {
-            "results": [
-                {
-                    "title": secret_result,
-                    "url": f"https://example.com/{secret_result}",
-                    "content": secret_result,
-                    "engine": "brave",
-                }
-            ],
-            "suggestions": [secret_result],
-        }
-
-    monkeypatch.setattr(srv, "_searxng_request", fake_request)
+    async def fake_brave_search(query, num_results, api_key):
+        return _brave_outcome([
+            {"title": secret_result, "url": f"https://example.com/{secret_result}",
+             "snippet": secret_result, "domain": "example.com",
+             "engine": "brave", "provider": "brave", "score": None},
+        ])
+    monkeypatch.setattr(srv, "_brave_search", fake_brave_search)
     result = await _call_tool("web_search", {"query": secret_query, "num_results": 3})
     assert secret_query in _result_text(result)
     assert srv._telemetry.flush()
@@ -1181,49 +1094,20 @@ async def test_search_telemetry_never_persists_query_or_result_content(monkeypat
 
 
 @pytest.mark.asyncio
-async def test_stats_aggregates_degradation_tavily_429_and_fallback(monkeypatch):
+async def test_stats_aggregates_provider_states(monkeypatch):
     from types import SimpleNamespace
 
-    async def fake_request(path, params, timeout=None):
-        return {
-            "results": [],
-            "suggestions": [],
-            "unresponsive_engines": [["bing", "too many requests"]],
-        }
-
-    async def fake_tavily(query, num_results, api_key):
-        return srv._BackendOutcome(
-            backend="tavily",
-            state="error",
-            attempts=1,
-            elapsed_ms=4.0,
-            error="HTTP 429",
-            http_status=429,
-            credential_mode="keyless",
-            circuit_before="closed",
-            circuit_after="open",
-            circuit_transition="opened",
-            circuit_failures=3,
-        )
-
-    monkeypatch.setattr(srv, "_searxng_request", fake_request)
-    monkeypatch.setattr(srv, "_tavily_search", fake_tavily)
+    async def fake_brave_search(query, num_results, api_key):
+        return srv._BackendOutcome(backend="brave", state="error", error="boom", attempts=1)
+    monkeypatch.setattr(srv, "_brave_search", fake_brave_search)
     await _call_tool("web_search", {"query": "not stored"})
 
     response = await srv.stats(SimpleNamespace(query_params={"window": "24h"}))
     payload = json.loads(response.body)
     assert response.status_code == 200
     assert payload["searches"]["total"] == 1
-    assert payload["fallback"]["searches"] == 1
-    assert payload["providers"]["searxng"]["states"] == {"degraded": 1}
-    assert payload["providers"]["tavily"]["attempts"] == 1
-    assert payload["providers"]["tavily"]["errors"] == 1
-    assert payload["providers"]["tavily"]["rate_limited_429s"] == 1
-    assert payload["providers"]["tavily"]["circuit_trips"] == 1
-    assert payload["searxng_engine_failures"] == [
-        {"engine": "bing", "reason": "rate_limited", "count": 1}
-    ]
-    assert payload["providers"]["tavily"]["credit_usage"]["available"] is False
+    assert payload["providers"]["brave"]["attempts"] == 1
+    assert payload["providers"]["brave"]["errors"] == 1
 
 
 @pytest.mark.asyncio
@@ -1242,15 +1126,12 @@ async def test_unavailable_telemetry_never_breaks_search(monkeypatch, tmp_path):
     unavailable = srv.TelemetryStore(tmp_path / "disabled", enabled=False)
     monkeypatch.setattr(srv, "_telemetry", unavailable)
 
-    async def fake_request(path, params, timeout=None):
-        return {
-            "results": [
-                {"title": "S", "url": "https://example.com/", "content": "ok", "engine": "brave"}
-            ],
-            "suggestions": [],
-        }
-
-    monkeypatch.setattr(srv, "_searxng_request", fake_request)
+    async def fake_brave_search(query, num_results, api_key):
+        return _brave_outcome([
+            {"title": "B", "url": "https://example.com/", "snippet": "ok",
+             "domain": "example.com", "engine": "brave", "provider": "brave", "score": None},
+        ])
+    monkeypatch.setattr(srv, "_brave_search", fake_brave_search)
     result = await _call_tool("web_search", {"query": "still works"})
     assert json.loads(_result_text(result))["status"] == "ok"
     response = await srv.stats(SimpleNamespace(query_params={"window": "24h"}))
@@ -1268,7 +1149,7 @@ async def test_tools_list_exposes_expected_tools():
     async with Client(srv.mcp) as client:
         tools = await client.list_tools()
     names = {t.name for t in tools}
-    assert names == {"web_search", "batch_web_search", "image_search", "web_fetch", "answer_search", "verify_url"}
+    assert names == {"web_search", "batch_web_search", "image_search", "web_fetch", "verify_url"}
     batch_tool = next(tool for tool in tools if tool.name == "batch_web_search")
     batch_schema = batch_tool.model_dump(by_alias=True)["inputSchema"]
     assert batch_schema["required"] == ["queries"]
@@ -1290,123 +1171,22 @@ async def test_tools_list_exposes_expected_tools():
 
 
 # --------------------------------------------------------------------------- #
-# Tavily failover.
-# --------------------------------------------------------------------------- #
-
-@pytest.mark.asyncio
-async def test_no_tavily_key_searxng_only_returns_searxng_results(monkeypatch):
-    """With no Tavily key (env or header), SearXNG results are returned directly."""
-    monkeypatch.setattr(srv, "TAVILY_API_KEY_ENV", "")
-    async def fake_request(path, params, timeout=None):
-        return {"results": [{"title": "S", "url": "https://s.example/x", "content": "s", "engine": "brave"}], "suggestions": []}
-    monkeypatch.setattr(srv, "_searxng_request", fake_request)
-    result = await _call_tool("web_search", {"query": "q"})
-    payload = json.loads(_result_text(result))
-    assert len(payload["results"]) == 1
-    assert payload["results"][0]["engine"] == "brave"
-
-@pytest.mark.asyncio
-async def test_tavily_failover_when_searxng_empty(monkeypatch):
-    """SearXNG returns empty + Tavily key present → Tavily is queried and returned."""
-    monkeypatch.setattr(srv, "TAVILY_API_KEY_ENV", "tvly-test")
-    async def fake_searxng(path, params, timeout=None):
-        return {"results": [], "suggestions": []}
-    monkeypatch.setattr(srv, "_searxng_request", fake_searxng)
-    tavily_called = {"n": 0}
-    async def fake_tavily(query, num_results, api_key):
-        tavily_called["n"] += 1
-        assert api_key == "tvly-test"
-        return [{"title": "T", "url": "https://t.example/y", "domain": "t.example", "snippet": "t", "engine": "tavily", "score": None}], True
-    monkeypatch.setattr(srv, "_tavily_search", fake_tavily)
-    result = await _call_tool("web_search", {"query": "q"})
-    payload = json.loads(_result_text(result))
-    assert tavily_called["n"] == 1
-    assert len(payload["results"]) == 1
-    assert payload["results"][0]["engine"] == "tavily"
-
-@pytest.mark.asyncio
-async def test_tavily_not_called_when_searxng_has_results(monkeypatch):
-    """Credit-conserving: Tavily is NOT queried when SearXNG already returned results."""
-    monkeypatch.setattr(srv, "TAVILY_API_KEY_ENV", "tvly-test")
-    async def fake_searxng(path, params, timeout=None):
-        return {"results": [{"title": "S", "url": "https://s.example/x", "content": "s", "engine": "brave"}], "suggestions": []}
-    monkeypatch.setattr(srv, "_searxng_request", fake_searxng)
-    async def fake_tavily(query, num_results, api_key):
-        raise AssertionError("Tavily must not be called when SearXNG has results")
-    monkeypatch.setattr(srv, "_tavily_search", fake_tavily)
-    result = await _call_tool("web_search", {"query": "q"})
-    payload = json.loads(_result_text(result))
-    assert payload["results"][0]["engine"] == "brave"
-
-@pytest.mark.asyncio
-async def test_no_tavily_key_searxng_failure_attempts_keyless_tavily(monkeypatch):
-    """No key + SearXNG failure → keyless Tavily is attempted (free default).
-    If keyless Tavily also fails, a structured error mentioning both is returned."""
-    monkeypatch.setattr(srv, "TAVILY_API_KEY_ENV", "")
-    async def fake_searxng(path, params, timeout=None):
-        return None
-    monkeypatch.setattr(srv, "_searxng_request", fake_searxng)
-    tavily_called = {"key": None}
-    async def fake_tavily(query, num_results, api_key):
-        tavily_called["key"] = api_key  # should be "" (keyless)
-        return [], False
-    monkeypatch.setattr(srv, "_tavily_search", fake_tavily)
-    result = await _call_tool("web_search", {"query": "q"})
-    payload = json.loads(_result_text(result))
-    # Keyless path was attempted (empty key passed).
-    assert tavily_called["key"] == ""
-    assert payload["results"] == []
-    assert "error" in payload
-    assert "SearXNG unreachable and Tavily failed" in payload["error"]
-
-@pytest.mark.asyncio
-async def test_keyless_tavily_returns_results_when_searxng_empty(monkeypatch):
-    """No key + SearXNG empty → keyless Tavily returns results (free default
-    path: zero onboarding, reliable search out of the box)."""
-    monkeypatch.setattr(srv, "TAVILY_API_KEY_ENV", "")
-    async def fake_searxng(path, params, timeout=None):
-        return {"results": [], "suggestions": []}
-    monkeypatch.setattr(srv, "_searxng_request", fake_searxng)
-    async def fake_tavily(query, num_results, api_key):
-        assert api_key == ""  # keyless
-        return [{"title": "T", "url": "https://t.example/y", "domain": "t.example", "snippet": "t", "engine": "tavily", "score": None}], True
-    monkeypatch.setattr(srv, "_tavily_search", fake_tavily)
-    result = await _call_tool("web_search", {"query": "q"})
-    payload = json.loads(_result_text(result))
-    assert len(payload["results"]) == 1
-    assert payload["results"][0]["engine"] == "tavily"
-
-@pytest.mark.asyncio
-async def test_both_backends_fail_returns_error(monkeypatch):
-    """SearXNG fails + Tavily fails → error payload mentioning both."""
-    monkeypatch.setattr(srv, "TAVILY_API_KEY_ENV", "tvly-test")
-    async def fake_searxng(path, params, timeout=None):
-        return None
-    monkeypatch.setattr(srv, "_searxng_request", fake_searxng)
-    async def fake_tavily(query, num_results, api_key):
-        return [], False
-    monkeypatch.setattr(srv, "_tavily_search", fake_tavily)
-    result = await _call_tool("web_search", {"query": "q"})
-    payload = json.loads(_result_text(result))
-    assert "error" in payload
-    assert "SearXNG unreachable and Tavily failed" in payload["error"]
-
-
-# --------------------------------------------------------------------------- #
 # Dedupe by URL.
 # --------------------------------------------------------------------------- #
 
 @pytest.mark.asyncio
-async def test_dedupe_by_url_searxng_results(monkeypatch):
+async def test_dedupe_by_url_brave_results(monkeypatch):
     """Duplicate URLs (same URL, different fragments) collapse to one."""
-    async def fake_request(path, params, timeout=None):
-        return {"results": [
-            {"title": "A", "url": "https://example.com/page", "content": "a", "engine": "brave"},
-            {"title": "A2", "url": "https://example.com/page#frag", "content": "a2", "engine": "qwant"},
-            {"title": "B", "url": "https://other.com/", "content": "b", "engine": "brave"},
-        ], "suggestions": []}
-    monkeypatch.setattr(srv, "_searxng_request", fake_request)
-    monkeypatch.setattr(srv, "TAVILY_API_KEY_ENV", "")
+    async def fake_brave_search(query, num_results, api_key):
+        return _brave_outcome([
+            {"title": "A", "url": "https://example.com/page", "snippet": "a",
+             "domain": "example.com", "engine": "brave", "provider": "brave", "score": None},
+            {"title": "A2", "url": "https://example.com/page#frag", "snippet": "a2",
+             "domain": "example.com", "engine": "brave", "provider": "brave", "score": None},
+            {"title": "B", "url": "https://other.com/", "snippet": "b",
+             "domain": "other.com", "engine": "brave", "provider": "brave", "score": None},
+        ])
+    monkeypatch.setattr(srv, "_brave_search", fake_brave_search)
     result = await _call_tool("web_search", {"query": "q"})
     payload = json.loads(_result_text(result))
     assert len(payload["results"]) == 2  # page + page#frag deduped, other.com kept
@@ -1420,24 +1200,28 @@ async def test_dedupe_by_url_searxng_results(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_circuit_breaker_trips_after_threshold(monkeypatch):
-    """After N consecutive SearXNG failures, the breaker skips SearXNG."""
+    """After N consecutive Brave failures, the breaker skips Brave."""
     monkeypatch.setattr(srv, "BREAKER_FAIL_THRESHOLD", 2)
     monkeypatch.setattr(srv, "BREAKER_COOLDOWN", 60)
-    # Fresh breaker.
     monkeypatch.setattr(srv, "_breaker", srv._CircuitBreaker())
     calls = {"n": 0}
-    async def fake_searxng(path, params, timeout=None):
+
+    async def fake_brave_search(query, num_results, api_key):
+        if not srv._breaker.allow("brave"):
+            calls["n"]  # not contacted
+            return srv._BackendOutcome(backend="brave", state="circuit_open", error="circuit open")
         calls["n"] += 1
-        return None
-    monkeypatch.setattr(srv, "_searxng_request", fake_searxng)
-    monkeypatch.setattr(srv, "TAVILY_API_KEY_ENV", "")
+        srv._breaker.record_failure("brave")
+        return srv._BackendOutcome(backend="brave", state="error", error="boom")
+    monkeypatch.setattr(srv, "_brave_search", fake_brave_search)
     # Two failures to trip.
     await _call_tool("web_search", {"query": "q1"})
     await _call_tool("web_search", {"query": "q2"})
     assert calls["n"] == 2
-    # Third call: breaker open → SearXNG not contacted.
+    # Third call: breaker open → Brave not contacted.
     await _call_tool("web_search", {"query": "q3"})
     assert calls["n"] == 2  # not incremented
+
 
 @pytest.mark.asyncio
 async def test_circuit_breaker_resets_on_success(monkeypatch):
@@ -1445,74 +1229,23 @@ async def test_circuit_breaker_resets_on_success(monkeypatch):
     monkeypatch.setattr(srv, "BREAKER_FAIL_THRESHOLD", 3)
     monkeypatch.setattr(srv, "_breaker", srv._CircuitBreaker())
     state = {"fail": True}
-    async def fake_searxng(path, params, timeout=None):
+
+    async def fake_brave_search(query, num_results, api_key):
         if state["fail"]:
-            return None
-        return {"results": [{"title": "ok", "url": "https://x.example/", "content": "", "engine": "brave"}], "suggestions": []}
-    monkeypatch.setattr(srv, "_searxng_request", fake_searxng)
-    monkeypatch.setattr(srv, "TAVILY_API_KEY_ENV", "")
+            srv._breaker.record_failure("brave")
+            return srv._BackendOutcome(backend="brave", state="error", error="boom")
+        srv._breaker.record_success("brave")
+        return _brave_outcome([
+            {"title": "ok", "url": "https://x.example/", "snippet": "",
+             "domain": "x.example", "engine": "brave", "provider": "brave", "score": None},
+        ])
+    monkeypatch.setattr(srv, "_brave_search", fake_brave_search)
     breaker = srv._breaker
     await _call_tool("web_search", {"query": "q"})  # fail 1
-    assert breaker._fails.get("searxng") == 1
+    assert breaker._fails.get("brave") == 1
     state["fail"] = False
     await _call_tool("web_search", {"query": "q"})  # success resets
-    assert "searxng" not in breaker._fails
-
-
-# --------------------------------------------------------------------------- #
-# Tavily key resolution (per-call header > env var).
-# --------------------------------------------------------------------------- #
-
-@pytest.mark.asyncio
-async def test_resolve_tavily_key_env_fallback(monkeypatch):
-    """No HTTP context (stdio) → env var is used."""
-    monkeypatch.setattr(srv, "TAVILY_API_KEY_ENV", "tvly-env")
-    # get_http_headers raises LookupError in stdio/no-request context.
-    import server as s
-    def raise_lookup():
-        raise LookupError("no request")
-    monkeypatch.setattr(s, "get_http_headers", raise_lookup)
-    assert s._resolve_tavily_key() == "tvly-env"
-
-@pytest.mark.asyncio
-async def test_resolve_tavily_key_header_precedence(monkeypatch):
-    """Per-call X-Tavily-Key header takes precedence over env var.
-    (The standard Authorization header is consumed by the MCP transport and
-    does not reach tool code, so a custom header is used.)"""
-    monkeypatch.setattr(srv, "TAVILY_API_KEY_ENV", "tvly-env")
-    monkeypatch.setattr(srv, "get_http_headers", lambda: {"x-tavily-key": "tvly-header"})
-    assert srv._resolve_tavily_key() == "tvly-header"
-
-@pytest.mark.asyncio
-async def test_resolve_tavily_key_does_not_repurpose_generic_api_key(monkeypatch):
-    """Generic broker credentials must never be forwarded to Tavily."""
-    monkeypatch.setattr(srv, "TAVILY_API_KEY_ENV", "tvly-env")
-    monkeypatch.setattr(srv, "get_http_headers", lambda: {"x-api-key": "broker-secret"})
-    assert srv._resolve_tavily_key() == "tvly-env"
-
-@pytest.mark.asyncio
-async def test_resolve_tavily_key_empty_when_neither(monkeypatch):
-    monkeypatch.setattr(srv, "TAVILY_API_KEY_ENV", "")
-    monkeypatch.setattr(srv, "get_http_headers", lambda: {})
-    assert srv._resolve_tavily_key() == ""
-
-@pytest.mark.asyncio
-async def test_tavily_failover_uses_per_call_header_key(monkeypatch):
-    """End-to-end: a per-call X-Tavily-Key header triggers Tavily failover even with no env key."""
-    monkeypatch.setattr(srv, "TAVILY_API_KEY_ENV", "")
-    monkeypatch.setattr(srv, "get_http_headers", lambda: {"x-tavily-key": "tvly-header"})
-    async def fake_searxng(path, params, timeout=None):
-        return {"results": [], "suggestions": []}
-    monkeypatch.setattr(srv, "_searxng_request", fake_searxng)
-    seen_key = {}
-    async def fake_tavily(query, num_results, api_key):
-        seen_key["k"] = api_key
-        return [{"title": "T", "url": "https://t.example/y", "domain": "t.example", "snippet": "t", "engine": "tavily", "score": None}], True
-    monkeypatch.setattr(srv, "_tavily_search", fake_tavily)
-    result = await _call_tool("web_search", {"query": "q"})
-    payload = json.loads(_result_text(result))
-    assert seen_key.get("k") == "tvly-header"
-    assert payload["results"][0]["engine"] == "tavily"
+    assert "brave" not in breaker._fails
 
 
 # --------------------------------------------------------------------------- #
@@ -1520,29 +1253,32 @@ async def test_tavily_failover_uses_per_call_header_key(monkeypatch):
 # --------------------------------------------------------------------------- #
 
 @pytest.mark.asyncio
-async def test_provider_list_default_order_and_names():
-    """The default provider list is SearXNG primary + Tavily fallback."""
+async def test_provider_list_default_order_and_names(monkeypatch):
+    """The default provider list is Brave (primary, independent index)."""
+    monkeypatch.setattr(srv, "_PROVIDER_STACK", "brave")
+    monkeypatch.setattr(srv, "_PROVIDERS", srv._build_provider_stack())
     names = [p.name for p in srv._PROVIDERS]
-    assert names == ["searxng", "tavily"]
+    assert names == ["brave"]
     assert all(p.output == "raw" for p in srv._PROVIDERS)
 
 
-def test_default_timings_ms_has_all_provider_keys():
+def test_default_timings_ms_has_all_provider_keys(monkeypatch):
+    monkeypatch.setattr(srv, "_PROVIDER_STACK", "brave")
+    monkeypatch.setattr(srv, "_PROVIDERS", srv._build_provider_stack())
     timings = srv._default_timings_ms()
-    assert set(timings) == {"total", "searxng", "tavily"}
+    assert set(timings) == {"total", "brave"}
     assert timings["total"] == 0.0
-    assert timings["searxng"] is None
-    assert timings["tavily"] is None
+    assert timings["brave"] is None
 
 
 def test_provider_timeout_reads_current_module_global(monkeypatch):
-    """Provider.timeout must reflect monkeypatched SEARCH_TIMEOUT/TAVILY_TIMEOUT."""
+    """Provider.timeout must reflect monkeypatched SEARCH_TIMEOUT/BRAVE_TIMEOUT."""
     monkeypatch.setattr(srv, "SEARCH_TIMEOUT", 0.5)
-    monkeypatch.setattr(srv, "TAVILY_TIMEOUT", 0.7)
+    monkeypatch.setattr(srv, "BRAVE_TIMEOUT", 0.7)
     searxng = srv._SearXNGProvider()
-    tavily = srv._TavilyProvider()
+    brave = srv._BraveProvider()
     assert searxng.timeout == 0.5
-    assert tavily.timeout == 0.7
+    assert brave.timeout == 0.7
 
 
 @pytest.mark.asyncio
@@ -1560,28 +1296,30 @@ async def test_searxng_provider_delegates_to_monkeypatched_search(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_tavily_provider_delegates_and_resolves_key(monkeypatch):
-    """Provider.search must call _tavily_search with the resolved key."""
-    monkeypatch.setattr(srv, "TAVILY_API_KEY_ENV", "tvly-x")
+async def test_brave_provider_delegates_with_resolved_key(monkeypatch):
+    monkeypatch.setattr(srv, "BRAVE_API_KEY_ENV", "brave-env")
     monkeypatch.setattr(srv, "get_http_headers", lambda: {})
     seen = {}
-    async def fake_tavily_search(query, num_results, api_key):
+
+    async def fake_brave_search(query, num_results, api_key):
         seen["key"] = api_key
-        return srv._BackendOutcome(backend="tavily", ok=True, state="ok")
-    monkeypatch.setattr(srv, "_tavily_search", fake_tavily_search)
-    await srv._TavilyProvider().search("q", 5)
-    assert seen["key"] == "tvly-x"
-    assert srv._TavilyProvider.credential_label() == "keyed"
+        return srv._BackendOutcome(backend="brave", ok=True, state="ok")
+    monkeypatch.setattr(srv, "_brave_search", fake_brave_search)
+    await srv._BraveProvider().search("q", 5)
+    assert seen["key"] == "brave-env"
+    assert srv._BraveProvider.credential_label() == "keyed"
 
 
 @pytest.mark.asyncio
 async def test_web_search_result_carries_provider_field(monkeypatch):
     """Normalized results expose a 'provider' field naming the API backend."""
-    async def fake_request(path, params, timeout=None):
-        return {"results": [{"title": "T", "url": "https://example.com/a", "content": "c", "engine": "brave"}], "suggestions": []}
-    monkeypatch.setattr(srv, "_searxng_request", fake_request)
-    monkeypatch.setattr(srv, "TAVILY_API_KEY_ENV", "")
+    async def fake_brave_search(query, num_results, api_key):
+        return _brave_outcome([
+            {"title": "T", "url": "https://example.com/a", "snippet": "c",
+             "domain": "example.com", "engine": "brave", "provider": "brave", "score": None},
+        ])
+    monkeypatch.setattr(srv, "_brave_search", fake_brave_search)
     result = await _call_tool("web_search", {"query": "q", "num_results": 1})
     payload = json.loads(_result_text(result))
-    assert payload["results"][0]["provider"] == "searxng"
+    assert payload["results"][0]["provider"] == "brave"
     assert payload["results"][0]["engine"] == "brave"

@@ -22,11 +22,17 @@ from telemetry import (
 )
 
 
-def _event(*, created_at: int, status: str = "ok", tavily: bool = False) -> SearchEvent:
+def _event(
+    *,
+    created_at: int,
+    status: str = "ok",
+    mode: str = "normal",
+    fallback_reason: str | None = None,
+) -> SearchEvent:
     providers = [
         ProviderEvent(
-            provider="searxng",
-            state="degraded" if tavily else "ok",
+            provider="brave",
+            state="ok",
             attempts=1,
             result_count=2,
             latency_ms=10.0,
@@ -35,33 +41,17 @@ def _event(*, created_at: int, status: str = "ok", tavily: bool = False) -> Sear
             circuit_after="closed",
         )
     ]
-    if tavily:
-        providers.append(
-            ProviderEvent(
-                provider="tavily",
-                state="error",
-                attempts=1,
-                latency_ms=20.0,
-                error_kind="http",
-                http_status=429,
-                credential_mode="keyless",
-                circuit_before="closed",
-                circuit_after="open",
-                circuit_transition="opened",
-                circuit_failures=3,
-            )
-        )
     return SearchEvent(
         created_at=created_at,
-        status="degraded" if tavily else status,
-        backend="searxng" if not tavily else "searxng",
-        mode="fallback",
+        status=status,
+        backend="brave",
+        mode=mode,
         requested_count=5,
         result_count=2,
-        total_latency_ms=30.0 if tavily else 10.0,
-        fallback_reason="searxng_degraded" if tavily else None,
+        total_latency_ms=10.0,
+        fallback_reason=fallback_reason,
         providers=tuple(providers),
-        engine_failures=(("bing", "rate_limited"),) if tavily else (),
+        engine_failures=(),
     )
 
 
@@ -81,28 +71,47 @@ def test_persists_across_reopen_and_uses_private_permissions(tmp_path):
     try:
         stats = reopened.stats("24h", now=2_000_000_100)
         assert stats["searches"]["total"] == 1
-        assert stats["providers"]["searxng"]["attempts"] == 1
+        assert stats["providers"]["brave"]["attempts"] == 1
     finally:
         reopened.close()
 
 
-def test_aggregation_windows_and_tavily_operational_counts(tmp_path):
+def test_persists_current_modes_and_quality_reasons_without_normalizing_them_away(tmp_path):
+    store = TelemetryStore(tmp_path / "data")
+    try:
+        store.record(
+            _event(
+                created_at=2_000_000_000,
+                mode="maximum_recall",
+                fallback_reason="quality_low_domain_diversity",
+            )
+        )
+        store.record(_event(created_at=2_000_000_001, mode="disabled"))
+        assert store.flush()
+        with sqlite3.connect(store.db_path) as conn:
+            rows = conn.execute(
+                "SELECT mode, fallback_reason FROM search_events ORDER BY id"
+            ).fetchall()
+        assert rows == [
+            ("maximum_recall", "quality_low_domain_diversity"),
+            ("disabled", None),
+        ]
+    finally:
+        store.close()
+
+
+def test_aggregation_windows_and_provider_counts(tmp_path):
     now = 2_000_000_000
     store = TelemetryStore(tmp_path / "data")
     try:
-        store.record(_event(created_at=now - 60, tavily=True))
+        store.record(_event(created_at=now - 60))
         store.record(_event(created_at=now - 2 * 24 * 60 * 60))
         store.record(_event(created_at=now - 10 * 24 * 60 * 60))
         assert store.flush()
 
         daily = store.stats("24h", now=now)
         assert daily["searches"]["total"] == 1
-        assert daily["fallback"]["rate"] == 1.0
-        assert daily["providers"]["tavily"]["attempted_searches"] == 1
-        assert daily["providers"]["tavily"]["rate_limited_429s"] == 1
-        assert daily["providers"]["tavily"]["circuit_trips"] == 1
-        assert daily["providers"]["tavily"]["credential_modes"] == {"keyless": 1}
-        assert daily["searxng_engine_failures"][0]["reason"] == "rate_limited"
+        assert daily["providers"]["brave"]["attempted_searches"] == 1
 
         assert store.stats("7d", now=now)["searches"]["total"] == 2
         assert store.stats("30d", now=now)["searches"]["total"] == 3
@@ -113,7 +122,7 @@ def test_aggregation_windows_and_tavily_operational_counts(tmp_path):
 def test_schema_and_rows_cannot_contain_sensitive_search_fields(tmp_path):
     store = TelemetryStore(tmp_path / "data")
     try:
-        store.record(_event(created_at=2_000_000_000, tavily=True))
+        store.record(_event(created_at=2_000_000_000))
         assert store.flush()
         with sqlite3.connect(store.db_path) as conn:
             schema_rows = conn.execute(
@@ -177,7 +186,7 @@ def test_explicit_reset_clears_events_but_keeps_database(tmp_path):
     store = TelemetryStore(tmp_path / "data")
     try:
         store.record(_event(created_at=2_000_000_000))
-        store.record(_event(created_at=2_000_000_001, tavily=True))
+        store.record(_event(created_at=2_000_000_001))
         assert store.flush()
         assert store.reset() == 2
         assert store.db_path.exists()

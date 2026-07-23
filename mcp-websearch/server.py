@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Policy-aware MCP web search broker for local SearXNG and Tavily.
+"""Policy-aware MCP web search broker for Brave Search and local SearXNG.
 
 Tools:
-  - web_search(query, num_results=8)          SearXNG first; Tavily policy-controlled
+  - web_search(query, num_results=8)          Brave (default) or optional SearXNG stack
   - batch_web_search(queries, num_results=8)  up to three searches under one deadline
-  - image_search(query, num_results=8)        loopback SearXNG images; no fallback
+  - image_search(query, num_results=8)        Brave (default) or loopback SearXNG images
   - web_fetch(url, max_chars=20000)           direct fetch with SSRF guard
+  - verify_url(url)                           direct-fetch verification
 
 HTTP diagnostics:
   - GET /live    dependency-free process liveness
@@ -13,32 +14,30 @@ HTTP diagnostics:
   - GET /health  compatibility diagnostics (always HTTP 200)
   - GET /stats   query-free aggregate telemetry (24h, 7d, or 30d)
 
-WEBSEARCH_TAVILY_MODE controls external Tavily egress:
-  - disabled:   SearXNG only
-  - fallback:   Tavily only when SearXNG has no usable results (default)
-  - supplement: Tavily when SearXNG is below the configured result minimum
+Brave Search is the default raw-search provider (independent index, strong
+privacy posture, $0.005/query). SearXNG remains available as an optional
+loopback provider for image search and as an opt-in web-search stack.
 
 Searches use one bounded 18-second-or-less budget, overfetch before URL dedupe,
-and return additive status/backend/fallback/timing metadata. Tavily uses the
-per-call X-Tavily-Key header, then TAVILY_API_KEY, otherwise its keyless mode.
+and return additive status/backend/fallback/timing metadata. Brave uses the
+per-call X-Brave-Key header, then BRAVE_API_KEY, then a mode-0600 secret file.
 Broker Authorization credentials are intentionally separate and never treated
-as Tavily credentials.
+as provider credentials.
 
 Key configuration:
   SEARXNG_URL                         default http://127.0.0.1:8888
-  WEBSEARCH_TAVILY_MODE               disabled|fallback|supplement
   WEBSEARCH_FETCH_MAX_BYTES           default 20 MiB
   WEBSEARCH_HTML_EXTRACT_TIMEOUT      default 8 seconds
   WEBSEARCH_PDF_MAX_PAGES             default 20
   WEBSEARCH_TOTAL_TIMEOUT             capped at 18 seconds
   WEBSEARCH_SEARXNG_TIMEOUT           default 7 seconds
-  WEBSEARCH_TAVILY_TIMEOUT            default 8 seconds
+  WEBSEARCH_BRAVE_TIMEOUT             default 8 seconds
   WEBSEARCH_SEARCH_MAX_BYTES          default 2 MiB per provider response
   WEBSEARCH_SUPPLEMENT_MIN_RESULTS    default 5
   LOCAL_SEARCH_DATA_DIR               default ../data beside this package
   LOCAL_SEARCH_TELEMETRY_ENABLED      default true
-  TAVILY_API_KEY                      optional stdio/server fallback key
-  TAVILY_BASE_URL                     default https://api.tavily.com
+  BRAVE_API_KEY                       optional stdio/server fallback key
+  BRAVE_BASE_URL                      default https://api.search.brave.com
   MCP_PORT                            default 8889 (HTTP transport only)
 """
 
@@ -85,19 +84,10 @@ from telemetry import (
 logger = logging.getLogger("websearch-mcp")
 
 SEARXNG_URL = os.environ.get("SEARXNG_URL", "http://127.0.0.1:8888").rstrip("/")
-TAVILY_BASE_URL = os.environ.get("TAVILY_BASE_URL", "https://api.tavily.com").rstrip("/")
-KAGI_BASE_URL = os.environ.get("KAGI_BASE_URL", "https://kagi.com").rstrip("/")
-PERPLEXITY_BASE_URL = os.environ.get("PERPLEXITY_BASE_URL", "https://api.perplexity.ai").rstrip("/")
-# Environment fallback for stdio clients. HTTP clients should forward a Tavily
-# key only through X-Tavily-Key; broker authentication is a separate concern.
-TAVILY_API_KEY_ENV = os.environ.get("TAVILY_API_KEY", "").strip()
-# Kagi API key. HTTP clients should forward it via X-Kagi-Key; the env var is a
-# stdio/server-side fallback. A mode-0600 secret file beside the data dir is
-# also consulted so keys can live outside the repo and process environment.
-KAGI_API_KEY_ENV = os.environ.get("KAGI_API_KEY", "").strip()
-# Perplexity Sonar API key. HTTP clients should forward it via X-Perplexity-Key;
-# the env var is a stdio/server-side fallback, then a mode-0600 secret file.
-PERPLEXITY_API_KEY_ENV = os.environ.get("PERPLEXITY_API_KEY", "").strip()
+BRAVE_BASE_URL = os.environ.get("BRAVE_BASE_URL", "https://api.search.brave.com").rstrip("/")
+# Brave Search API key. HTTP clients should forward it via X-Brave-Key; the
+# env var is a stdio/server-side fallback, then a mode-0600 secret file.
+BRAVE_API_KEY_ENV = os.environ.get("BRAVE_API_KEY", "").strip()
 _DEFAULT_DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 LOCAL_SEARCH_DATA_DIR = Path(
     os.environ.get("LOCAL_SEARCH_DATA_DIR", str(_DEFAULT_DATA_DIR))
@@ -128,9 +118,6 @@ def _bounded_int(name: str, default: int, *, minimum: int, maximum: int) -> int:
 
 # Search policy and bounded latency budget. The broker stays below Pi's 20s
 # client deadline so fallback has time to complete and serialize a response.
-TAVILY_MODE = os.environ.get("WEBSEARCH_TAVILY_MODE", "fallback").strip().lower()
-if TAVILY_MODE not in {"disabled", "fallback", "supplement"}:
-    raise RuntimeError("WEBSEARCH_TAVILY_MODE must be disabled, fallback, or supplement")
 SEARCH_TOTAL_TIMEOUT = _bounded_float("WEBSEARCH_TOTAL_TIMEOUT", 18.0, minimum=1.0, maximum=18.0)
 SEARCH_TIMEOUT = _bounded_float(
     "WEBSEARCH_SEARXNG_TIMEOUT",
@@ -138,16 +125,9 @@ SEARCH_TIMEOUT = _bounded_float(
     minimum=0.25,
     maximum=SEARCH_TOTAL_TIMEOUT,
 )
-TAVILY_TIMEOUT = _bounded_float(
-    "WEBSEARCH_TAVILY_TIMEOUT", 8.0, minimum=0.25, maximum=SEARCH_TOTAL_TIMEOUT
+BRAVE_TIMEOUT = _bounded_float(
+    "WEBSEARCH_BRAVE_TIMEOUT", 8.0, minimum=0.25, maximum=SEARCH_TOTAL_TIMEOUT
 )
-KAGI_TIMEOUT = _bounded_float(
-    "WEBSEARCH_KAGI_TIMEOUT", 8.0, minimum=0.25, maximum=SEARCH_TOTAL_TIMEOUT
-)
-PERPLEXITY_TIMEOUT = _bounded_float(
-    "WEBSEARCH_PERPLEXITY_TIMEOUT", 12.0, minimum=0.25, maximum=SEARCH_TOTAL_TIMEOUT
-)
-SONAR_MODEL = os.environ.get("WEBSEARCH_SONAR_MODEL", "sonar").strip() or "sonar"
 # Default search routing mode (ADR 0002 Phase 5). Per-call overrides come via
 # the web_search `mode` argument. `sensitive` makes no external call (local KB
 # only or refuse; SearXNG is NOT no-egress). `maximum_recall` serially
@@ -155,14 +135,13 @@ SONAR_MODEL = os.environ.get("WEBSEARCH_SONAR_MODEL", "sonar").strip() or "sonar
 _SEARCH_MODE = os.environ.get("WEBSEARCH_SEARCH_MODE", "normal").strip().lower()
 if _SEARCH_MODE not in {"normal", "sensitive", "maximum_recall"}:
     raise RuntimeError("WEBSEARCH_SEARCH_MODE must be normal, sensitive, or maximum_recall")
-# Provider stack selection (ADR 0002). The default preserves the existing
-# SearXNG-first + Tavily-fallback behavior so deployments and tests are
-# unchanged until an operator opts into the Kagi stack. Phase 6 will flip the
-# default to "kagi+sonar" once Sonar is wired.
-_PROVIDER_STACK = os.environ.get("WEBSEARCH_PROVIDER_STACK", "searxng+tavily").strip().lower()
-if _PROVIDER_STACK not in {"searxng+tavily", "kagi", "kagi+sonar", "searxng"}:
+# Provider stack selection (ADR 0002). Brave is the default raw-search
+# provider (independent index, strong privacy posture, $0.005/query).
+# SearXNG remains available as an optional loopback provider.
+_PROVIDER_STACK = os.environ.get("WEBSEARCH_PROVIDER_STACK", "brave").strip().lower()
+if _PROVIDER_STACK not in {"brave", "searxng"}:
     raise RuntimeError(
-        "WEBSEARCH_PROVIDER_STACK must be one of: searxng+tavily, kagi, kagi+sonar, searxng"
+        "WEBSEARCH_PROVIDER_STACK must be one of: brave, searxng"
     )
 SUPPLEMENT_MIN_RESULTS = _bounded_int(
     "WEBSEARCH_SUPPLEMENT_MIN_RESULTS", 5, minimum=1, maximum=20
@@ -170,9 +149,7 @@ SUPPLEMENT_MIN_RESULTS = _bounded_int(
 # Quality gate (ADR 0002 Phase 3). When enabled, a nonempty primary result set
 # can still trigger fallback if it is thin, single-domain-dominated, or
 # duplicate/generic. Defaults are conservative starting points to be tuned
-# against the local smoke set. "auto" enables the gate for every stack except
-# the legacy searxng+tavily default so existing behavior is preserved until
-# Phase 6 flips the default.
+# against the local smoke set.
 _QUALITY_GATE_MODE = os.environ.get("WEBSEARCH_QUALITY_GATE", "auto").strip().lower()
 if _QUALITY_GATE_MODE not in {"auto", "on", "off"}:
     raise RuntimeError("WEBSEARCH_QUALITY_GATE must be auto, on, or off")
@@ -188,6 +165,13 @@ QUALITY_MIN_DOMAINS = _bounded_int(
 QUALITY_DUPLICATE_FRACTION = _bounded_float(
     "WEBSEARCH_QUALITY_DUPLICATE_FRACTION", 0.6, minimum=0.1, maximum=0.95
 )
+# Per-provider cost rates (USD per billable search request). Used for the
+# estimated_cost_usd field in search responses.
+_PROVIDER_COST_USD: dict[str, float] = {
+    "brave": 0.005,
+    "searxng": 0.0,
+    "none": 0.0,
+}
 MAX_NUM_RESULTS = 20
 RESULT_OVERFETCH_FACTOR = 2
 MAX_QUERY_CHARS = 512
@@ -289,7 +273,7 @@ async def _public_fetch_client() -> httpx.AsyncClient:
 mcp = FastMCP(
     "websearch",
     instructions=(
-        "Web and image search plus page fetching via local SearXNG, with policy-controlled Tavily fallback or supplementation for web search only. "
+        "Web and image search plus page fetching via Brave Search (default) or an optional loopback SearXNG stack. "
         "Use web_search for one focused query and batch_web_search for two or three independent query angles that can run together. "
         "Use image_search to find public image and source-page URLs without downloading image bytes. "
         "Use web_fetch to retrieve the main text and attachment links from a specific URL."
@@ -384,7 +368,7 @@ _breaker = _CircuitBreaker()
 # Provider abstraction (ADR 0002). Raw ranked-search backends implement one
 # contract so the broker can route, gate, and fail over without naming each
 # provider inline. Module-level search functions remain the implementation
-# seam so existing tests that monkeypatch _searxng_search / _tavily_search /
+# seam so existing tests that monkeypatch _searxng_search /
 # _searxng_request keep working unchanged.
 # --------------------------------------------------------------------------- #
 
@@ -416,81 +400,32 @@ class _SearXNGProvider:
         return _searxng_search(query, num_results)
 
 
-class _TavilyProvider:
-    """Tavily raw-search provider with per-call credential resolution."""
+class _BraveProvider:
+    """Brave Search raw-search provider (independent index; requires API key)."""
 
-    name = "tavily"
+    name = "brave"
     output = "raw"
 
     @property
     def timeout(self) -> float:
-        return TAVILY_TIMEOUT
+        return BRAVE_TIMEOUT
 
     @staticmethod
     def search(query: str, num_results: int) -> Awaitable[_BackendOutcome]:
-        return _tavily_search(query, num_results, _resolve_tavily_key())
+        return _brave_search(query, num_results, _resolve_brave_key())
 
     @staticmethod
     def credential_label() -> str:
-        return "keyed" if _resolve_tavily_key() else "keyless"
-
-
-class _KagiProvider:
-    """Kagi raw-search provider (requires an API key; no keyless mode)."""
-
-    name = "kagi"
-    output = "raw"
-
-    @property
-    def timeout(self) -> float:
-        return KAGI_TIMEOUT
-
-    @staticmethod
-    def search(query: str, num_results: int) -> Awaitable[_BackendOutcome]:
-        return _kagi_search(query, num_results, _resolve_kagi_key())
-
-    @staticmethod
-    def credential_label() -> str:
-        return "keyed" if _resolve_kagi_key() else "none"
-
-
-class _PerplexityProvider:
-    """Perplexity Sonar generated-output provider (answer + search_results).
-
-    Requires an API key (no keyless mode). Its `output` is "generated" so the
-    broker never silently merges a Sonar answer into a raw result list.
-    """
-
-    name = "sonar"
-    output = "generated"
-
-    @property
-    def timeout(self) -> float:
-        return PERPLEXITY_TIMEOUT
-
-    @staticmethod
-    def search(query: str, num_results: int) -> Awaitable[_BackendOutcome]:
-        return _sonar_search(query, num_results, _resolve_perplexity_key())
-
-    @staticmethod
-    def credential_label() -> str:
-        return "keyed" if _resolve_perplexity_key() else "none"
+        return "keyed" if _resolve_brave_key() else "none"
 
 
 # Ordered provider list for the default web-search path. The first entry is
 # the primary; the second (when present) is the policy-controlled fallback.
-# WEBSEARCH_PROVIDER_STACK selects the active stack; the default preserves the
-# existing SearXNG-first + Tavily-fallback behavior.
+# WEBSEARCH_PROVIDER_STACK selects the active stack.
 def _build_provider_stack() -> list[SearchProvider]:
-    if _PROVIDER_STACK == "searxng+tavily":
-        return [_SearXNGProvider(), _TavilyProvider()]
     if _PROVIDER_STACK == "searxng":
         return [_SearXNGProvider()]
-    if _PROVIDER_STACK == "kagi":
-        return [_KagiProvider()]
-    if _PROVIDER_STACK == "kagi+sonar":
-        return [_KagiProvider(), _PerplexityProvider()]
-    return [_SearXNGProvider(), _TavilyProvider()]
+    return [_BraveProvider()]
 
 
 _PROVIDERS: list[SearchProvider] = _build_provider_stack()
@@ -500,12 +435,8 @@ def _provider_credential_configured(name: str) -> bool:
     """Return whether a provider's credential is resolvable (without leaking it)."""
     if name == "searxng":
         return True  # loopback SearXNG is keyless.
-    if name == "tavily":
-        return bool(_resolve_tavily_key()) or True  # Tavily supports keyless mode.
-    if name == "kagi":
-        return bool(_resolve_kagi_key())
-    if name == "sonar":
-        return bool(_resolve_perplexity_key())
+    if name == "brave":
+        return bool(_resolve_brave_key())
     return False
 
 
@@ -543,9 +474,9 @@ class _BackendOutcome:
     circuit_after: str = "unknown"
     circuit_transition: str = "none"
     circuit_failures: int = 0
-    # Generated-output providers (Sonar) carry a synthesized answer and
-    # citation URLs alongside their ranked search_results. Empty for raw
-    # providers so the contract stays single-type.
+    # Generated-output providers carry a synthesized answer and citation URLs
+    # alongside their ranked results. Empty for raw providers so the contract
+    # stays single-type.
     answer: str = ""
     citations: list[str] = field(default_factory=list)
 
@@ -558,6 +489,30 @@ _telemetry_lock = Lock()
 # --------------------------------------------------------------------------- #
 # Error / payload helpers.
 # --------------------------------------------------------------------------- #
+
+def _attempted_providers(
+    outcomes: list[_BackendOutcome | None] | tuple[_BackendOutcome | None, ...],
+) -> list[str]:
+    """Return providers that issued at least one request, preserving order."""
+    names: list[str] = []
+    for outcome in outcomes:
+        if outcome is not None and outcome.attempts > 0 and outcome.backend not in names:
+            names.append(outcome.backend)
+    return names
+
+
+def _estimate_search_cost(*, backend: str, attempted: list[str] | None) -> float:
+    """Estimate USD cost from providers that issued a billable request.
+
+    ``backend`` identifies the source of returned results. ``attempted`` is
+    intentionally narrower: providers skipped for missing credentials, an open
+    circuit, or an exhausted total deadline are excluded because no request was
+    issued. Contacted providers are counted even when their request failed.
+    """
+    if not attempted:
+        return 0.0
+    return sum(_PROVIDER_COST_USD.get(p, 0.0) for p in attempted)
+
 
 def _search_metadata(
     *,
@@ -577,9 +532,10 @@ def _search_metadata(
         "attempted": attempted or [],
         "fallback_reason": fallback_reason,
         "timings_ms": timings_ms or _default_timings_ms(),
-        "mode": mode or TAVILY_MODE,
+        "mode": mode or "normal",
         "unresponsive_engines": (unresponsive_engines or [])[:10],
         "provider_states": provider_states or {},
+        "estimated_cost_usd": round(_estimate_search_cost(backend=backend, attempted=attempted), 4),
     }
     if search_mode:
         meta["search_mode"] = search_mode
@@ -600,6 +556,7 @@ def _record_last_search(payload: dict[str, Any]) -> None:
         "unresponsive_engine_count": len(payload.get("unresponsive_engines", [])),
         "provider_states": payload.get("provider_states", {}),
         "mode": payload.get("mode"),
+        "estimated_cost_usd": payload.get("estimated_cost_usd", 0.0),
     }
 
 
@@ -671,7 +628,7 @@ def _record_search_telemetry(
             SearchEvent(
                 status=status,
                 backend=backend,
-                mode=mode or TAVILY_MODE,
+                mode=mode,
                 requested_count=requested_count,
                 result_count=result_count,
                 fallback_reason=fallback_reason,
@@ -724,6 +681,7 @@ def _search_error_payload(
     provider_states: dict[str, str] | None = None,
     mode: str | None = None,
     search_mode: str | None = None,
+    safe_search: str | None = None,
 ) -> str:
     payload = {
         "query": query,
@@ -743,6 +701,8 @@ def _search_error_payload(
             search_mode=search_mode,
         ),
     }
+    if safe_search:
+        payload["safe_search"] = safe_search
     _record_last_search(payload)
     return json.dumps(payload)
 
@@ -908,74 +868,66 @@ def _normalize_searxng_image_result(r: dict[str, Any]) -> dict[str, Any] | None:
     }
 
 
-def _normalize_tavily_result(r: dict) -> dict[str, Any] | None:
-    url = _public_http_url(r.get("url"))
-    if url is None:
-        return None
-    return {
-        "title": r.get("title") or "Untitled",
-        "url": url,
-        "domain": _domain(url),
-        "snippet": str(r.get("content") or r.get("raw_content") or ""),
-        "engine": "tavily",
-        "provider": "tavily",
-        "score": r.get("score"),
-    }
+def _normalize_brave_result(r: dict) -> dict[str, Any] | None:
+    """Normalize one Brave Search API `web.results` entry.
 
-
-def _normalize_kagi_result(r: dict) -> dict[str, Any] | None:
-    """Normalize one Kagi Search API result object.
-
-    Kagi returns a `data` array whose entries with `t == 0` are web results
-    carrying `url`, `title`, `snippet`, and optional `published`. Entries with
-    `t == 1` are related-search lists and are ignored here.
+    Brave returns a `web.results` array whose entries carry `url`, `title`,
+    `description` (the snippet), and optional `age`/`page_age`/`publish_date`.
+    Thumbnail and meta_url fields are ignored; only the public HTTP URL and
+    text fields are retained.
     """
-    if r.get("t") not in (0, None):
-        # t == 1 is a related-searches list; t == 2/3 are teasers/infoboxes.
-        return None
     url = _public_http_url(r.get("url"))
     if url is None:
         return None
-    snippet = str(r.get("snippet") or "")
-    published = r.get("published")
+    snippet = str(r.get("description") or "")
+    published = r.get("page_age") or r.get("publish_date") or r.get("age")
     if isinstance(published, str) and published and not snippet.endswith(published):
-        # Preserve the publication timestamp as a trailing hint without
-        # duplicating it; normalization never stores the query itself.
         snippet = f"{snippet} (published {published})".strip()
     return {
         "title": r.get("title") or "Untitled",
         "url": url,
         "domain": _domain(url),
         "snippet": snippet,
-        "engine": "kagi",
-        "provider": "kagi",
+        "engine": "brave",
+        "provider": "brave",
         "score": None,
     }
 
 
-def _normalize_sonar_result(r: dict) -> dict[str, Any] | None:
-    """Normalize one Perplexity Sonar `search_results` entry.
+def _normalize_brave_image_result(r: dict) -> dict[str, Any] | None:
+    """Normalize one Brave Image Search API `results` entry.
 
-    Sonar is a generated-output provider: it returns a generated answer plus a
-    `search_results` array of `{title, url, snippet, date, last_updated}`.
-    These normalized results carry `provider="sonar"` so callers can
-    distinguish raw-ranked from generated-sourced links.
+    Brave returns a `results` array whose entries carry `title`, `url` (the
+    page where the image was found), `source`, `thumbnail` (with `src`,
+    `width`, `height`), and `properties` (with the actual image `url`).
     """
-    url = _public_http_url(r.get("url"))
-    if url is None:
+    properties = r.get("properties")
+    image_url = _public_http_url(
+        properties.get("url") if isinstance(properties, dict) else None
+    )
+    if image_url is None:
         return None
-    snippet = str(r.get("snippet") or "")
-    date = r.get("date") or r.get("last_updated")
-    if isinstance(date, str) and date and not snippet.endswith(date):
-        snippet = f"{snippet} (published {date})".strip()
+    page_url = _public_http_url(r.get("url"))
+    thumbnail = r.get("thumbnail")
+    thumbnail_url = _public_http_url(
+        thumbnail.get("src") if isinstance(thumbnail, dict) else None
+    )
+    width = thumbnail.get("width") if isinstance(thumbnail, dict) else None
+    height = thumbnail.get("height") if isinstance(thumbnail, dict) else None
+    source = str(r.get("source") or "") or (_domain(page_url) if page_url else "")
     return {
-        "title": r.get("title") or "Untitled",
-        "url": url,
-        "domain": _domain(url),
-        "snippet": snippet,
-        "engine": "sonar",
-        "provider": "sonar",
-        "score": None,
+        "title": str(r.get("title") or "Untitled"),
+        "image_url": image_url,
+        "thumbnail_url": thumbnail_url,
+        "page_url": page_url,
+        "source": source,
+        "engine": "brave",
+        "width": int(width) if isinstance(width, (int, float)) else None,
+        "height": int(height) if isinstance(height, (int, float)) else None,
+        "mime_type": None,
+        "creator": None,
+        "license": None,
+        "license_url": None,
     }
 
 
@@ -1109,7 +1061,7 @@ def _format_results(
         text = "\n".join(lines)
     else:
         text = f"No results found for: {query}"
-    # Generated-output providers (Sonar) surface a synthesized answer that is
+    # Generated-output providers surface a synthesized answer that is
     # never merged into the raw result list; it travels as its own field.
     if answer:
         text = f"{answer}\n\n---\n\n{text}" if results else answer
@@ -1146,6 +1098,8 @@ def _format_image_results(
     *,
     status: str,
     backend: str,
+    attempted: list[str],
+    safe_search: str,
     fallback_reason: str | None,
     timings_ms: dict[str, float | None],
     unresponsive_engines: list[Any],
@@ -1171,11 +1125,11 @@ def _format_image_results(
         "results": results,
         "suggestions": suggestions[:5],
         "text": text,
-        "safe_search": "moderate",
+        "safe_search": safe_search,
         **_search_metadata(
             status=status,
             backend=backend,
-            attempted=["searxng"],
+            attempted=attempted,
             fallback_reason=fallback_reason,
             timings_ms=timings_ms,
             unresponsive_engines=unresponsive_engines,
@@ -1540,36 +1494,8 @@ def _pinned_public_request(
 
 
 # --------------------------------------------------------------------------- #
-# Tavily key resolution (per-call header > env var).
+# Brave key resolution (per-call header > env var > mode-0600 secret file).
 # --------------------------------------------------------------------------- #
-
-def _resolve_tavily_key() -> str:
-    """Return the Tavily API key from the current HTTP request, falling back to
-    the TAVILY_API_KEY env var. Empty if neither.
-
-    Header precedence (custom headers pass through to tools; standard
-    `Authorization` is reserved exclusively for MCP transport authentication):
-      1. X-Tavily-Key   (explicit Tavily credential)
-    Then env var TAVILY_API_KEY for stdio/server-side consumers. Generic
-    X-Api-Key and Authorization values are never repurposed as Tavily keys.
-    """
-    try:
-        headers = get_http_headers()
-    except LookupError:
-        # stdio transport / no HTTP context — env var only.
-        return TAVILY_API_KEY_ENV
-    value = headers.get("x-tavily-key")
-    if value and value.strip():
-        return value.strip()
-    return TAVILY_API_KEY_ENV
-
-
-# --------------------------------------------------------------------------- #
-# Kagi key resolution (per-call header > env var > mode-0600 secret file).
-# --------------------------------------------------------------------------- #
-
-_KAGI_SECRET_FILE = LOCAL_SEARCH_DATA_DIR / "kagi_key"
-
 
 def _read_secret_file(path: Path) -> str:
     """Return the first non-empty stripped line from a mode-0600 secret file.
@@ -1596,50 +1522,27 @@ def _read_secret_file(path: Path) -> str:
     return ""
 
 
-def _resolve_kagi_key() -> str:
-    """Return the Kagi API key from the current HTTP request, env var, or a
-    mode-0600 secret file. Empty if none.
-
-    Header precedence (custom headers pass through to tools; standard
-    `Authorization` is reserved exclusively for MCP transport authentication):
-      1. X-Kagi-Key   (explicit Kagi credential)
-    Then env var KAGI_API_KEY, then the secret file at
-    $LOCAL_SEARCH_DATA_DIR/kagi_key. Generic X-Api-Key and Authorization values
-    are never repurposed as Kagi keys.
-    """
-    try:
-        headers = get_http_headers()
-    except LookupError:
-        # stdio transport / no HTTP context — env var / file only.
-        env_or_file = KAGI_API_KEY_ENV or _read_secret_file(_KAGI_SECRET_FILE)
-        return env_or_file
-    value = headers.get("x-kagi-key")
-    if value and value.strip():
-        return value.strip()
-    return KAGI_API_KEY_ENV or _read_secret_file(_KAGI_SECRET_FILE)
+_BRAVE_SECRET_FILE = LOCAL_SEARCH_DATA_DIR / "brave_key"
 
 
-_PERPLEXITY_SECRET_FILE = LOCAL_SEARCH_DATA_DIR / "perplexity_key"
-
-
-def _resolve_perplexity_key() -> str:
-    """Return the Perplexity API key from the current HTTP request, env var, or
-    a mode-0600 secret file. Empty if none.
+def _resolve_brave_key() -> str:
+    """Return the Brave Search API key from the current HTTP request, env var,
+    or a mode-0600 secret file. Empty if none.
 
     Header precedence (standard `Authorization` is reserved for MCP transport):
-      1. X-Perplexity-Key   (explicit Perplexity credential)
-    Then env var PERPLEXITY_API_KEY, then the secret file at
-    $LOCAL_SEARCH_DATA_DIR/perplexity_key. Generic X-Api-Key and Authorization
-    values are never repurposed as Perplexity keys.
+      1. X-Brave-Key   (explicit Brave credential)
+    Then env var BRAVE_API_KEY, then the secret file at
+    $LOCAL_SEARCH_DATA_DIR/brave_key. Generic X-Api-Key and Authorization
+    values are never repurposed as Brave keys.
     """
     try:
         headers = get_http_headers()
     except LookupError:
-        return PERPLEXITY_API_KEY_ENV or _read_secret_file(_PERPLEXITY_SECRET_FILE)
-    value = headers.get("x-perplexity-key")
+        return BRAVE_API_KEY_ENV or _read_secret_file(_BRAVE_SECRET_FILE)
+    value = headers.get("x-brave-key")
     if value and value.strip():
         return value.strip()
-    return PERPLEXITY_API_KEY_ENV or _read_secret_file(_PERPLEXITY_SECRET_FILE)
+    return BRAVE_API_KEY_ENV or _read_secret_file(_BRAVE_SECRET_FILE)
 
 
 # --------------------------------------------------------------------------- #
@@ -1672,26 +1575,6 @@ async def _limited_json_object(response: httpx.Response, *, provider: str) -> di
     if not isinstance(data, dict):
         raise ValueError(f"{provider} returned an invalid JSON payload")
     return data
-
-
-def _tavily_search_url() -> str:
-    """Return the configured Tavily endpoint only when credentials can be sent safely."""
-    parsed = urllib.parse.urlsplit(TAVILY_BASE_URL)
-    try:
-        _ = parsed.port
-    except ValueError as exc:
-        raise ValueError("TAVILY_BASE_URL must be a credential-free HTTPS origin") from exc
-    if (
-        parsed.scheme.lower() != "https"
-        or not parsed.hostname
-        or parsed.username is not None
-        or parsed.password is not None
-        or parsed.path not in {"", "/"}
-        or parsed.query
-        or parsed.fragment
-    ):
-        raise ValueError("TAVILY_BASE_URL must be a credential-free HTTPS origin")
-    return urllib.parse.urlunsplit(("https", parsed.netloc, "/search", "", ""))
 
 
 def _searxng_url_is_loopback() -> bool:
@@ -1773,6 +1656,16 @@ async def _searxng_request(
 async def _searxng_search(query: str, num_results: int) -> _BackendOutcome:
     started = time.monotonic()
     circuit_before = _breaker.snapshot("searxng")
+    if not _searxng_url_is_loopback():
+        return _BackendOutcome(
+            backend="searxng",
+            state="error",
+            elapsed_ms=round((time.monotonic() - started) * 1000, 1),
+            error="SearXNG URL is not loopback",
+            circuit_before=str(circuit_before["state"]),
+            circuit_after=str(circuit_before["state"]),
+            circuit_failures=int(circuit_before["consecutive_failures"]),
+        )
     if not _breaker.allow("searxng"):
         logger.info("SearXNG circuit open; skipping")
         circuit_after = _breaker.snapshot("searxng")
@@ -1935,138 +1828,19 @@ async def _searxng_image_search(query: str, num_results: int) -> _BackendOutcome
 
 
 # --------------------------------------------------------------------------- #
-# Backend: Tavily.
-# --------------------------------------------------------------------------- #
-
-async def _tavily_search(query: str, num_results: int, api_key: str) -> _BackendOutcome:
-    """Search Tavily in keyed or keyless mode without mixing credential roles."""
-    started = time.monotonic()
-    credential_mode = "keyed" if api_key else "keyless"
-    circuit_before = _breaker.snapshot("tavily")
-    if not _breaker.allow("tavily"):
-        logger.info("Tavily circuit open; skipping")
-        circuit_after = _breaker.snapshot("tavily")
-        return _BackendOutcome(
-            backend="tavily",
-            state="circuit_open",
-            elapsed_ms=round((time.monotonic() - started) * 1000, 1),
-            credential_mode=credential_mode,
-            circuit_before=str(circuit_before["state"]),
-            circuit_after=str(circuit_after["state"]),
-            circuit_failures=int(circuit_after["consecutive_failures"]),
-        )
-
-    payload = {
-        "query": query,
-        "max_results": min(MAX_NUM_RESULTS, max(1, num_results)),
-        "search_depth": "basic",
-        "include_answer": False,
-        "include_raw_content": False,
-        "topic": "general",
-    }
-    headers = (
-        {"Authorization": f"Bearer {api_key}", "Accept-Encoding": "identity"}
-        if api_key
-        else {"X-Tavily-Access-Mode": "keyless", "Accept-Encoding": "identity"}
-    )
-    try:
-        search_url = _tavily_search_url()
-        client = await _client()
-        async with client.stream(
-            "POST",
-            search_url,
-            json=payload,
-            headers=headers,
-            timeout=TAVILY_TIMEOUT,
-        ) as response:
-            response.raise_for_status()
-            data = await _limited_json_object(response, provider="Tavily")
-    except asyncio.CancelledError:
-        _breaker.record_aborted("tavily")
-        raise
-    except httpx.TimeoutException:
-        circuit_transition = _breaker.record_failure("tavily")
-        state = "timeout"
-        error = "request timed out"
-        http_status = None
-    except httpx.HTTPStatusError as exc:
-        status_code = exc.response.status_code
-        http_status = status_code
-        # Authentication/client errors prove the provider is reachable and
-        # must not globally circuit-break valid keys or keyless traffic.
-        if status_code in {400, 401, 403, 404, 422}:
-            circuit_transition = _breaker.record_success("tavily")
-        else:
-            circuit_transition = _breaker.record_failure("tavily")
-        state = "error"
-        error = f"HTTP {status_code}"
-    except Exception as exc:
-        circuit_transition = _breaker.record_failure("tavily")
-        state = "error"
-        error = type(exc).__name__
-        http_status = None
-    else:
-        circuit_transition = _breaker.record_success("tavily")
-        circuit_after = _breaker.snapshot("tavily")
-        raw_results = data.get("results", [])
-        if not isinstance(raw_results, list):
-            raw_results = []
-        results = [
-            normalized
-            for item in raw_results[:num_results]
-            if isinstance(item, dict)
-            and (normalized := _normalize_tavily_result(item)) is not None
-        ]
-        return _BackendOutcome(
-            backend="tavily",
-            results=results,
-            ok=True,
-            state="ok" if results else "empty",
-            elapsed_ms=round((time.monotonic() - started) * 1000, 1),
-            attempts=1,
-            http_status=response.status_code,
-            credential_mode=credential_mode,
-            circuit_before=str(circuit_before["state"]),
-            circuit_after=str(circuit_after["state"]),
-            circuit_transition=circuit_transition,
-            circuit_failures=int(circuit_after["consecutive_failures"]),
-        )
-
-    circuit_after = _breaker.snapshot("tavily")
-    logger.warning(
-        "Tavily search failed (%s): %s",
-        "keyed" if api_key else "keyless",
-        error,
-    )
-    return _BackendOutcome(
-        backend="tavily",
-        state=state,
-        elapsed_ms=round((time.monotonic() - started) * 1000, 1),
-        attempts=1,
-        error=error,
-        http_status=http_status,
-        credential_mode=credential_mode,
-        circuit_before=str(circuit_before["state"]),
-        circuit_after=str(circuit_after["state"]),
-        circuit_transition=circuit_transition,
-        circuit_failures=int(circuit_after["consecutive_failures"]),
-    )
-
-
-# --------------------------------------------------------------------------- #
-# Backend: Kagi (ADR 0002).
+# Backend: Brave Search (ADR 0002). Independent index; raw ranked results.
 # --------------------------------------------------------------------------- #
 
 
-def _kagi_search_url() -> str:
-    """Return the configured Kagi search endpoint only when credentials can be
-    sent safely. Mirrors the Tavily credential-free-origin guard.
+def _brave_search_url() -> str:
+    """Return the configured Brave search endpoint only when credentials can
+    be sent safely. Mirrors the SearXNG credential-free-origin guard.
     """
-    parsed = urllib.parse.urlsplit(KAGI_BASE_URL)
+    parsed = urllib.parse.urlsplit(BRAVE_BASE_URL)
     try:
         _ = parsed.port
     except ValueError as exc:
-        raise ValueError("KAGI_BASE_URL must be a credential-free HTTPS origin") from exc
+        raise ValueError("BRAVE_BASE_URL must be a credential-free HTTPS origin") from exc
     if (
         parsed.scheme.lower() != "https"
         or not parsed.hostname
@@ -2076,20 +1850,25 @@ def _kagi_search_url() -> str:
         or parsed.query
         or parsed.fragment
     ):
-        raise ValueError("KAGI_BASE_URL must be a credential-free HTTPS origin")
-    return urllib.parse.urlunsplit(("https", parsed.netloc, "/api/v1/search", "", ""))
+        raise ValueError("BRAVE_BASE_URL must be a credential-free HTTPS origin")
+    return urllib.parse.urlunsplit(("https", parsed.netloc, "/res/v1/web/search", "", ""))
 
 
-async def _kagi_search(query: str, num_results: int, api_key: str) -> _BackendOutcome:
-    """Search Kagi. Requires an API key (no keyless mode)."""
+async def _brave_search(query: str, num_results: int, api_key: str) -> _BackendOutcome:
+    """Search Brave. Requires an API key (no keyless mode).
+
+    Brave's web search endpoint returns a `web.results` array of ranked
+    results. We request `text_decorations=false` so snippets are plain text,
+    and `safesearch=moderate` to match the broker's default content policy.
+    """
     started = time.monotonic()
     credential_mode = "keyed" if api_key else "none"
-    circuit_before = _breaker.snapshot("kagi")
+    circuit_before = _breaker.snapshot("brave")
     if not api_key:
-        logger.info("Kagi search skipped: no API key configured")
-        circuit_after = _breaker.snapshot("kagi")
+        logger.info("Brave search skipped: no API key configured")
+        circuit_after = _breaker.snapshot("brave")
         return _BackendOutcome(
-            backend="kagi",
+            backend="brave",
             state="error",
             elapsed_ms=round((time.monotonic() - started) * 1000, 1),
             error="missing API key",
@@ -2098,11 +1877,11 @@ async def _kagi_search(query: str, num_results: int, api_key: str) -> _BackendOu
             circuit_after=str(circuit_after["state"]),
             circuit_failures=int(circuit_after["consecutive_failures"]),
         )
-    if not _breaker.allow("kagi"):
-        logger.info("Kagi circuit open; skipping")
-        circuit_after = _breaker.snapshot("kagi")
+    if not _breaker.allow("brave"):
+        logger.info("Brave circuit open; skipping")
+        circuit_after = _breaker.snapshot("brave")
         return _BackendOutcome(
-            backend="kagi",
+            backend="brave",
             state="circuit_open",
             elapsed_ms=round((time.monotonic() - started) * 1000, 1),
             credential_mode=credential_mode,
@@ -2111,25 +1890,33 @@ async def _kagi_search(query: str, num_results: int, api_key: str) -> _BackendOu
             circuit_failures=int(circuit_after["consecutive_failures"]),
         )
 
-    body = {"query": query}
-    headers = {"Authorization": f"Bot {api_key}", "Accept-Encoding": "identity"}
+    # Overfetch to allow URL dedupe before truncation to num_results.
+    fetch_count = min(num_results * RESULT_OVERFETCH_FACTOR, MAX_NUM_RESULTS)
+    params = {
+        "q": query,
+        "count": str(fetch_count),
+        "safesearch": "moderate",
+        "text_decorations": "false",
+    }
+    headers = {"X-Subscription-Token": api_key, "Accept": "application/json",
+               "Accept-Encoding": "identity"}
     try:
-        search_url = _kagi_search_url()
+        search_url = _brave_search_url()
         client = await _client()
         async with client.stream(
-            "POST",
+            "GET",
             search_url,
-            json=body,
+            params=params,
             headers=headers,
-            timeout=KAGI_TIMEOUT,
+            timeout=BRAVE_TIMEOUT,
         ) as response:
             response.raise_for_status()
-            data = await _limited_json_object(response, provider="Kagi")
+            data = await _limited_json_object(response, provider="Brave")
     except asyncio.CancelledError:
-        _breaker.record_aborted("kagi")
+        _breaker.record_aborted("brave")
         raise
     except httpx.TimeoutException:
-        circuit_transition = _breaker.record_failure("kagi")
+        circuit_transition = _breaker.record_failure("brave")
         state = "timeout"
         error = "request timed out"
         http_status = None
@@ -2138,31 +1925,31 @@ async def _kagi_search(query: str, num_results: int, api_key: str) -> _BackendOu
         http_status = status_code
         # Auth/client errors prove reachability; do not circuit-break a valid key.
         if status_code in {400, 401, 403, 404, 422}:
-            circuit_transition = _breaker.record_success("kagi")
+            circuit_transition = _breaker.record_success("brave")
         else:
-            circuit_transition = _breaker.record_failure("kagi")
+            circuit_transition = _breaker.record_failure("brave")
         state = "error"
         error = f"HTTP {status_code}"
     except Exception as exc:
-        circuit_transition = _breaker.record_failure("kagi")
+        circuit_transition = _breaker.record_failure("brave")
         state = "error"
         error = type(exc).__name__
         http_status = None
     else:
-        circuit_transition = _breaker.record_success("kagi")
-        circuit_after = _breaker.snapshot("kagi")
-        raw_results = data.get("data") if isinstance(data, dict) else None
-        # Defensively accept a `results` key as well in case v1 renames `data`.
-        if not isinstance(raw_results, list):
-            raw_results = data.get("results", []) if isinstance(data, dict) else []
+        circuit_transition = _breaker.record_success("brave")
+        circuit_after = _breaker.snapshot("brave")
+        web_block = data.get("web") if isinstance(data, dict) else None
+        raw_results = (
+            web_block.get("results", []) if isinstance(web_block, dict) else []
+        )
         results = [
             normalized
             for item in raw_results[:num_results]
             if isinstance(item, dict)
-            and (normalized := _normalize_kagi_result(item)) is not None
+            and (normalized := _normalize_brave_result(item)) is not None
         ]
         return _BackendOutcome(
-            backend="kagi",
+            backend="brave",
             results=results,
             ok=True,
             state="ok" if results else "empty",
@@ -2176,10 +1963,10 @@ async def _kagi_search(query: str, num_results: int, api_key: str) -> _BackendOu
             circuit_failures=int(circuit_after["consecutive_failures"]),
         )
 
-    circuit_after = _breaker.snapshot("kagi")
-    logger.warning("Kagi search failed (%s): %s", credential_mode, error)
+    circuit_after = _breaker.snapshot("brave")
+    logger.warning("Brave search failed (%s): %s", credential_mode, error)
     return _BackendOutcome(
-        backend="kagi",
+        backend="brave",
         state=state,
         elapsed_ms=round((time.monotonic() - started) * 1000, 1),
         attempts=1,
@@ -2193,20 +1980,13 @@ async def _kagi_search(query: str, num_results: int, api_key: str) -> _BackendOu
     )
 
 
-# --------------------------------------------------------------------------- #
-# Backend: Perplexity Sonar (ADR 0002). Generated output + search_results.
-# --------------------------------------------------------------------------- #
-
-
-def _sonar_completions_url() -> str:
-    """Return the Perplexity chat-completions endpoint only when credentials
-    can be sent safely. Mirrors the Kagi/Tavily credential-free-origin guard.
-    """
-    parsed = urllib.parse.urlsplit(PERPLEXITY_BASE_URL)
+def _brave_image_search_url() -> str:
+    """Return the Brave image search endpoint (same origin guard as web search)."""
+    parsed = urllib.parse.urlsplit(BRAVE_BASE_URL)
     try:
         _ = parsed.port
     except ValueError as exc:
-        raise ValueError("PERPLEXITY_BASE_URL must be a credential-free HTTPS origin") from exc
+        raise ValueError("BRAVE_BASE_URL must be a credential-free HTTPS origin") from exc
     if (
         parsed.scheme.lower() != "https"
         or not parsed.hostname
@@ -2216,26 +1996,20 @@ def _sonar_completions_url() -> str:
         or parsed.query
         or parsed.fragment
     ):
-        raise ValueError("PERPLEXITY_BASE_URL must be a credential-free HTTPS origin")
-    return urllib.parse.urlunsplit(("https", parsed.netloc, "/chat/completions", "", ""))
+        raise ValueError("BRAVE_BASE_URL must be a credential-free HTTPS origin")
+    return urllib.parse.urlunsplit(("https", parsed.netloc, "/res/v1/images/search", "", ""))
 
 
-async def _sonar_search(query: str, num_results: int, api_key: str) -> _BackendOutcome:
-    """Call Perplexity Sonar and return normalized search_results plus answer.
-
-    Sonar is a generated-output provider (OpenAI-compatible chat completions).
-    The generated answer is surfaced separately so it is never silently merged
-    into a raw result list; the ranked `search_results` are normalized and ride
-    the standard BackendOutcome contract. Requires an API key (no keyless mode).
-    """
+async def _brave_image_search(query: str, num_results: int, api_key: str) -> _BackendOutcome:
+    """Search images via Brave. Requires an API key (no keyless mode)."""
     started = time.monotonic()
     credential_mode = "keyed" if api_key else "none"
-    circuit_before = _breaker.snapshot("sonar")
+    circuit_before = _breaker.snapshot("brave")
     if not api_key:
-        logger.info("Sonar search skipped: no API key configured")
-        circuit_after = _breaker.snapshot("sonar")
+        logger.info("Brave image search skipped: no API key configured")
+        circuit_after = _breaker.snapshot("brave")
         return _BackendOutcome(
-            backend="sonar",
+            backend="brave",
             state="error",
             elapsed_ms=round((time.monotonic() - started) * 1000, 1),
             error="missing API key",
@@ -2244,11 +2018,11 @@ async def _sonar_search(query: str, num_results: int, api_key: str) -> _BackendO
             circuit_after=str(circuit_after["state"]),
             circuit_failures=int(circuit_after["consecutive_failures"]),
         )
-    if not _breaker.allow("sonar"):
-        logger.info("Sonar circuit open; skipping")
-        circuit_after = _breaker.snapshot("sonar")
+    if not _breaker.allow("brave"):
+        logger.info("Brave circuit open; skipping image search")
+        circuit_after = _breaker.snapshot("brave")
         return _BackendOutcome(
-            backend="sonar",
+            backend="brave",
             state="circuit_open",
             elapsed_ms=round((time.monotonic() - started) * 1000, 1),
             credential_mode=credential_mode,
@@ -2257,26 +2031,31 @@ async def _sonar_search(query: str, num_results: int, api_key: str) -> _BackendO
             circuit_failures=int(circuit_after["consecutive_failures"]),
         )
 
-    payload = {
-        "model": SONAR_MODEL,
-        "messages": [{"role": "user", "content": query}],
-        "return_search_results": True,
-        "search_recency_filter": "month",
+    fetch_count = min(num_results * RESULT_OVERFETCH_FACTOR, MAX_NUM_RESULTS)
+    params = {
+        "q": query,
+        "count": str(fetch_count),
+        "safesearch": "strict",
     }
-    headers = {"Authorization": f"Bearer {api_key}", "Accept-Encoding": "identity"}
+    headers = {"X-Subscription-Token": api_key, "Accept": "application/json",
+               "Accept-Encoding": "identity"}
     try:
-        url = _sonar_completions_url()
+        search_url = _brave_image_search_url()
         client = await _client()
         async with client.stream(
-            "POST", url, json=payload, headers=headers, timeout=PERPLEXITY_TIMEOUT,
+            "GET",
+            search_url,
+            params=params,
+            headers=headers,
+            timeout=BRAVE_TIMEOUT,
         ) as response:
             response.raise_for_status()
-            data = await _limited_json_object(response, provider="Sonar")
+            data = await _limited_json_object(response, provider="Brave")
     except asyncio.CancelledError:
-        _breaker.record_aborted("sonar")
+        _breaker.record_aborted("brave")
         raise
     except httpx.TimeoutException:
-        circuit_transition = _breaker.record_failure("sonar")
+        circuit_transition = _breaker.record_failure("brave")
         state = "timeout"
         error = "request timed out"
         http_status = None
@@ -2284,44 +2063,31 @@ async def _sonar_search(query: str, num_results: int, api_key: str) -> _BackendO
         status_code = exc.response.status_code
         http_status = status_code
         if status_code in {400, 401, 403, 404, 422}:
-            circuit_transition = _breaker.record_success("sonar")
+            circuit_transition = _breaker.record_success("brave")
         else:
-            circuit_transition = _breaker.record_failure("sonar")
+            circuit_transition = _breaker.record_failure("brave")
         state = "error"
         error = f"HTTP {status_code}"
     except Exception as exc:
-        circuit_transition = _breaker.record_failure("sonar")
+        circuit_transition = _breaker.record_failure("brave")
         state = "error"
         error = type(exc).__name__
         http_status = None
     else:
-        circuit_transition = _breaker.record_success("sonar")
-        circuit_after = _breaker.snapshot("sonar")
-        choices = data.get("choices") if isinstance(data, dict) else None
-        answer = ""
-        if isinstance(choices, list) and choices:
-            message = choices[0].get("message") if isinstance(choices[0], dict) else None
-            if isinstance(message, dict):
-                answer = str(message.get("content") or "")
-        citations = data.get("citations") if isinstance(data, dict) else None
-        if not isinstance(citations, list):
-            citations = []
-        raw_results = data.get("search_results") if isinstance(data, dict) else None
-        if not isinstance(raw_results, list):
-            raw_results = []
+        circuit_transition = _breaker.record_success("brave")
+        circuit_after = _breaker.snapshot("brave")
+        raw_results = data.get("results", []) if isinstance(data, dict) else []
         results = [
             normalized
             for item in raw_results[:num_results]
             if isinstance(item, dict)
-            and (normalized := _normalize_sonar_result(item)) is not None
+            and (normalized := _normalize_brave_image_result(item)) is not None
         ]
-        state = "ok" if (results or answer) else "empty"
         return _BackendOutcome(
-            backend="sonar",
+            backend="brave",
             results=results,
-            suggestions=[],
-            ok=bool(results or answer),
-            state=state,
+            ok=True,
+            state="ok" if results else "empty",
             elapsed_ms=round((time.monotonic() - started) * 1000, 1),
             attempts=1,
             http_status=response.status_code,
@@ -2330,14 +2096,12 @@ async def _sonar_search(query: str, num_results: int, api_key: str) -> _BackendO
             circuit_after=str(circuit_after["state"]),
             circuit_transition=circuit_transition,
             circuit_failures=int(circuit_after["consecutive_failures"]),
-            answer=answer,
-            citations=[str(c) for c in citations if isinstance(c, str)],
         )
 
-    circuit_after = _breaker.snapshot("sonar")
-    logger.warning("Sonar search failed (%s): %s", credential_mode, error)
+    circuit_after = _breaker.snapshot("brave")
+    logger.warning("Brave image search failed (%s): %s", credential_mode, error)
     return _BackendOutcome(
-        backend="sonar",
+        backend="brave",
         state=state,
         elapsed_ms=round((time.monotonic() - started) * 1000, 1),
         attempts=1,
@@ -2349,73 +2113,16 @@ async def _sonar_search(query: str, num_results: int, api_key: str) -> _BackendO
         circuit_transition=circuit_transition,
         circuit_failures=int(circuit_after["consecutive_failures"]),
     )
-
-
-# --------------------------------------------------------------------------- #
-# Kagi Extract (ADR 0002 Phase 7) — server-side page content verification.
-# --------------------------------------------------------------------------- #
-
-
-def _kagi_extract_url() -> str:
-    """Return the Kagi extract endpoint with the same credential-free-origin guard."""
-    parsed = urllib.parse.urlsplit(KAGI_BASE_URL)
-    try:
-        _ = parsed.port
-    except ValueError as exc:
-        raise ValueError("KAGI_BASE_URL must be a credential-free HTTPS origin") from exc
-    if (
-        parsed.scheme.lower() != "https"
-        or not parsed.hostname
-        or parsed.username is not None
-        or parsed.password is not None
-        or parsed.path not in {"", "/"}
-        or parsed.query
-        or parsed.fragment
-    ):
-        raise ValueError("KAGI_BASE_URL must be a credential-free HTTPS origin")
-    return urllib.parse.urlunsplit(("https", parsed.netloc, "/api/v1/extract", "", ""))
-
-
-async def _kagi_extract(url: str, api_key: str) -> dict[str, Any]:
-    """Fetch clean markdown content for one URL via the Kagi Extract API.
-
-    Returns {"ok": bool, "markdown": str, "error": str | None}. Used as a
-    server-side verification/content layer after search discovery; never used to
-    automate consumer SERPs. Requires a Kagi key (no keyless mode).
-    """
-    if not api_key:
-        return {"ok": False, "markdown": "", "error": "missing API key"}
-    body = {"pages": [{"url": url}], "format": "json"}
-    headers = {"Authorization": f"Bot {api_key}", "Accept-Encoding": "identity"}
-    try:
-        extract_url = _kagi_extract_url()
-        client = await _client()
-        async with client.stream(
-            "POST", extract_url, json=body, headers=headers, timeout=FETCH_TIMEOUT,
-        ) as response:
-            response.raise_for_status()
-            data = await _limited_json_object(response, provider="Kagi")
-    except asyncio.CancelledError:
-        raise
-    except httpx.TimeoutException:
-        return {"ok": False, "markdown": "", "error": "request timed out"}
-    except httpx.HTTPStatusError as exc:
-        return {"ok": False, "markdown": "", "error": f"HTTP {exc.response.status_code}"}
-    except Exception as exc:
-        return {"ok": False, "markdown": "", "error": type(exc).__name__}
-    entries = data.get("data") if isinstance(data, dict) else None
-    if not isinstance(entries, list) or not entries:
-        return {"ok": False, "markdown": "", "error": "no extract data"}
-    first = entries[0] if isinstance(entries[0], dict) else {}
-    return {"ok": True, "markdown": str(first.get("markdown") or ""), "error": None}
-
-
-# --------------------------------------------------------------------------- #
-# Health probe.
 # --------------------------------------------------------------------------- #
 
 async def _probe_searxng() -> dict[str, Any]:
     started = time.monotonic()
+    if not _searxng_url_is_loopback():
+        return {
+            "reachable": False,
+            "error": "SearXNG URL is not loopback",
+            "latency_ms": round((time.monotonic() - started) * 1000, 1),
+        }
     try:
         client = await _client()
         resp = await client.get(f"{SEARXNG_URL}/healthz", timeout=3.0)
@@ -2435,23 +2142,31 @@ async def _probe_searxng() -> dict[str, Any]:
 async def _health_payload() -> dict[str, Any]:
     searxng = await _probe_searxng()
     searxng_breaker = _breaker.snapshot("searxng")
-    tavily_breaker = _breaker.snapshot("tavily")
     last_search = _last_search or {}
     provider_states = last_search.get("provider_states", {})
-    failed_states = {"error", "timeout", "circuit_open"}
     searxng_available = (
         bool(searxng.get("reachable"))
         and searxng_breaker["state"] != "open"
-        and provider_states.get("searxng") not in failed_states
     )
-    tavily_available = (
-        TAVILY_MODE != "disabled"
-        and tavily_breaker["state"] != "open"
-        and provider_states.get("tavily") not in failed_states
-    )
-    ready = searxng_available or tavily_available
+    # Provider-neutral readiness: any provider in the active stack whose
+    # credential is configured (or keyless) and whose circuit is not open.
+    stack_available = False
+    for p in _PROVIDERS:
+        breaker = _breaker.snapshot(p.name)
+        if breaker["state"] == "open":
+            continue
+        if p.name == "searxng":
+            if searxng_available:
+                stack_available = True
+                break
+        elif _provider_credential_configured(p.name):
+            stack_available = True
+            break
+    # A healthy diagnostic SearXNG instance must not make an unrelated active
+    # stack ready. Only providers selected by WEBSEARCH_PROVIDER_STACK count.
+    ready = stack_available
     last_status = last_search.get("status")
-    if searxng_available and last_status not in {"degraded", "error"}:
+    if ready and last_status not in {"degraded", "error"}:
         status = "ok"
     elif ready:
         status = "degraded"
@@ -2462,10 +2177,8 @@ async def _health_payload() -> dict[str, Any]:
         "ready": ready,
         "service": "mcp-websearch",
         "policy": {
-            "tavily_mode": TAVILY_MODE,
             "total_timeout_s": SEARCH_TOTAL_TIMEOUT,
             "searxng_timeout_s": SEARCH_TIMEOUT,
-            "tavily_timeout_s": TAVILY_TIMEOUT,
             "supplement_min_results": SUPPLEMENT_MIN_RESULTS,
         },
         "searxng_url": SEARXNG_URL,
@@ -2474,18 +2187,6 @@ async def _health_payload() -> dict[str, Any]:
             "available": searxng_available,
             "last_state": provider_states.get("searxng"),
             "circuit": searxng_breaker,
-        },
-        "tavily": {
-            "available": tavily_available,
-            "enabled": TAVILY_MODE != "disabled",
-            "env_key_configured": bool(TAVILY_API_KEY_ENV),
-            "keyless_supported": True,
-            "keyless_available": tavily_available,
-            "base_url": TAVILY_BASE_URL,
-            "mode": "keyed" if TAVILY_API_KEY_ENV else "keyless",
-            "credential_mode": "keyed" if TAVILY_API_KEY_ENV else "keyless",
-            "last_state": provider_states.get("tavily"),
-            "circuit": tavily_breaker,
         },
         "provider_stack": _PROVIDER_STACK,
         "providers": [
@@ -2566,15 +2267,6 @@ def _coerce_backend_outcome(value: Any, backend: str, elapsed_ms: float) -> _Bac
             state="ok" if results else ("empty" if ok else "error"),
             elapsed_ms=elapsed_ms,
             unresponsive_engines=unresponsive,
-        )
-    if backend == "tavily" and isinstance(value, tuple) and len(value) == 2:
-        results, ok = value
-        return _BackendOutcome(
-            backend=backend,
-            results=results,
-            ok=bool(ok),
-            state="ok" if results else ("empty" if ok else "error"),
-            elapsed_ms=elapsed_ms,
         )
     return _BackendOutcome(backend=backend, state="error", elapsed_ms=elapsed_ms)
 
@@ -2673,7 +2365,7 @@ def _quality_gate(
         fresh = 0
         for item in candidates:
             snippet = item.get("snippet") or ""
-            if "published " in snippet:  # set by _normalize_kagi_result
+            if "published " in snippet:  # set by _normalize_brave_result
                 fresh += 1
         if fresh == 0:
             return False, "quality_stale_for_news_intent"
@@ -2682,12 +2374,7 @@ def _quality_gate(
 
 
 def _quality_gate_enabled() -> bool:
-    if _QUALITY_GATE_MODE == "on":
-        return True
-    if _QUALITY_GATE_MODE == "off":
-        return False
-    # auto: enabled for every stack except the legacy searxng+tavily default.
-    return _PROVIDER_STACK != "searxng+tavily"
+    return _QUALITY_GATE_MODE == "on"
 
 
 def _fallback_reason(primary: _BackendOutcome, result_count: int, threshold: int) -> str:
@@ -2704,10 +2391,8 @@ def _fallback_reason(primary: _BackendOutcome, result_count: int, threshold: int
 
 
 def _result_backend(results: list[dict[str, Any]]) -> str:
-    # Derive the backend label from the distinct provider names on the results,
-    # preserving provider order. This generalizes the old tavily/searxng split
-    # to any provider pair (e.g. kagi+sonar) while producing identical labels
-    # for the legacy stack.
+    # Derive the backend label from the distinct provider names on the
+    # results, preserving provider order.
     names: list[str] = []
     for result in results:
         name = result.get("provider") or result.get("engine")
@@ -2747,6 +2432,7 @@ async def _web_search_impl(query: str, num_results: int = 8, *, mode: str | None
                 query,
                 "Search error: query must not be empty.",
                 timings_ms=timings_ms,
+                mode=effective_mode,
                 search_mode=effective_mode,
             ),
             status="error",
@@ -2754,6 +2440,7 @@ async def _web_search_impl(query: str, num_results: int = 8, *, mode: str | None
             requested_count=requested,
             result_count=0,
             timings_ms=timings_ms,
+            mode=effective_mode,
         )
     if len(query) > MAX_QUERY_CHARS:
         timings_ms = _default_timings_ms()
@@ -2763,6 +2450,7 @@ async def _web_search_impl(query: str, num_results: int = 8, *, mode: str | None
                 "",
                 f"Search error: query must be at most {MAX_QUERY_CHARS} characters.",
                 timings_ms=timings_ms,
+                mode=effective_mode,
                 search_mode=effective_mode,
             ),
             status="error",
@@ -2770,6 +2458,7 @@ async def _web_search_impl(query: str, num_results: int = 8, *, mode: str | None
             requested_count=requested,
             result_count=0,
             timings_ms=timings_ms,
+            mode=effective_mode,
         )
 
     # Sensitive / no-egress mode (ADR 0002 Phase 5): make no external call.
@@ -2786,6 +2475,7 @@ async def _web_search_impl(query: str, num_results: int = 8, *, mode: str | None
                 timings_ms=timings_ms,
                 attempted=[],
                 provider_states={},
+                mode=effective_mode,
                 search_mode=effective_mode,
             ),
             status="error",
@@ -2793,17 +2483,17 @@ async def _web_search_impl(query: str, num_results: int = 8, *, mode: str | None
             requested_count=requested,
             result_count=0,
             timings_ms=timings_ms,
+            mode=effective_mode,
         )
 
     candidate_limit = min(MAX_NUM_RESULTS, requested * RESULT_OVERFETCH_FACTOR)
 
     # Maximum-recall mode (ADR 0002 Phase 5): opt-in serial escalation across
     # every configured provider. Multiplies disclosure, so it is never the
-    # default. Results are merged and deduped; a generated answer (Sonar) is
-    # surfaced separately. This path bypasses the quality gate by design.
+    # default. Results are merged and deduped; a generated answer is surfaced
+    # separately. This path bypasses the quality gate by design.
     if effective_mode == "maximum_recall" and len(_PROVIDERS) >= 1:
         outcomes: list[_BackendOutcome] = []
-        attempted_mr: list[str] = []
         merged: list[dict[str, Any]] = []
         answer_mr: str | None = None
         citations_mr: list[str] = []
@@ -2825,11 +2515,8 @@ async def _web_search_impl(query: str, num_results: int = 8, *, mode: str | None
                     provider.search(query, candidate_limit),
                     min(provider.timeout, remaining),
                 )
-                if outcome.credential_mode == "none" and isinstance(provider, _TavilyProvider):
-                    outcome.credential_mode = provider.credential_label()
                 outcomes.append(outcome)
             last = outcomes[-1]
-            attempted_mr.append(last.backend)
             provider_states_mr[last.backend] = last.state
             merged.extend(last.results)
             if last.answer and not answer_mr:
@@ -2837,8 +2524,10 @@ async def _web_search_impl(query: str, num_results: int = 8, *, mode: str | None
             if last.citations and not citations_mr:
                 citations_mr = last.citations
         results = _dedupe_and_rank(merged, requested)
+        attempted_mr = _attempted_providers(outcomes)
         timings_ms = _timings(started, outcomes)
         backend = _result_backend(results)
+        fallback_reason_mr: str | None = None
         if results or answer_mr:
             status = "ok" if any(o.ok for o in outcomes) else "degraded"
             rendered = _format_results(
@@ -2846,36 +2535,49 @@ async def _web_search_impl(query: str, num_results: int = 8, *, mode: str | None
                 status=status, backend=backend, attempted=attempted_mr,
                 timings_ms=timings_ms, provider_states=provider_states_mr,
                 answer=answer_mr, citations=citations_mr or None,
-                search_mode=effective_mode,
+                mode=effective_mode, search_mode=effective_mode,
             )
-        else:
-            status = "empty" if any(o.ok for o in outcomes) else "error"
+        elif any(o.ok for o in outcomes):
+            status = "empty"
             backend = "none"
             rendered = _format_results(
                 query, [], [], status=status, backend=backend, attempted=attempted_mr,
                 timings_ms=timings_ms, provider_states=provider_states_mr,
+                mode=effective_mode, search_mode=effective_mode,
+            )
+        else:
+            status = "error"
+            backend = "none"
+            failed = next((outcome for outcome in reversed(outcomes) if not outcome.ok), outcomes[-1])
+            fallback_reason_mr = _fallback_reason(failed, 0, requested)
+            rendered = _search_error_payload(
+                query,
+                "Search error: all configured providers failed.",
+                attempted=attempted_mr,
+                fallback_reason=fallback_reason_mr,
+                timings_ms=timings_ms,
+                provider_states=provider_states_mr,
+                mode=effective_mode,
                 search_mode=effective_mode,
             )
         return _finish_search(
             rendered, status=status, backend=backend, requested_count=requested,
-            result_count=len(results), timings_ms=timings_ms, outcomes=outcomes,
+            result_count=len(results), fallback_reason=fallback_reason_mr,
+            timings_ms=timings_ms, outcomes=outcomes, mode=effective_mode,
         )
 
     primary = _PROVIDERS[0]
     fallback = _PROVIDERS[1] if len(_PROVIDERS) > 1 else None
-    attempted = [primary.name]
     primary_outcome = await _run_backend(
         primary.name,
         primary.search(query, candidate_limit),
         min(primary.timeout, SEARCH_TOTAL_TIMEOUT),
     )
+    attempted = _attempted_providers([primary_outcome])
     primary_candidates = _dedupe_and_rank(primary_outcome.results, candidate_limit)
     threshold = min(SUPPLEMENT_MIN_RESULTS, requested)
     provider_states = {primary.name: primary_outcome.state}
-    policy_triggers_fallback = fallback is not None and (
-        (TAVILY_MODE == "fallback" and not primary_candidates)
-        or (TAVILY_MODE == "supplement" and len(primary_candidates) < threshold)
-    )
+    policy_triggers_fallback = fallback is not None and not primary_candidates
     # Quality gate (ADR 0002 Phase 3): only evaluated when the policy rules did
     # not already trigger fallback, and only on a nonempty, reachable primary.
     # The gate is transient and query-free; it never persists snippets/titles.
@@ -2905,6 +2607,8 @@ async def _web_search_impl(query: str, num_results: int = 8, *, mode: str | None
                 timings_ms=timings_ms,
                 unresponsive_engines=primary_outcome.unresponsive_engines,
                 provider_states=provider_states,
+                mode=effective_mode,
+                search_mode=effective_mode,
             )
         elif primary_outcome.ok:
             degraded = primary_outcome.state == "degraded"
@@ -2921,14 +2625,13 @@ async def _web_search_impl(query: str, num_results: int = 8, *, mode: str | None
                 timings_ms=timings_ms,
                 unresponsive_engines=primary_outcome.unresponsive_engines,
                 provider_states=provider_states,
+                mode=effective_mode,
+                search_mode=effective_mode,
             )
         else:
             status = "error"
             fallback_reason = _fallback_reason(primary_outcome, 0, threshold)
-            if fallback is None:
-                message = f"Search error: {primary.name} search failed and no fallback provider is configured."
-            else:
-                message = "Search error: SearXNG failed and Tavily is disabled by policy."
+            message = f"Search error: {primary.name} search failed and no fallback provider is configured."
             rendered = _search_error_payload(
                 query,
                 message,
@@ -2938,6 +2641,8 @@ async def _web_search_impl(query: str, num_results: int = 8, *, mode: str | None
                 timings_ms=timings_ms,
                 unresponsive_engines=primary_outcome.unresponsive_engines,
                 provider_states=provider_states,
+                mode=effective_mode,
+                search_mode=effective_mode,
             )
         return _finish_search(
             rendered,
@@ -2948,9 +2653,9 @@ async def _web_search_impl(query: str, num_results: int = 8, *, mode: str | None
             fallback_reason=fallback_reason,
             timings_ms=timings_ms,
             outcomes=[primary_outcome],
+            mode=effective_mode,
         )
 
-    attempted.append(fallback.name)
     reason = quality_reason if quality_reason is not None else _fallback_reason(
         primary_outcome, len(primary_candidates), threshold
     )
@@ -2972,13 +2677,10 @@ async def _web_search_impl(query: str, num_results: int = 8, *, mode: str | None
             fallback.search(query, candidate_limit),
             min(fallback.timeout, remaining),
         )
-        if fallback_outcome.credential_mode == "none" and isinstance(fallback, _TavilyProvider):
-            fallback_outcome.credential_mode = fallback.credential_label()
     provider_states[fallback.name] = fallback_outcome.state
+    attempted = _attempted_providers([primary_outcome, fallback_outcome])
 
-    if TAVILY_MODE == "supplement" or (
-        TAVILY_MODE == "fallback" and primary_outcome.state == "degraded"
-    ):
+    if primary_candidates:
         results = _merge_with_secondary_reserve(primary_candidates, fallback_outcome.results, requested)
     else:
         results = _dedupe_and_rank(fallback_outcome.results, requested)
@@ -3001,14 +2703,12 @@ async def _web_search_impl(query: str, num_results: int = 8, *, mode: str | None
             provider_states=provider_states,
             answer=answer,
             citations=citations,
+            mode=effective_mode,
+            search_mode=effective_mode,
         )
     elif not primary_outcome.ok and not fallback_outcome.ok:
         status = "error"
-        both_failed_msg = (
-            "Search error: SearXNG unreachable and Tavily failed."
-            if primary.name == "searxng" and fallback.name == "tavily"
-            else f"Search error: {primary.name} and {fallback.name} both failed."
-        )
+        both_failed_msg = f"Search error: {primary.name} and {fallback.name} both failed."
         rendered = _search_error_payload(
             query,
             both_failed_msg,
@@ -3018,6 +2718,8 @@ async def _web_search_impl(query: str, num_results: int = 8, *, mode: str | None
             timings_ms=timings_ms,
             unresponsive_engines=primary_outcome.unresponsive_engines,
             provider_states=provider_states,
+            mode=effective_mode,
+            search_mode=effective_mode,
         )
     else:
         status = "empty" if primary_outcome.ok and fallback_outcome.ok else "degraded"
@@ -3035,6 +2737,8 @@ async def _web_search_impl(query: str, num_results: int = 8, *, mode: str | None
             provider_states=provider_states,
             answer=answer,
             citations=citations,
+            mode=effective_mode,
+            search_mode=effective_mode,
         )
     return _finish_search(
         rendered,
@@ -3045,92 +2749,19 @@ async def _web_search_impl(query: str, num_results: int = 8, *, mode: str | None
         fallback_reason=reason,
         timings_ms=timings_ms,
         outcomes=[primary_outcome, fallback_outcome],
+        mode=effective_mode,
     )
 
 
 @mcp.tool()
 async def web_search(query: str, num_results: int = 8, mode: str | None = None) -> str:
-    """Search SearXNG first, then apply the configured Tavily egress policy.
+    """Search the configured Brave (default) or SearXNG provider stack.
 
     Optional `mode` selects the ADR 0002 routing mode: `normal` (default),
     `sensitive` (no external egress; refuses without a local corpus), or
     `maximum_recall` (opt-in serial escalation across all configured providers).
     """
     return await _web_search_impl(query, num_results, mode=mode)
-
-
-@mcp.tool()
-async def answer_search(query: str, num_results: int = 8) -> str:
-    """Ask Perplexity Sonar directly for a grounded answer with citations.
-
-    This is the ADR 0002 `answer`/`research` route: it bypasses the raw ranked
-    providers and returns Sonar's generated answer plus its `search_results`.
-    Requires a Perplexity API key. The generated answer is never merged into a
-    raw result list; it travels as the `answer` field with `citations`.
-    """
-    started = time.monotonic()
-    query = query.strip()
-    requested = min(MAX_NUM_RESULTS, max(1, int(num_results)))
-    if not query:
-        timings_ms = _default_timings_ms()
-        timings_ms["total"] = round((time.monotonic() - started) * 1000, 1)
-        return _finish_search(
-            _search_error_payload(
-                query, "Answer search error: query must not be empty.",
-                timings_ms=timings_ms, mode="answer",
-            ),
-            status="error", backend="none",
-            requested_count=requested, result_count=0, timings_ms=timings_ms,
-        )
-    if len(query) > MAX_QUERY_CHARS:
-        timings_ms = _default_timings_ms()
-        timings_ms["total"] = round((time.monotonic() - started) * 1000, 1)
-        return _finish_search(
-            _search_error_payload(
-                "",
-                f"Answer search error: query must be at most {MAX_QUERY_CHARS} characters.",
-                timings_ms=timings_ms, mode="answer",
-            ),
-            status="error", backend="none",
-            requested_count=requested, result_count=0, timings_ms=timings_ms,
-        )
-    outcome = await _run_backend(
-        "sonar",
-        _sonar_search(query, requested, _resolve_perplexity_key()),
-        min(PERPLEXITY_TIMEOUT, SEARCH_TOTAL_TIMEOUT),
-    )
-    provider_states = {"sonar": outcome.state}
-    results = _dedupe_and_rank(outcome.results, requested)
-    timings_ms = _timings(started, [outcome])
-    if results or outcome.answer:
-        status = "ok" if outcome.ok else "degraded"
-        backend = "sonar"
-        rendered = _format_results(
-            query, results, [],
-            status=status, backend=backend, attempted=["sonar"],
-            timings_ms=timings_ms, provider_states=provider_states,
-            answer=outcome.answer or None, citations=outcome.citations or None,
-            mode="answer",
-        )
-    elif outcome.ok:
-        status = "empty"
-        backend = "none"
-        rendered = _format_results(
-            query, [], [], status=status, backend=backend, attempted=["sonar"],
-            timings_ms=timings_ms, provider_states=provider_states, mode="answer",
-        )
-    else:
-        status = "error"
-        backend = "none"
-        rendered = _search_error_payload(
-            query, "Answer search error: Sonar failed and no fallback is configured.",
-            attempted=["sonar"], fallback_reason=_fallback_reason(outcome, 0, requested),
-            timings_ms=timings_ms, provider_states=provider_states, mode="answer",
-        )
-    return _finish_search(
-        rendered, status=status, backend=backend, requested_count=requested,
-        result_count=len(results), timings_ms=timings_ms, outcomes=[outcome], mode="answer",
-    )
 
 
 def _batch_error_payload(message: str, started: float, requested: int) -> str:
@@ -3143,6 +2774,7 @@ def _batch_error_payload(message: str, started: float, requested: int) -> str:
         fallback_reason=None,
         total_latency_ms=float(timings_ms["total"]),
         outcomes=[],
+        mode=_SEARCH_MODE,
     )
     return json.dumps(
         {
@@ -3152,6 +2784,7 @@ def _batch_error_payload(message: str, started: float, requested: int) -> str:
             "duplicates_ignored": 0,
             "results": [],
             "timings_ms": timings_ms,
+            "mode": _SEARCH_MODE,
         }
     )
 
@@ -3172,6 +2805,7 @@ def _batch_timeout_item(query: str, requested: int, elapsed_ms: float) -> dict[s
         fallback_reason="batch_deadline",
         total_latency_ms=elapsed_ms,
         outcomes=[],
+        mode=_SEARCH_MODE,
     )
     return {
         "query": query,
@@ -3181,8 +2815,8 @@ def _batch_timeout_item(query: str, requested: int, elapsed_ms: float) -> dict[s
         "backend": "none",
         "attempted": [],
         "fallback_reason": "batch_deadline",
-        "timings_ms": {"total": elapsed_ms, "searxng": None, "tavily": None},
-        "mode": TAVILY_MODE,
+        "timings_ms": {**_default_timings_ms(), "total": elapsed_ms},
+        "mode": _SEARCH_MODE,
         "unresponsive_engines": [],
         "provider_states": {},
         "error": "Search error: batch deadline exceeded.",
@@ -3246,6 +2880,7 @@ async def batch_web_search(queries: BatchQueries, num_results: int = 8) -> str:
                 fallback_reason=None,
                 total_latency_ms=elapsed_ms,
                 outcomes=[],
+                mode=_SEARCH_MODE,
             )
             return {
                 "query": query,
@@ -3255,8 +2890,8 @@ async def batch_web_search(queries: BatchQueries, num_results: int = 8) -> str:
                 "backend": "none",
                 "attempted": [],
                 "fallback_reason": None,
-                "timings_ms": {"total": elapsed_ms, "searxng": None, "tavily": None},
-                "mode": TAVILY_MODE,
+                "timings_ms": {**_default_timings_ms(), "total": elapsed_ms},
+                "mode": _SEARCH_MODE,
                 "unresponsive_engines": [],
                 "provider_states": {},
                 "error": "Search error: internal batch item failure.",
@@ -3298,14 +2933,16 @@ async def batch_web_search(queries: BatchQueries, num_results: int = 8) -> str:
             "duplicates_ignored": duplicates_ignored,
             "results": items,
             "timings_ms": {"total": elapsed_ms},
+            "mode": _SEARCH_MODE,
         }
     )
 
 
 @mcp.tool()
 async def image_search(query: str, num_results: int = 8) -> str:
-    """Search public image metadata via loopback SearXNG with moderate SafeSearch."""
+    """Search public image metadata via Brave (default) or loopback SearXNG."""
     started = time.monotonic()
+    safe_search = "moderate" if _PROVIDER_STACK == "searxng" else "strict"
     query = query.strip()
     requested = min(MAX_NUM_RESULTS, max(1, int(num_results)))
     if not query:
@@ -3317,6 +2954,7 @@ async def image_search(query: str, num_results: int = 8) -> str:
                 "Image search error: query must not be empty.",
                 timings_ms=timings_ms,
                 mode="disabled",
+                safe_search=safe_search,
             ),
             status="error",
             backend="none",
@@ -3334,6 +2972,7 @@ async def image_search(query: str, num_results: int = 8) -> str:
                 f"Image search error: query must be at most {MAX_QUERY_CHARS} characters.",
                 timings_ms=timings_ms,
                 mode="disabled",
+                safe_search=safe_search,
             ),
             status="error",
             backend="none",
@@ -3347,64 +2986,81 @@ async def image_search(query: str, num_results: int = 8) -> str:
         MAX_NUM_RESULTS * RESULT_OVERFETCH_FACTOR,
         requested * RESULT_OVERFETCH_FACTOR,
     )
-    searxng = await _run_backend(
-        "searxng",
-        _searxng_image_search(query, candidate_limit),
-        min(SEARCH_TIMEOUT, SEARCH_TOTAL_TIMEOUT),
-    )
-    results = _dedupe_and_rank_images(searxng.results, requested)
-    timings_ms = _timings(started, [searxng])
-    provider_states = {"searxng": searxng.state}
+    # Use the active provider stack: Brave for "brave", SearXNG for "searxng".
+    if _PROVIDER_STACK == "searxng":
+        outcome = await _run_backend(
+            "searxng",
+            _searxng_image_search(query, candidate_limit),
+            min(SEARCH_TIMEOUT, SEARCH_TOTAL_TIMEOUT),
+        )
+    else:
+        outcome = await _run_backend(
+            "brave",
+            _brave_image_search(query, candidate_limit, _resolve_brave_key()),
+            min(BRAVE_TIMEOUT, SEARCH_TOTAL_TIMEOUT),
+        )
+    results = _dedupe_and_rank_images(outcome.results, requested)
+    timings_ms = _timings(started, [outcome])
+    provider_states = {outcome.backend: outcome.state}
+    attempted = _attempted_providers([outcome])
     fallback_reason: str | None = None
 
     if results:
-        status = "degraded" if searxng.state == "degraded" else "ok"
-        backend = "searxng"
+        status = "degraded" if outcome.state == "degraded" else "ok"
+        backend = outcome.backend
         rendered = _format_image_results(
             query,
             results,
-            searxng.suggestions,
+            outcome.suggestions,
             status=status,
             backend=backend,
+            attempted=attempted,
+            safe_search=safe_search,
             fallback_reason=None,
             timings_ms=timings_ms,
-            unresponsive_engines=searxng.unresponsive_engines,
+            unresponsive_engines=outcome.unresponsive_engines,
             provider_states=provider_states,
         )
-    elif searxng.ok:
-        status = "degraded" if searxng.state == "degraded" else "empty"
+    elif outcome.ok:
+        status = "degraded" if outcome.state == "degraded" else "empty"
         backend = "none"
-        fallback_reason = "searxng_degraded" if status == "degraded" else None
+        fallback_reason = f"{outcome.backend}_degraded" if status == "degraded" else None
         rendered = _format_image_results(
             query,
             [],
-            searxng.suggestions,
+            outcome.suggestions,
             status=status,
             backend=backend,
+            attempted=attempted,
+            safe_search=safe_search,
             fallback_reason=fallback_reason,
             timings_ms=timings_ms,
-            unresponsive_engines=searxng.unresponsive_engines,
+            unresponsive_engines=outcome.unresponsive_engines,
             provider_states=provider_states,
         )
     else:
         status = "error"
         backend = "none"
-        fallback_reason = _fallback_reason(searxng, 0, requested)
-        message = (
-            "Image search error: loopback SearXNG is required."
-            if searxng.error == "SearXNG URL is not loopback"
-            else "Image search error: loopback SearXNG failed."
-        )
+        fallback_reason = _fallback_reason(outcome, 0, requested)
+        if outcome.backend == "searxng":
+            message = (
+                "Image search error: loopback SearXNG is required."
+                if outcome.error == "SearXNG URL is not loopback"
+                else "Image search error: loopback SearXNG failed."
+            )
+        else:
+            message = f"Image search error: {outcome.backend} search failed."
         rendered = _search_error_payload(
             query,
             message,
-            searxng.suggestions,
-            attempted=["searxng"],
+            outcome.suggestions,
+            attempted=attempted,
             fallback_reason=fallback_reason,
             timings_ms=timings_ms,
-            unresponsive_engines=searxng.unresponsive_engines,
+            unresponsive_engines=outcome.unresponsive_engines,
             provider_states=provider_states,
             mode="disabled",
+            safe_search=safe_search,
         )
 
     return _finish_search(
@@ -3415,7 +3071,7 @@ async def image_search(query: str, num_results: int = 8) -> str:
         result_count=len(results),
         fallback_reason=fallback_reason,
         timings_ms=timings_ms,
-        outcomes=[searxng],
+        outcomes=[outcome],
         mode="disabled",
     )
 
@@ -3540,44 +3196,27 @@ async def web_fetch(url: str, max_chars: int = 20000) -> str:
 
 @mcp.tool()
 async def verify_url(url: str, max_chars: int = 20000) -> str:
-    """Verify/retrieve content for one URL: direct fetch first, then Kagi Extract.
+    """Verify/retrieve content for one URL via a direct fetch.
 
-    ADR 0002 Phase 7 verification layer. Direct fetch (the same path as
-    web_fetch) is tried first. If it errors or returns very little text
-    (JS-heavy or fetch-blocked pages), and a Kagi key is configured, Kagi's
-    server-side Extract API is tried as a content fallback. Browser-based
-    verification for pages that defeat both is handled by the Pi agent's shared
-    browser_* tools, not by this broker. This tool never automates consumer
-    SERPs and never bypasses CAPTCHAs, logins, or rate limits.
+    Direct fetch (the same path as web_fetch) is tried and the retrieved text
+    is returned tagged with its method. Browser-based verification for pages
+    that defeat a direct fetch is handled by the Pi agent's shared browser_*
+    tools, not by this broker. This tool never automates consumer SERPs and
+    never bypasses CAPTCHAs, logins, or rate limits.
     """
     max_chars = min(50000, max(1, int(max_chars)))
     direct = await web_fetch(url, max_chars)
     # web_fetch returns either a JSON string (success) or a "Fetch error: ..." string.
     direct_ok = not direct.startswith("Fetch error:")
-    direct_text = ""
-    if direct_ok:
-        try:
-            parsed = json.loads(direct)
-            direct_text = str(parsed.get("text") or "")
-        except Exception:
-            direct_text = direct
-    if direct_ok:
-        # Direct fetch yielded content; return it tagged as direct.
-        return json.dumps({"url": url, "method": "direct", "text": direct_text[:max_chars], "error": None})
-    # Direct fetch failed or yielded no text: try Kagi Extract if a key is set.
-    kagi_key = _resolve_kagi_key()
-    if kagi_key:
-        extract = await _kagi_extract(url, kagi_key)
-        if extract["ok"] and extract["markdown"]:
-            return json.dumps({"url": url, "method": "kagi_extract",
-                               "text": extract["markdown"][:max_chars], "error": None})
-        # Both failed: return the direct-fetch error with an extract-error note.
-        return json.dumps({"url": url, "method": "none", "text": "",
-                           "error": direct if not direct_ok else "empty direct fetch",
-                           "extract_error": extract["error"]})
-    return json.dumps({"url": url, "method": "direct" if direct_ok else "none",
-                       "text": direct_text[:max_chars] if direct_ok else "",
-                       "error": None if direct_ok else direct})
+    # web_fetch returns the fetched text directly. JSON documents are text too;
+    # parsing them here would discard objects that do not contain a `text` key.
+    direct_text = direct if direct_ok else ""
+    return json.dumps({
+        "url": url,
+        "method": "direct" if direct_ok else "none",
+        "text": direct_text[:max_chars] if direct_ok else "",
+        "error": None if direct_ok else direct,
+    })
 
 
 if __name__ == "__main__":

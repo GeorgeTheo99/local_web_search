@@ -54,10 +54,23 @@ installed_mcp_env() {
 
 SEARXNG_URL="${SEARXNG_URL:-http://127.0.0.1:8888}"
 MCP_PORT="${MCP_PORT:-8889}"
-WEBSEARCH_TAVILY_MODE="${WEBSEARCH_TAVILY_MODE:-fallback}"
+WEBSEARCH_PROVIDER_STACK="${WEBSEARCH_PROVIDER_STACK:-$(installed_config_value WEBSEARCH_PROVIDER_STACK)}"
+WEBSEARCH_PROVIDER_STACK="${WEBSEARCH_PROVIDER_STACK:-$(installed_mcp_env WEBSEARCH_PROVIDER_STACK)}"
+WEBSEARCH_PROVIDER_STACK="${WEBSEARCH_PROVIDER_STACK:-brave}"
+WEBSEARCH_SEARCH_MODE="${WEBSEARCH_SEARCH_MODE:-$(installed_config_value WEBSEARCH_SEARCH_MODE)}"
+WEBSEARCH_SEARCH_MODE="${WEBSEARCH_SEARCH_MODE:-$(installed_mcp_env WEBSEARCH_SEARCH_MODE)}"
+WEBSEARCH_SEARCH_MODE="${WEBSEARCH_SEARCH_MODE:-normal}"
+WEBSEARCH_TOTAL_TIMEOUT="${WEBSEARCH_TOTAL_TIMEOUT:-$(installed_config_value WEBSEARCH_TOTAL_TIMEOUT)}"
+WEBSEARCH_TOTAL_TIMEOUT="${WEBSEARCH_TOTAL_TIMEOUT:-$(installed_mcp_env WEBSEARCH_TOTAL_TIMEOUT)}"
 WEBSEARCH_TOTAL_TIMEOUT="${WEBSEARCH_TOTAL_TIMEOUT:-18}"
+WEBSEARCH_SEARXNG_TIMEOUT="${WEBSEARCH_SEARXNG_TIMEOUT:-$(installed_config_value WEBSEARCH_SEARXNG_TIMEOUT)}"
+WEBSEARCH_SEARXNG_TIMEOUT="${WEBSEARCH_SEARXNG_TIMEOUT:-$(installed_mcp_env WEBSEARCH_SEARXNG_TIMEOUT)}"
 WEBSEARCH_SEARXNG_TIMEOUT="${WEBSEARCH_SEARXNG_TIMEOUT:-7}"
-WEBSEARCH_TAVILY_TIMEOUT="${WEBSEARCH_TAVILY_TIMEOUT:-8}"
+WEBSEARCH_BRAVE_TIMEOUT="${WEBSEARCH_BRAVE_TIMEOUT:-$(installed_config_value WEBSEARCH_BRAVE_TIMEOUT)}"
+WEBSEARCH_BRAVE_TIMEOUT="${WEBSEARCH_BRAVE_TIMEOUT:-$(installed_mcp_env WEBSEARCH_BRAVE_TIMEOUT)}"
+WEBSEARCH_BRAVE_TIMEOUT="${WEBSEARCH_BRAVE_TIMEOUT:-8}"
+WEBSEARCH_SUPPLEMENT_MIN_RESULTS="${WEBSEARCH_SUPPLEMENT_MIN_RESULTS:-$(installed_config_value WEBSEARCH_SUPPLEMENT_MIN_RESULTS)}"
+WEBSEARCH_SUPPLEMENT_MIN_RESULTS="${WEBSEARCH_SUPPLEMENT_MIN_RESULTS:-$(installed_mcp_env WEBSEARCH_SUPPLEMENT_MIN_RESULTS)}"
 WEBSEARCH_SUPPLEMENT_MIN_RESULTS="${WEBSEARCH_SUPPLEMENT_MIN_RESULTS:-5}"
 LOCAL_SEARCH_TELEMETRY_ENABLED="${LOCAL_SEARCH_TELEMETRY_ENABLED:-$(installed_config_value LOCAL_SEARCH_TELEMETRY_ENABLED)}"
 LOCAL_SEARCH_TELEMETRY_ENABLED="${LOCAL_SEARCH_TELEMETRY_ENABLED:-$(installed_mcp_env LOCAL_SEARCH_TELEMETRY_ENABLED)}"
@@ -113,8 +126,16 @@ ensure_data_dir() {
 persist_install_config() {
   mkdir -p "$(dirname "$INSTALL_CONFIG")"
   chmod 700 "$(dirname "$INSTALL_CONFIG")"
-  (umask 077; printf 'LOCAL_SEARCH_DATA_DIR=%s\nLOCAL_SEARCH_TELEMETRY_ENABLED=%s\n' \
-    "$LOCAL_SEARCH_DATA_DIR" "$LOCAL_SEARCH_TELEMETRY_ENABLED" >"$INSTALL_CONFIG")
+  (umask 077; printf '%s\n' \
+    "LOCAL_SEARCH_DATA_DIR=$LOCAL_SEARCH_DATA_DIR" \
+    "LOCAL_SEARCH_TELEMETRY_ENABLED=$LOCAL_SEARCH_TELEMETRY_ENABLED" \
+    "WEBSEARCH_PROVIDER_STACK=$WEBSEARCH_PROVIDER_STACK" \
+    "WEBSEARCH_SEARCH_MODE=$WEBSEARCH_SEARCH_MODE" \
+    "WEBSEARCH_TOTAL_TIMEOUT=$WEBSEARCH_TOTAL_TIMEOUT" \
+    "WEBSEARCH_SEARXNG_TIMEOUT=$WEBSEARCH_SEARXNG_TIMEOUT" \
+    "WEBSEARCH_BRAVE_TIMEOUT=$WEBSEARCH_BRAVE_TIMEOUT" \
+    "WEBSEARCH_SUPPLEMENT_MIN_RESULTS=$WEBSEARCH_SUPPLEMENT_MIN_RESULTS" \
+    >"$INSTALL_CONFIG")
   chmod 600 "$INSTALL_CONFIG"
 }
 
@@ -131,6 +152,32 @@ check_prereqs() {
   require_cmd python3
   require_cmd uv
   require_cmd launchctl
+}
+
+check_provider_credentials() {
+  [ "$WEBSEARCH_PROVIDER_STACK" = "brave" ] || return 0
+  local key_file="$LOCAL_SEARCH_DATA_DIR/brave_key"
+  if ! python3 - "$key_file" <<'PY'
+import os
+import stat
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+try:
+    info = path.stat()
+    configured = (
+        stat.S_ISREG(info.st_mode)
+        and info.st_mode & 0o077 == 0
+        and any(line.strip() for line in path.read_text(encoding="utf-8").splitlines())
+    )
+except (OSError, UnicodeError):
+    configured = False
+raise SystemExit(0 if configured else 1)
+PY
+  then
+    die "Brave stack requires an owner-only nonempty key at $key_file; create it with mode 600 or install with WEBSEARCH_PROVIDER_STACK=searxng"
+  fi
 }
 
 searxng_ref() {
@@ -254,10 +301,11 @@ mcp_plist() {
 <key>EnvironmentVariables</key><dict>
   <key>SEARXNG_URL</key><string>${SEARXNG_URL}</string>
   <key>MCP_PORT</key><string>${MCP_PORT}</string>
-  <key>WEBSEARCH_TAVILY_MODE</key><string>${WEBSEARCH_TAVILY_MODE}</string>
+  <key>WEBSEARCH_PROVIDER_STACK</key><string>${WEBSEARCH_PROVIDER_STACK}</string>
+  <key>WEBSEARCH_SEARCH_MODE</key><string>${WEBSEARCH_SEARCH_MODE}</string>
   <key>WEBSEARCH_TOTAL_TIMEOUT</key><string>${WEBSEARCH_TOTAL_TIMEOUT}</string>
   <key>WEBSEARCH_SEARXNG_TIMEOUT</key><string>${WEBSEARCH_SEARXNG_TIMEOUT}</string>
-  <key>WEBSEARCH_TAVILY_TIMEOUT</key><string>${WEBSEARCH_TAVILY_TIMEOUT}</string>
+  <key>WEBSEARCH_BRAVE_TIMEOUT</key><string>${WEBSEARCH_BRAVE_TIMEOUT}</string>
   <key>WEBSEARCH_SUPPLEMENT_MIN_RESULTS</key><string>${WEBSEARCH_SUPPLEMENT_MIN_RESULTS}</string>
   <key>LOCAL_SEARCH_DATA_DIR</key><string>${LOCAL_SEARCH_DATA_DIR}</string>
   <key>LOCAL_SEARCH_TELEMETRY_ENABLED</key><string>${LOCAL_SEARCH_TELEMETRY_ENABLED}</string>
@@ -322,6 +370,7 @@ bootstrap_service() {
 }
 
 start_services() {
+  check_provider_credentials
   bootstrap_service "$SEARXNG_LABEL"
   bootstrap_service "$MCP_LABEL"
   launchctl enable "gui/$(id -u)/$SEARXNG_LABEL" 2>/dev/null || true
@@ -334,6 +383,7 @@ stop_services() {
 }
 
 restart_services() {
+  check_provider_credentials
   # Stop mcp first (depends on searxng), wait for ports to free, then start
   # searxng first and wait for it before starting mcp.
   stop_services
@@ -382,8 +432,8 @@ verify() {
   tools="$(curl -fsS --max-time 5 -X POST "http://127.0.0.1:${MCP_PORT}/mcp" \
     -H 'content-type: application/json' -H 'accept: application/json' \
     -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' 2>/dev/null \
-    | python3 -c 'import sys,json;d=json.load(sys.stdin);print(",".join(t["name"] for t in d.get("result",{}).get("tools",[])))' 2>/dev/null || true)"
-  if [ "$tools" = "web_search,batch_web_search,image_search,web_fetch" ]; then ok "MCP tools: $tools"; else warn "MCP tools/list unexpected: '$tools'"; rc=1; fi
+    | python3 -c 'import sys,json;d=json.load(sys.stdin);print(",".join(sorted(t["name"] for t in d.get("result",{}).get("tools",[]))))' 2>/dev/null || true)"
+  if [ "$tools" = "batch_web_search,image_search,verify_url,web_fetch,web_search" ]; then ok "MCP tools: $tools"; else warn "MCP tools/list unexpected: '$tools'"; rc=1; fi
   return $rc
 }
 
@@ -396,7 +446,7 @@ status() {
   printf '%-22s %s\n' "searxng health:" "$(curl -fsS --max-time 3 "$SEARXNG_URL/healthz" 2>/dev/null || echo 'DOWN')"
   local h
   h="$(curl -fsS --max-time 3 "http://127.0.0.1:${MCP_PORT}/health" 2>/dev/null || echo 'DOWN')"
-  printf '%-22s %s\n' "mcp /health:" "$(echo "$h" | python3 -c 'import sys,json;d=json.load(sys.stdin);last=d.get("last_search") or {};telemetry=d.get("telemetry") or {};print(d.get("status","?"),"ready="+str(d.get("ready","?")),"mode="+str(d.get("policy",{}).get("tavily_mode","?")),"telemetry="+str(telemetry.get("available","?")),"last_backend="+str(last.get("backend","none")))' 2>/dev/null || echo "$h")"
+  printf '%-22s %s\n' "mcp /health:" "$(echo "$h" | python3 -c 'import sys,json;d=json.load(sys.stdin);last=d.get("last_search") or {};telemetry=d.get("telemetry") or {};print(d.get("status","?"),"ready="+str(d.get("ready","?")),"stack="+str(d.get("provider_stack","?")),"telemetry="+str(telemetry.get("available","?")),"last_backend="+str(last.get("backend","none")))' 2>/dev/null || echo "$h")"
 }
 
 # --------------------------------------------------------------------------- #
@@ -406,6 +456,7 @@ cmd_install() {
   local start=1
   [ "${1:-}" = "--no-start" ] && start=0
   check_prereqs
+  [ $start -eq 0 ] || check_provider_credentials
   log "Installing local-search into $ROOT_DIR"
   ensure_searxng_src
   ensure_searxng_venv
@@ -471,10 +522,11 @@ MCP_DIR=$MCP_DIR
 MCP_VENV=$MCP_VENV
 MCP_PORT=$MCP_PORT
 MCP_LABEL=$MCP_LABEL
-WEBSEARCH_TAVILY_MODE=$WEBSEARCH_TAVILY_MODE
+WEBSEARCH_PROVIDER_STACK=$WEBSEARCH_PROVIDER_STACK
+WEBSEARCH_SEARCH_MODE=$WEBSEARCH_SEARCH_MODE
 WEBSEARCH_TOTAL_TIMEOUT=$WEBSEARCH_TOTAL_TIMEOUT
 WEBSEARCH_SEARXNG_TIMEOUT=$WEBSEARCH_SEARXNG_TIMEOUT
-WEBSEARCH_TAVILY_TIMEOUT=$WEBSEARCH_TAVILY_TIMEOUT
+WEBSEARCH_BRAVE_TIMEOUT=$WEBSEARCH_BRAVE_TIMEOUT
 WEBSEARCH_SUPPLEMENT_MIN_RESULTS=$WEBSEARCH_SUPPLEMENT_MIN_RESULTS
 LOCAL_SEARCH_DATA_DIR=$LOCAL_SEARCH_DATA_DIR
 LOCAL_SEARCH_TELEMETRY_ENABLED=$LOCAL_SEARCH_TELEMETRY_ENABLED
@@ -586,6 +638,8 @@ cmd_rotate_logs() {
 
 cmd_mcp_stdio() {
   export LOCAL_SEARCH_DATA_DIR LOCAL_SEARCH_TELEMETRY_ENABLED
+  export WEBSEARCH_PROVIDER_STACK WEBSEARCH_SEARCH_MODE WEBSEARCH_TOTAL_TIMEOUT
+  export WEBSEARCH_SEARXNG_TIMEOUT WEBSEARCH_BRAVE_TIMEOUT WEBSEARCH_SUPPLEMENT_MIN_RESULTS
   exec "$MCP_VENV/bin/python" "$MCP_DIR/server.py"
 }
 

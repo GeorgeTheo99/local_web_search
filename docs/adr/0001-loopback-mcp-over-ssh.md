@@ -48,7 +48,7 @@ No MCP route is added to Caddy, the LAN, or a Tailscale listener.
 ### Protected assets
 
 - Search terms, fetched URLs, and returned content.
-- Availability of local SearXNG, Tavily fallback, and the broker host.
+- Availability of the configured Brave or local SearXNG provider and the broker host.
 - The client's dedicated SSH private key.
 
 ### Trust boundaries and controls

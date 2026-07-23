@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
-"""Synthetic official-domain retrieval smoke for SearXNG, Tavily, and Perplexity.
+"""Synthetic official-domain retrieval smoke for SearXNG and Brave Search.
 
 This calls provider backends directly, bypassing production telemetry. Queries
-are public and synthetic. Set PERPLEXITY_API_KEY to include Perplexity Search;
-TAVILY_API_KEY is optional (otherwise Tavily keyless is used).
+are public and synthetic. A Brave key must be available through BRAVE_API_KEY
+or the owner-only ``data/brave_key`` file. Running the full suite issues up to
+12 billable Brave API requests (currently at most $0.06 total).
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
-import os
 import sys
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -23,8 +23,8 @@ CASES = [
     ("Python packaging installing packages tutorial", "packaging.python.org"),
     ("RFC 9110 HTTP Semantics official", "rfc-editor.org"),
     ("SearXNG why use a private instance documentation", "docs.searxng.org"),
-    ("Tavily API credits pricing documentation", "docs.tavily.com"),
-    ("Perplexity Search API pricing documentation", "docs.perplexity.ai"),
+    ("Brave Search API pricing documentation", "brave.com"),
+    ("Brave Search API web search documentation", "api.search.brave.com"),
     ("Caddy reverse_proxy directive documentation", "caddyserver.com"),
     ("uv sync command documentation", "docs.astral.sh"),
     ("SQLite write-ahead logging documentation", "sqlite.org"),
@@ -66,55 +66,6 @@ def _record(outcome: srv._BackendOutcome, expected: str) -> dict:
     }
 
 
-async def _perplexity_search(query: str, max_results: int, api_key: str) -> srv._BackendOutcome:
-    if not api_key:
-        return srv._BackendOutcome(backend="perplexity_search", state="not_configured")
-    started = srv.time.monotonic()
-    try:
-        async with srv.httpx.AsyncClient(timeout=srv.TAVILY_TIMEOUT, trust_env=False) as client:
-            async with client.stream(
-                "POST",
-                "https://api.perplexity.ai/search",
-                headers={
-                    "Authorization": f"Bearer {api_key}",
-                    "Accept": "application/json",
-                    "Accept-Encoding": "identity",
-                },
-                json={"query": query, "max_results": max_results},
-            ) as response:
-                response.raise_for_status()
-                data = await srv._limited_json_object(response, provider="Perplexity")
-        results = []
-        for item in data.get("results", []):
-            if not isinstance(item, dict) or not (url := srv._public_http_url(item.get("url"))):
-                continue
-            results.append(
-                {
-                    "title": str(item.get("title") or "Untitled"),
-                    "url": url,
-                    "domain": srv._domain(url),
-                    "snippet": str(item.get("snippet") or ""),
-                    "engine": "perplexity_search",
-                    "score": None,
-                }
-            )
-        results = srv._dedupe_and_rank(results, max_results)
-        return srv._BackendOutcome(
-            backend="perplexity_search",
-            results=results,
-            ok=True,
-            state="ok" if results else "empty",
-            elapsed_ms=round((srv.time.monotonic() - started) * 1000, 1),
-        )
-    except Exception as exc:
-        return srv._BackendOutcome(
-            backend="perplexity_search",
-            state="error",
-            error=type(exc).__name__,
-            elapsed_ms=round((srv.time.monotonic() - started) * 1000, 1),
-        )
-
-
 def _summary(rows: list[dict], provider: str) -> dict:
     records = [row[provider] for row in rows]
     ranks = [record["rank"] for record in records]
@@ -129,20 +80,19 @@ def _summary(rows: list[dict], provider: str) -> dict:
 
 
 async def main() -> None:
-    tavily_key = os.environ.get("TAVILY_API_KEY", "").strip()
-    perplexity_key = os.environ.get("PERPLEXITY_API_KEY", "").strip()
-    providers = ["searxng", "tavily_basic_keyless" if not tavily_key else "tavily_basic_keyed"]
-    if perplexity_key:
-        providers.append("perplexity_search")
+    brave_key = srv._resolve_brave_key()
+    if not brave_key:
+        raise SystemExit(
+            "Brave API key required via BRAVE_API_KEY or owner-only data/brave_key"
+        )
+    providers = ["searxng", "brave"]
 
     rows = []
     for query, expected in CASES:
         outcomes = {
             "searxng": await srv._searxng_search(query, 10),
-            providers[1]: await srv._tavily_search(query, 10, tavily_key),
+            "brave": await srv._brave_search(query, 10, brave_key),
         }
-        if perplexity_key:
-            outcomes["perplexity_search"] = await _perplexity_search(query, 10, perplexity_key)
         rows.append(
             {
                 "query": query,
@@ -156,6 +106,9 @@ async def main() -> None:
             {
                 "method": "official-domain retrieval, 12 synthetic navigational queries, top 10",
                 "providers": providers,
+                "maximum_estimated_brave_cost_usd": round(
+                    len(CASES) * srv._PROVIDER_COST_USD["brave"], 4
+                ),
                 "summary": {provider: _summary(rows, provider) for provider in providers},
                 "rows": rows,
             },
