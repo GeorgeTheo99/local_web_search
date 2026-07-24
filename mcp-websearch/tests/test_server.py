@@ -68,6 +68,14 @@ def _result_text(result: Any) -> str:
     return json.dumps(result, default=str)
 
 
+def _structured_content(result: Any) -> dict[str, Any]:
+    if isinstance(result, dict):
+        value = result.get("structuredContent") or result.get("structured_content")
+    else:
+        value = getattr(result, "structured_content", None)
+    return value if isinstance(value, dict) else {}
+
+
 def _brave_outcome(results=None, *, state="ok", **extra) -> srv._BackendOutcome:
     """Build a Brave _BackendOutcome with normalized results."""
     if results is None:
@@ -535,6 +543,32 @@ async def test_web_fetch_records_host_only_success_telemetry(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_web_fetch_cache_hit_skips_network_and_exposes_metadata(monkeypatch):
+    calls = 0
+
+    async def successful_fetch(url):
+        nonlocal calls
+        calls += 1
+        return url, b"cached fetched text", "text/plain", 200
+
+    monkeypatch.setattr(srv, "_fetch_public_body", successful_fetch)
+    first = await _call_tool("web_fetch", {"url": "https://example.com/cached"})
+    second = await _call_tool("web_fetch", {"url": "https://example.com/cached"})
+    assert _result_text(first) == "cached fetched text"
+    assert _result_text(second) == "cached fetched text"
+    assert _structured_content(first)["cache_hit"] is False
+    assert _structured_content(second)["cache_hit"] is True
+    assert calls == 1
+
+    assert srv._telemetry.flush()
+    with sqlite3.connect(srv._telemetry.db_path) as conn:
+        cache_outcomes = conn.execute(
+            "SELECT cache_hit FROM fetch_events ORDER BY id"
+        ).fetchall()
+    assert cache_outcomes == [(0,), (1,)]
+
+
+@pytest.mark.asyncio
 async def test_web_fetch_records_http_error_telemetry(monkeypatch):
     async def failed_fetch(_url):
         request = srv.httpx.Request("GET", "https://example.com/")
@@ -955,6 +989,45 @@ async def test_web_search_success_payload_shape(monkeypatch):
     assert first["domain"] == "example.com"
     assert payload["suggestions"] == []
     assert "## Search: hello" in payload["text"]
+
+
+@pytest.mark.asyncio
+async def test_web_search_cache_hit_skips_provider_and_has_zero_cost(monkeypatch):
+    calls = 0
+
+    async def fake_brave_search(query, num_results, api_key):
+        nonlocal calls
+        calls += 1
+        return _brave_outcome([
+            {"title": "Cached", "url": "https://cache.example/a", "snippet": "s",
+             "domain": "cache.example", "engine": "brave", "provider": "brave",
+             "score": None},
+        ])
+
+    monkeypatch.setattr(srv, "_brave_search", fake_brave_search)
+    first = json.loads(_result_text(await _call_tool(
+        "web_search", {"query": "cache integration", "num_results": 3}
+    )))
+    second = json.loads(_result_text(await _call_tool(
+        "web_search", {"query": "cache integration", "num_results": 3}
+    )))
+
+    assert first["cache_hit"] is False
+    assert first["cache_age_seconds"] == 0
+    assert second["cache_hit"] is True
+    assert second["attempted"] == []
+    assert second["estimated_cost_usd"] == 0.0
+    assert second["timings_ms"]["brave"] is None
+    assert calls == 1
+
+    assert srv._telemetry.flush()
+    with sqlite3.connect(srv._telemetry.db_path) as conn:
+        search_rows = conn.execute(
+            "SELECT cache_hit FROM search_events ORDER BY id"
+        ).fetchall()
+        provider_count = conn.execute("SELECT COUNT(*) FROM provider_events").fetchone()[0]
+    assert search_rows == [(0,), (1,)]
+    assert provider_count == 1
 
 
 @pytest.mark.asyncio

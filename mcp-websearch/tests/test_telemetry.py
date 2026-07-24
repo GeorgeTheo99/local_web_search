@@ -29,6 +29,7 @@ def _event(
     status: str = "ok",
     mode: str = "normal",
     fallback_reason: str | None = None,
+    cache_hit: bool = False,
 ) -> SearchEvent:
     providers = [
         ProviderEvent(
@@ -53,6 +54,7 @@ def _event(
         fallback_reason=fallback_reason,
         providers=tuple(providers),
         engine_failures=(),
+        cache_hit=cache_hit,
     )
 
 
@@ -157,6 +159,81 @@ def test_aggregation_windows_and_provider_counts(tmp_path):
 
         assert store.stats("7d", now=now)["searches"]["total"] == 2
         assert store.stats("30d", now=now)["searches"]["total"] == 3
+    finally:
+        store.close()
+
+
+def test_cache_hit_fields_aggregate_without_provider_or_fallback_inflation(tmp_path):
+    now = 2_000_000_000
+    store = TelemetryStore(tmp_path / "data")
+    try:
+        store.record(_event(created_at=now - 2))
+        store.record(_event(
+            created_at=now - 1,
+            cache_hit=True,
+            fallback_reason="brave_error",
+        ))
+        store.record_fetch(FetchEvent(
+            "example.com", 200, "success", "direct", 10, 1.0,
+            cache_hit=False, created_at=now - 2,
+        ))
+        store.record_fetch(FetchEvent(
+            "example.com", None, "success", "direct", 10, 0.1,
+            cache_hit=True, created_at=now - 1,
+        ))
+        assert store.flush()
+        stats = store.stats("24h", now=now)
+        assert stats["cache"] == {
+            "search": {"hits": 1, "misses": 1, "hit_rate": 0.5},
+            "fetch": {"hits": 1, "misses": 1, "hit_rate": 0.5},
+        }
+        assert stats["providers"]["brave"]["attempts"] == 1
+        assert stats["fallback"]["searches"] == 0
+        with sqlite3.connect(store.db_path) as conn:
+            assert conn.execute(
+                "SELECT cache_hit FROM search_events ORDER BY id"
+            ).fetchall() == [(0,), (1,)]
+            assert conn.execute(
+                "SELECT cache_hit FROM fetch_events ORDER BY id"
+            ).fetchall() == [(0,), (1,)]
+    finally:
+        store.close()
+
+
+def test_v2_schema_migrates_cache_hit_columns_to_v3(tmp_path):
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    db_path = data_dir / DB_FILENAME
+    with sqlite3.connect(db_path) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE search_events (
+                id INTEGER PRIMARY KEY, created_at INTEGER NOT NULL,
+                status TEXT NOT NULL, backend TEXT NOT NULL, mode TEXT NOT NULL,
+                requested_count INTEGER NOT NULL, result_count INTEGER NOT NULL,
+                fallback_reason TEXT, total_latency_ms REAL NOT NULL
+            );
+            CREATE TABLE fetch_events (
+                id INTEGER PRIMARY KEY, created_at INTEGER NOT NULL,
+                url_host TEXT NOT NULL, http_status INTEGER, outcome TEXT NOT NULL,
+                tier_used TEXT NOT NULL, bytes INTEGER, latency_ms REAL NOT NULL
+            );
+            PRAGMA user_version = 2;
+            """
+        )
+    store = TelemetryStore(data_dir)
+    try:
+        assert store.available is True
+        with sqlite3.connect(db_path) as conn:
+            assert conn.execute("PRAGMA user_version").fetchone()[0] == 3
+            search_columns = {
+                row[1] for row in conn.execute("PRAGMA table_info(search_events)")
+            }
+            fetch_columns = {
+                row[1] for row in conn.execute("PRAGMA table_info(fetch_events)")
+            }
+        assert "cache_hit" in search_columns
+        assert "cache_hit" in fetch_columns
     finally:
         store.close()
 

@@ -66,12 +66,14 @@ from typing import Annotated, Any, Awaitable, Protocol
 
 import httpx
 from fastmcp import FastMCP
-from pydantic import WithJsonSchema
 from fastmcp.server.dependencies import get_http_headers
+from fastmcp.tools.tool import ToolResult
+from pydantic import WithJsonSchema
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
 import html_extraction as htmlx
+from cache import WebCache
 from telemetry import (
     FetchEvent,
     InvalidWindow,
@@ -476,6 +478,16 @@ class _RequestOutcome:
 
 
 @dataclass
+class _FetchResult:
+    text: str
+    error: str | None
+    cache_hit: bool
+    cache_age_seconds: float
+    url: str
+    content_type: str
+
+
+@dataclass
 class _BackendOutcome:
     backend: str
     results: list[dict[str, Any]] = field(default_factory=list)
@@ -502,6 +514,8 @@ class _BackendOutcome:
 _last_search: dict[str, Any] | None = None
 _telemetry: TelemetryStore | None = None
 _telemetry_lock = Lock()
+_cache: WebCache | None = None
+_cache_lock = Lock()
 
 
 # --------------------------------------------------------------------------- #
@@ -543,6 +557,8 @@ def _search_metadata(
     provider_states: dict[str, str] | None,
     mode: str | None = None,
     search_mode: str | None = None,
+    cache_hit: bool = False,
+    cache_age_seconds: float = 0.0,
 ) -> dict[str, Any]:
     meta = {
         "status": status,
@@ -553,7 +569,13 @@ def _search_metadata(
         "mode": mode or "normal",
         "unresponsive_engines": (unresponsive_engines or [])[:10],
         "provider_states": provider_states or {},
-        "estimated_cost_usd": round(_estimate_search_cost(backend=backend, attempted=attempted), 4),
+        "estimated_cost_usd": (
+            0.0
+            if cache_hit
+            else round(_estimate_search_cost(backend=backend, attempted=attempted), 4)
+        ),
+        "cache_hit": bool(cache_hit),
+        "cache_age_seconds": max(0, int(cache_age_seconds)),
     }
     if search_mode:
         meta["search_mode"] = search_mode
@@ -575,6 +597,8 @@ def _record_last_search(payload: dict[str, Any]) -> None:
         "provider_states": payload.get("provider_states", {}),
         "mode": payload.get("mode"),
         "estimated_cost_usd": payload.get("estimated_cost_usd", 0.0),
+        "cache_hit": bool(payload.get("cache_hit", False)),
+        "cache_age_seconds": int(payload.get("cache_age_seconds", 0) or 0),
     }
 
 
@@ -589,6 +613,25 @@ def _get_telemetry() -> TelemetryStore:
                 )
                 atexit.register(_telemetry.close)
     return _telemetry
+
+
+def _get_cache() -> WebCache | None:
+    """Lazily initialize the private cache and fail open if it is unavailable."""
+    global _cache
+    desired_root = LOCAL_SEARCH_DATA_DIR / "cache"
+    try:
+        if _cache is None or _cache.root != desired_root:
+            with _cache_lock:
+                if _cache is None or _cache.root != desired_root:
+                    if _cache is not None:
+                        _cache.close()
+                    _cache = WebCache(desired_root)
+                    _cache.start_cleanup()
+                    atexit.register(_cache.close)
+        return _cache
+    except Exception as exc:
+        logger.warning("Web cache unavailable (%s)", type(exc).__name__)
+        return None
 
 
 def _provider_event(outcome: _BackendOutcome) -> ProviderEvent:
@@ -625,6 +668,7 @@ def _record_fetch_telemetry(
     http_status: int | None = None,
     body_bytes: int | None = None,
     tier_used: str = "direct",
+    cache_hit: bool = False,
 ) -> None:
     """Queue a host-only fetch outcome; never retain a full URL or path."""
     try:
@@ -637,6 +681,7 @@ def _record_fetch_telemetry(
                 tier_used=tier_used,
                 bytes=body_bytes,
                 latency_ms=(time.monotonic() - started) * 1000,
+                cache_hit=cache_hit,
             )
         )
     except Exception as exc:
@@ -654,10 +699,12 @@ def _record_search_telemetry(
     total_latency_ms: float,
     outcomes: list[_BackendOutcome | None] | None = None,
     mode: str | None = None,
+    cache_hit: bool = False,
 ) -> None:
     """Queue only explicitly allowlisted operational fields, never a search payload."""
     try:
-        outcomes = outcomes or []
+        outcomes = [] if cache_hit else (outcomes or [])
+        fallback_reason = None if cache_hit else fallback_reason
         providers = tuple(
             _provider_event(outcome)
             for outcome in outcomes
@@ -680,11 +727,66 @@ def _record_search_telemetry(
                 total_latency_ms=total_latency_ms,
                 providers=providers,
                 engine_failures=engine_failures,
+                cache_hit=cache_hit,
             )
         )
     except Exception as exc:
         # Monitoring must never break or delay search behavior.
         logger.warning("Telemetry event dropped (%s)", type(exc).__name__)
+
+
+_SEARCH_CACHE_PAYLOAD_KEYS = {
+    "results",
+    "suggestions",
+    "status",
+    "backend",
+    "fallback_reason",
+    "unresponsive_engines",
+    "provider_states",
+    "answer",
+    "citations",
+    "mode",
+    "search_mode",
+}
+
+
+def _search_cache_variant(requested: int, mode: str) -> str:
+    """Describe every policy input that can change a cached search result."""
+    return json.dumps(
+        {
+            "num_results": requested,
+            "search_mode": mode,
+            "provider_stack": _PROVIDER_STACK,
+            "providers": [provider.name for provider in _PROVIDERS],
+            "quality_gate": _QUALITY_GATE_MODE,
+            "quality_min_results": QUALITY_MIN_RESULTS,
+            "quality_min_domains": QUALITY_MIN_DOMAINS,
+            "quality_duplicate_fraction": QUALITY_DUPLICATE_FRACTION,
+            "supplement_min_results": SUPPLEMENT_MIN_RESULTS,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def _put_search_cache(query: str, variant: str, rendered: str) -> None:
+    """Persist only the fields needed to reconstruct a successful response."""
+    try:
+        payload = json.loads(rendered)
+        if not isinstance(payload, dict):
+            return
+        if not payload.get("results") and not payload.get("answer"):
+            return
+        allowlisted = {
+            key: payload[key]
+            for key in _SEARCH_CACHE_PAYLOAD_KEYS
+            if key in payload
+        }
+        cache = _get_cache()
+        if cache is not None:
+            cache.put_search(query, allowlisted, variant=variant)
+    except Exception:
+        return
 
 
 def _finish_search(
@@ -698,6 +800,9 @@ def _finish_search(
     timings_ms: dict[str, float | None] | None = None,
     outcomes: list[_BackendOutcome | None] | None = None,
     mode: str | None = None,
+    cache_hit: bool = False,
+    cache_query: str | None = None,
+    cache_variant: str | None = None,
 ) -> str:
     total_latency_ms = float((timings_ms or {}).get("total") or 0.0)
     _record_search_telemetry(
@@ -709,7 +814,15 @@ def _finish_search(
         total_latency_ms=total_latency_ms,
         outcomes=outcomes,
         mode=mode,
+        cache_hit=cache_hit,
     )
+    if (
+        not cache_hit
+        and cache_query is not None
+        and cache_variant is not None
+        and status in {"ok", "degraded"}
+    ):
+        _put_search_cache(cache_query, cache_variant, rendered)
     return rendered
 
 
@@ -1087,6 +1200,8 @@ def _format_results(
     citations: list[str] | None = None,
     mode: str | None = None,
     search_mode: str | None = None,
+    cache_hit: bool = False,
+    cache_age_seconds: float = 0.0,
 ) -> str:
     """Format results as the legacy contract plus additive provider metadata."""
     effective_status = status or ("ok" if results else "empty")
@@ -1126,6 +1241,8 @@ def _format_results(
             provider_states=provider_states,
             mode=mode,
             search_mode=search_mode,
+            cache_hit=cache_hit,
+            cache_age_seconds=cache_age_seconds,
         ),
     }
     if answer:
@@ -1492,6 +1609,26 @@ async def _resolve_host_ips(host: str, port: int, scheme: str) -> list[ipaddress
 
 def _is_private_ip(ip: ipaddress._BaseAddress) -> bool:
     return any(getattr(ip, attr, False) for attr in _PRIVATE_IP_ATTRS)
+
+
+def _cache_lookup_allowed(url: str) -> bool:
+    """Reject URL forms that must never bypass web_fetch's SSRF contract."""
+    try:
+        parsed = urllib.parse.urlparse(url)
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+            return False
+        if parsed.username is not None or parsed.password is not None:
+            return False
+        host = parsed.hostname.strip().lower()
+        if host in {"localhost", "local"} or host.endswith(".localhost"):
+            return False
+        parsed.port  # Validate malformed ports before canonical cache lookup.
+        try:
+            return not _is_private_ip(ipaddress.ip_address(host))
+        except ValueError:
+            return True
+    except (TypeError, ValueError):
+        return False
 
 
 async def _validate_public_http_url(url: str) -> list[ipaddress._BaseAddress]:
@@ -2531,6 +2668,69 @@ async def _web_search_impl(query: str, num_results: int = 8, *, mode: str | None
             mode=effective_mode,
         )
 
+    cache_variant = _search_cache_variant(requested, effective_mode)
+    cache = _get_cache()
+    try:
+        cache_hit = (
+            cache.get_search(query, variant=cache_variant)
+            if cache is not None else None
+        )
+    except Exception:
+        cache_hit = None
+    if cache_hit is not None:
+        cached = cache_hit.payload
+        cached_results = cached.get("results")
+        cached_suggestions = cached.get("suggestions")
+        cached_status = str(cached.get("status") or "ok")
+        if (
+            isinstance(cached_results, list)
+            and all(
+                isinstance(result, dict)
+                and "rank" in result
+                and isinstance(result.get("snippet"), (str, type(None)))
+                for result in cached_results
+            )
+            and isinstance(cached_suggestions, list)
+            and all(isinstance(item, str) for item in cached_suggestions)
+            and isinstance(cached.get("unresponsive_engines"), (list, type(None)))
+            and isinstance(cached.get("provider_states"), (dict, type(None)))
+            and isinstance(cached.get("answer"), (str, type(None)))
+            and isinstance(cached.get("citations"), (list, type(None)))
+            and cached_status in {"ok", "degraded"}
+            and (cached_results or bool(cached.get("answer")))
+        ):
+            timings_ms = _default_timings_ms()
+            timings_ms["total"] = round((time.monotonic() - started) * 1000, 1)
+            backend = str(cached.get("backend") or _result_backend(cached_results))
+            rendered = _format_results(
+                query,
+                cached_results,
+                cached_suggestions,
+                status=cached_status,
+                backend=backend,
+                attempted=[],
+                fallback_reason=cached.get("fallback_reason"),
+                timings_ms=timings_ms,
+                unresponsive_engines=cached.get("unresponsive_engines"),
+                provider_states=cached.get("provider_states"),
+                answer=cached.get("answer"),
+                citations=cached.get("citations"),
+                mode=effective_mode,
+                search_mode=effective_mode,
+                cache_hit=True,
+                cache_age_seconds=cache_hit.age_seconds,
+            )
+            return _finish_search(
+                rendered,
+                status=cached_status,
+                backend=backend,
+                requested_count=requested,
+                result_count=len(cached_results),
+                timings_ms=timings_ms,
+                mode=effective_mode,
+                cache_hit=True,
+            )
+
     candidate_limit = min(MAX_NUM_RESULTS, requested * RESULT_OVERFETCH_FACTOR)
 
     # Maximum-recall mode (ADR 0002 Phase 5): opt-in serial escalation across
@@ -2609,6 +2809,7 @@ async def _web_search_impl(query: str, num_results: int = 8, *, mode: str | None
             rendered, status=status, backend=backend, requested_count=requested,
             result_count=len(results), fallback_reason=fallback_reason_mr,
             timings_ms=timings_ms, outcomes=outcomes, mode=effective_mode,
+            cache_query=query, cache_variant=cache_variant,
         )
 
     primary = _PROVIDERS[0]
@@ -2699,6 +2900,8 @@ async def _web_search_impl(query: str, num_results: int = 8, *, mode: str | None
             timings_ms=timings_ms,
             outcomes=[primary_outcome],
             mode=effective_mode,
+            cache_query=query,
+            cache_variant=cache_variant,
         )
 
     reason = quality_reason if quality_reason is not None else _fallback_reason(
@@ -2795,6 +2998,8 @@ async def _web_search_impl(query: str, num_results: int = 8, *, mode: str | None
         timings_ms=timings_ms,
         outcomes=[primary_outcome, fallback_outcome],
         mode=effective_mode,
+        cache_query=query,
+        cache_variant=cache_variant,
     )
 
 
@@ -3186,39 +3391,87 @@ async def _fetch_public_body(url: str) -> tuple[str, bytes, str, int]:
     raise ValueError("too many redirects")
 
 
-@mcp.tool()
-async def web_fetch(url: str, max_chars: int = 20000) -> str:
-    """Fetch a public URL and return readable text, including bounded PDF OCR on macOS."""
+def _bound_fetch_text(text: str, max_chars: int) -> str:
+    """Bound cached extraction text while retaining an HTML attachment section."""
+    if len(text) <= max_chars:
+        return text
+    marker = "\n\nAttachments:"
+    if marker in text:
+        article, attachment_tail = text.rsplit(marker, 1)
+        attachments = f"Attachments:{attachment_tail}"
+        if len(attachments) + 2 < max_chars:
+            article_budget = max_chars - len(attachments) - 2
+            bounded_article = _truncate_text(
+                article, article_budget, "\n\n... (truncated)"
+            ).rstrip()
+            return f"{bounded_article}\n\n{attachments}"
+    return _truncate_text(text, max_chars, "\n\n... (truncated)")
+
+
+async def _web_fetch_impl(url: str, max_chars: int = 20000) -> _FetchResult:
+    """Fetch and extract one URL, returning text plus internal cache metadata."""
     max_chars = min(50000, max(1, int(max_chars)))
     fetch_started = time.monotonic()
+    cache = _get_cache()
+    try:
+        cached = (
+            cache.get_content(url)
+            if cache is not None and _cache_lookup_allowed(url)
+            else None
+        )
+    except Exception:
+        cached = None
+    if cached is not None:
+        text = cached.content.decode("utf-8", errors="replace")
+        text = _bound_fetch_text(text, max_chars)
+        _record_fetch_telemetry(
+            url=url,
+            outcome="success",
+            started=fetch_started,
+            body_bytes=len(cached.content),
+            cache_hit=True,
+        )
+        return _FetchResult(
+            text=text,
+            error=None,
+            cache_hit=True,
+            cache_age_seconds=cached.age_seconds,
+            url=cached.final_url or url,
+            content_type=cached.content_type,
+        )
+
+    def failure(message: str) -> _FetchResult:
+        text = _fetch_error(message)
+        return _FetchResult(text, text, False, 0.0, url, "")
+
     try:
         current_url, body, content_type, http_status = await asyncio.wait_for(
             _fetch_public_body(url),
             timeout=FETCH_TIMEOUT,
         )
-    except httpx.HTTPStatusError as e:
+    except httpx.HTTPStatusError as exc:
         _record_fetch_telemetry(
             url=url,
             outcome="http_error",
             started=fetch_started,
-            http_status=e.response.status_code,
+            http_status=exc.response.status_code,
         )
-        return _fetch_error(f"HTTP {e.response.status_code} from {url}")
-    except httpx.TimeoutException as e:
+        return failure(f"HTTP {exc.response.status_code} from {url}")
+    except httpx.TimeoutException as exc:
         _record_fetch_telemetry(url=url, outcome="timeout", started=fetch_started)
-        return _fetch_error(f"request failed: {e}")
-    except httpx.RequestError as e:
+        return failure(f"request failed: {exc}")
+    except httpx.RequestError as exc:
         _record_fetch_telemetry(url=url, outcome="connection_error", started=fetch_started)
-        return _fetch_error(f"request failed: {e}")
+        return failure(f"request failed: {exc}")
     except asyncio.TimeoutError:
         _record_fetch_telemetry(url=url, outcome="timeout", started=fetch_started)
-        return _fetch_error(f"request exceeded {FETCH_TIMEOUT:g} second deadline")
-    except ValueError as e:
+        return failure(f"request exceeded {FETCH_TIMEOUT:g} second deadline")
+    except ValueError as exc:
         _record_fetch_telemetry(url=url, outcome="connection_error", started=fetch_started)
-        return _fetch_error(str(e))
-    except Exception as e:
+        return failure(str(exc))
+    except Exception as exc:
         _record_fetch_telemetry(url=url, outcome="connection_error", started=fetch_started)
-        return _fetch_error(f"unexpected error: {e}")
+        return failure(f"unexpected error: {exc}")
 
     _record_fetch_telemetry(
         url=url,
@@ -3228,7 +3481,10 @@ async def web_fetch(url: str, max_chars: int = 20000) -> str:
         body_bytes=len(body),
     )
 
+    full_extracted: str
+    effective_content_type = content_type
     if "application/pdf" in content_type or body.startswith(b"%PDF-"):
+        effective_content_type = "application/pdf"
         try:
             async with _bounded_extraction_slot(
                 _pdf_extract_admission,
@@ -3244,66 +3500,97 @@ async def web_fetch(url: str, max_chars: int = 20000) -> str:
             asyncio.TimeoutError,
             _OutputLimitExceeded,
         ) as exc:
-            return _fetch_error(f"PDF extraction failed: {exc}")
+            return failure(f"PDF extraction failed: {exc}")
         if text is None:
-            return _fetch_error(method)
-        return _pdf_fetch_text(current_url, text, method, max_chars)
+            return failure(method)
+        full_extracted = _pdf_fetch_text(current_url, text, method, 50000)
+    else:
+        media_type = content_type.split(";", 1)[0].strip()
+        textual = (
+            "html" in media_type
+            or media_type.startswith("text/")
+            or "json" in media_type
+            or "xml" in media_type
+        )
+        if not _looks_like_text(body, content_type):
+            return failure(f"unsupported binary content type: {media_type or 'unknown'}")
+        if not textual and media_type not in {"", "application/octet-stream"}:
+            return failure(f"unsupported binary content type: {media_type or 'unknown'}")
 
-    media_type = content_type.split(";", 1)[0].strip()
-    textual = (
-        "html" in media_type
-        or media_type.startswith("text/")
-        or "json" in media_type
-        or "xml" in media_type
-    )
-    if not _looks_like_text(body, content_type):
-        return _fetch_error(f"unsupported binary content type: {media_type or 'unknown'}")
-    if not textual and media_type not in {"", "application/octet-stream"}:
-        return _fetch_error(f"unsupported binary content type: {media_type or 'unknown'}")
+        decoded = _decode_text_body(body, content_type)
+        if "html" in media_type:
+            try:
+                full_extracted = await _extract_html_content_isolated(
+                    decoded, current_url, 50000
+                )
+            except asyncio.TimeoutError:
+                return failure(
+                    f"HTML extraction exceeded {HTML_EXTRACT_TIMEOUT:g} second deadline"
+                )
+            except _OutputLimitExceeded as exc:
+                return failure(f"HTML extraction failed: {exc}")
+            except (OSError, RuntimeError) as exc:
+                return failure(f"HTML extraction failed: {exc}")
+        else:
+            full_extracted = _truncate_text(decoded, 50000, "\n\n... (truncated)")
 
-    decoded = _decode_text_body(body, content_type)
-    if "html" in media_type:
+    extracted = _bound_fetch_text(full_extracted, max_chars)
+    if cache is not None:
         try:
-            text = await _extract_html_content_isolated(decoded, current_url, max_chars)
-        except asyncio.TimeoutError:
-            return _fetch_error(
-                f"HTML extraction exceeded {HTML_EXTRACT_TIMEOUT:g} second deadline"
+            cache.put_content(
+                url,
+                full_extracted,
+                content_type=effective_content_type,
+                final_url=current_url,
             )
-        except _OutputLimitExceeded as exc:
-            return _fetch_error(f"HTML extraction failed: {exc}")
-        except (OSError, RuntimeError) as exc:
-            return _fetch_error(f"HTML extraction failed: {exc}")
-        return text
+        except Exception:
+            pass
+    return _FetchResult(
+        text=extracted,
+        error=None,
+        cache_hit=False,
+        cache_age_seconds=0.0,
+        url=current_url,
+        content_type=effective_content_type,
+    )
 
-    return _truncate_text(decoded, max_chars, "\n\n... (truncated)")
+
+@mcp.tool()
+async def web_fetch(url: str, max_chars: int = 20000) -> ToolResult:
+    """Fetch a public URL while preserving text as the primary MCP content."""
+    result = await _web_fetch_impl(url, max_chars)
+    return ToolResult(
+        content=result.text,
+        structured_content={
+            "text": result.text,
+            "error": result.error,
+            "cache_hit": result.cache_hit,
+            "cache_age_seconds": max(0, int(result.cache_age_seconds)),
+            "url": result.url,
+            "content_type": result.content_type,
+        },
+    )
 
 
 @mcp.tool()
 async def verify_url(url: str, max_chars: int = 20000) -> str:
-    """Verify/retrieve content for one URL via a direct fetch.
-
-    Direct fetch (the same path as web_fetch) is tried and the retrieved text
-    is returned tagged with its method. Browser-based verification for pages
-    that defeat a direct fetch is handled by the Pi agent's shared browser_*
-    tools, not by this broker. This tool never automates consumer SERPs and
-    never bypasses CAPTCHAs, logins, or rate limits.
-    """
+    """Verify/retrieve content for one URL via the cached direct-fetch path."""
     max_chars = min(50000, max(1, int(max_chars)))
-    direct = await web_fetch(url, max_chars)
-    # web_fetch returns either a JSON string (success) or a "Fetch error: ..." string.
-    direct_ok = not direct.startswith("Fetch error:")
-    # web_fetch returns the fetched text directly. JSON documents are text too;
-    # parsing them here would discard objects that do not contain a `text` key.
-    direct_text = direct if direct_ok else ""
+    direct = await _web_fetch_impl(url, max_chars)
+    direct_ok = direct.error is None
     return json.dumps({
-        "url": url,
+        "url": direct.url,
         "method": "direct" if direct_ok else "none",
-        "text": direct_text[:max_chars] if direct_ok else "",
-        "error": None if direct_ok else direct,
+        "text": direct.text[:max_chars] if direct_ok else "",
+        "error": direct.error,
+        "cache_hit": direct.cache_hit,
+        "cache_age_seconds": max(0, int(direct.cache_age_seconds)),
+        "content_type": direct.content_type,
     })
 
 
 if __name__ == "__main__":
     # Initialize private SQLite state before accepting stdio tool calls.
     _get_telemetry()
+    _get_cache()
     mcp.run()

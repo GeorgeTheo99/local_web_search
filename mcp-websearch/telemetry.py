@@ -28,7 +28,7 @@ from typing import Any
 logger = logging.getLogger("websearch-mcp.telemetry")
 
 DB_FILENAME = "telemetry.sqlite3"
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 VALID_WINDOWS = {"24h": 24 * 60 * 60, "7d": 7 * 24 * 60 * 60, "30d": 30 * 24 * 60 * 60}
 
 _SEARCH_STATUSES = {"ok", "empty", "degraded", "error", "timeout"}
@@ -127,6 +127,7 @@ class SearchEvent:
     engine_failures: tuple[tuple[str, str], ...] = field(default_factory=tuple)
     created_at: int = field(default_factory=lambda: int(time.time()))
     created_at_ns: int = field(default_factory=time.time_ns)
+    cache_hit: bool = False
 
 
 @dataclass(frozen=True)
@@ -139,6 +140,7 @@ class FetchEvent:
     latency_ms: float
     created_at: int = field(default_factory=lambda: int(time.time()))
     created_at_ns: int = field(default_factory=time.time_ns)
+    cache_hit: bool = False
 
 
 @dataclass
@@ -300,7 +302,8 @@ class TelemetryStore:
                     requested_count INTEGER NOT NULL,
                     result_count INTEGER NOT NULL,
                     fallback_reason TEXT,
-                    total_latency_ms REAL NOT NULL
+                    total_latency_ms REAL NOT NULL,
+                    cache_hit INTEGER NOT NULL DEFAULT 0
                 );
                 CREATE INDEX IF NOT EXISTS idx_search_events_created_at
                     ON search_events(created_at);
@@ -344,7 +347,8 @@ class TelemetryStore:
                     outcome TEXT NOT NULL,
                     tier_used TEXT NOT NULL,
                     bytes INTEGER,
-                    latency_ms REAL NOT NULL
+                    latency_ms REAL NOT NULL,
+                    cache_hit INTEGER NOT NULL DEFAULT 0
                 );
                 CREATE INDEX IF NOT EXISTS idx_fetch_events_created_at
                     ON fetch_events(created_at);
@@ -368,6 +372,25 @@ class TelemetryStore:
                     VALUES (1, 0);
                 """
             )
+            # v2 -> v3: cache outcomes are explicit and provider-free. Checking
+            # table columns also makes initialization safe for a fresh schema.
+            if current_version < 3:
+                search_columns = {
+                    str(row[1]) for row in conn.execute("PRAGMA table_info(search_events)")
+                }
+                if "cache_hit" not in search_columns:
+                    conn.execute(
+                        "ALTER TABLE search_events "
+                        "ADD COLUMN cache_hit INTEGER NOT NULL DEFAULT 0"
+                    )
+                fetch_columns = {
+                    str(row[1]) for row in conn.execute("PRAGMA table_info(fetch_events)")
+                }
+                if "cache_hit" not in fetch_columns:
+                    conn.execute(
+                        "ALTER TABLE fetch_events "
+                        "ADD COLUMN cache_hit INTEGER NOT NULL DEFAULT 0"
+                    )
             conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         self._secure_files()
 
@@ -472,7 +495,11 @@ class TelemetryStore:
         status = _enum(event.status, _SEARCH_STATUSES, "error")
         backend = _enum(event.backend, _BACKENDS, "none")
         mode = _enum(event.mode, _MODES, "disabled")
-        fallback_reason = _enum(event.fallback_reason, _FALLBACK_REASONS, "") or None
+        fallback_reason = (
+            None
+            if event.cache_hit
+            else (_enum(event.fallback_reason, _FALLBACK_REASONS, "") or None)
+        )
         with self._connect() as conn:
             # Serialize with reset across every process. Events queued before a
             # reset carry an older nanosecond timestamp and are discarded.
@@ -489,8 +516,8 @@ class TelemetryStore:
                     """
                     INSERT INTO search_events(
                         created_at, status, backend, mode, requested_count,
-                        result_count, fallback_reason, total_latency_ms
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        result_count, fallback_reason, total_latency_ms, cache_hit
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         max(0, int(event.created_at)),
@@ -501,11 +528,13 @@ class TelemetryStore:
                         max(0, int(event.result_count)),
                         fallback_reason,
                         max(0.0, float(event.total_latency_ms)),
+                        int(bool(event.cache_hit)),
                     ),
                 )
                 search_id = int(cursor.lastrowid)
                 seen_providers: set[str] = set()
-                for provider in event.providers:
+                providers = () if event.cache_hit else event.providers
+                for provider in providers:
                     if provider.provider in seen_providers:
                         continue
                     seen_providers.add(provider.provider)
@@ -537,7 +566,8 @@ class TelemetryStore:
                             max(0, int(provider.circuit_failures)),
                         ),
                     )
-                for engine, reason_kind in event.engine_failures[:100]:
+                engine_failures = () if event.cache_hit else event.engine_failures[:100]
+                for engine, reason_kind in engine_failures:
                     safe_engine = _ENGINE_NAME_RE.sub("", str(engine).lower()).strip()[:64]
                     if safe_engine not in _KNOWN_ENGINE_NAMES:
                         safe_engine = "unknown"
@@ -571,8 +601,8 @@ class TelemetryStore:
                     """
                     INSERT INTO fetch_events(
                         created_at, url_host, http_status, outcome, tier_used,
-                        bytes, latency_ms
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                        bytes, latency_ms, cache_hit
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         max(0, int(event.created_at)),
@@ -582,6 +612,7 @@ class TelemetryStore:
                         _enum(event.tier_used, _FETCH_TIERS, "direct"),
                         body_bytes,
                         max(0.0, float(event.latency_ms)),
+                        int(bool(event.cache_hit)),
                     ),
                 )
         self._mark_drops_persisted(len(pending_drops))
@@ -710,6 +741,22 @@ class TelemetryStore:
                 """,
                 (since, until),
             ).fetchall()
+            search_cache_row = conn.execute(
+                """
+                SELECT COUNT(*) AS total,
+                       COALESCE(SUM(cache_hit), 0) AS hits
+                FROM search_events WHERE created_at >= ? AND created_at <= ?
+                """,
+                (since, until),
+            ).fetchone()
+            fetch_cache_row = conn.execute(
+                """
+                SELECT COUNT(*) AS total,
+                       COALESCE(SUM(cache_hit), 0) AS hits
+                FROM fetch_events WHERE created_at >= ? AND created_at <= ?
+                """,
+                (since, until),
+            ).fetchone()
             health_row = conn.execute(
                 """
                 SELECT COALESCE(SUM(dropped_events), 0) AS dropped_events
@@ -723,6 +770,10 @@ class TelemetryStore:
         dropped_events = durable_drops + pending_drops
         total = int(search_row["total"] or 0)
         fallback_count = sum(int(row["count"]) for row in fallback_rows)
+        search_cache_total = int(search_cache_row["total"] or 0)
+        search_cache_hits = int(search_cache_row["hits"] or 0)
+        fetch_cache_total = int(fetch_cache_row["total"] or 0)
+        fetch_cache_hits = int(fetch_cache_row["hits"] or 0)
         provider_states: dict[str, dict[str, int]] = {}
         for row in provider_state_rows:
             provider_states.setdefault(str(row["provider"]), {})[str(row["state"])] = int(row["count"])
@@ -786,6 +837,24 @@ class TelemetryStore:
                 "searches": fallback_count,
                 "rate": round(fallback_count / total, 4) if total else 0.0,
                 "reasons": _count_map(fallback_rows),
+            },
+            "cache": {
+                "search": {
+                    "hits": search_cache_hits,
+                    "misses": search_cache_total - search_cache_hits,
+                    "hit_rate": (
+                        round(search_cache_hits / search_cache_total, 4)
+                        if search_cache_total else 0.0
+                    ),
+                },
+                "fetch": {
+                    "hits": fetch_cache_hits,
+                    "misses": fetch_cache_total - fetch_cache_hits,
+                    "hit_rate": (
+                        round(fetch_cache_hits / fetch_cache_total, 4)
+                        if fetch_cache_total else 0.0
+                    ),
+                },
             },
             "providers": providers,
             "searxng_engine_failures": [

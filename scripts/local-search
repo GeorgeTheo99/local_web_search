@@ -120,8 +120,8 @@ die()  { printf '%s✗%s %s\n' "$C_RED" "$C_RESET" "$*" >&2; exit 1; }
 require_cmd() { command -v "$1" >/dev/null 2>&1 || die "required command not found: $1 (install it and retry)"; }
 
 ensure_data_dir() {
-  mkdir -p "$LOCAL_SEARCH_DATA_DIR"
-  chmod 700 "$LOCAL_SEARCH_DATA_DIR"
+  mkdir -p "$LOCAL_SEARCH_DATA_DIR" "$LOCAL_SEARCH_DATA_DIR/cache"
+  chmod 700 "$LOCAL_SEARCH_DATA_DIR" "$LOCAL_SEARCH_DATA_DIR/cache"
 }
 
 ensure_searxng_secret() {

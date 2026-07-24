@@ -11,6 +11,7 @@ searxng/src/
 
 # Private query-free telemetry (including SQLite WAL/SHM files) and local install state
 data/*.sqlite3*
+data/cache/
 data/install.env
 
 # Provider API keys (mode-0600 secret files, never committed)

@@ -35,6 +35,14 @@ def _source_and_run(command: str, tmp_path: Path) -> str:
     return completed.stdout
 
 
+def test_ensure_data_dir_creates_private_cache_directory(tmp_path):
+    _source_and_run("ensure_data_dir", tmp_path)
+    data_dir = tmp_path / "data"
+    cache_dir = data_dir / "cache"
+    assert data_dir.stat().st_mode & 0o777 == 0o700
+    assert cache_dir.stat().st_mode & 0o777 == 0o700
+
+
 def test_brave_credential_preflight_fails_with_actionable_message(tmp_path):
     with pytest.raises(subprocess.CalledProcessError) as error:
         _source_and_run("check_provider_credentials", tmp_path)

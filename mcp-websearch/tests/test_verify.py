@@ -45,12 +45,16 @@ def _reset_runtime(monkeypatch, tmp_path):
 @pytest.mark.asyncio
 async def test_verify_url_direct_success(monkeypatch):
     async def fake_web_fetch(url, max_chars=20000):
-        return "Real page content here."
-    monkeypatch.setattr(srv, "web_fetch", fake_web_fetch)
+        return srv._FetchResult(
+            "Real page content here.", None, True, 12.0, url, "text/html"
+        )
+    monkeypatch.setattr(srv, "_web_fetch_impl", fake_web_fetch)
     result = await _call_tool("verify_url", {"url": "https://example.com/a"})
     payload = json.loads(_result_text(result))
     assert payload["method"] == "direct"
     assert payload["error"] is None
+    assert payload["cache_hit"] is True
+    assert payload["cache_age_seconds"] == 12
     assert "Real page content" in payload["text"]
 
 
@@ -59,9 +63,9 @@ async def test_verify_url_preserves_json_object_text(monkeypatch):
     document = json.dumps({"status": "ok", "value": 42})
 
     async def fake_web_fetch(url, max_chars=20000):
-        return document
+        return srv._FetchResult(document, None, False, 0.0, url, "application/json")
 
-    monkeypatch.setattr(srv, "web_fetch", fake_web_fetch)
+    monkeypatch.setattr(srv, "_web_fetch_impl", fake_web_fetch)
     result = await _call_tool("verify_url", {"url": "https://example.com/data.json"})
     payload = json.loads(_result_text(result))
     assert payload["method"] == "direct"
@@ -72,8 +76,9 @@ async def test_verify_url_preserves_json_object_text(monkeypatch):
 @pytest.mark.asyncio
 async def test_verify_url_direct_fail_reports_error(monkeypatch):
     async def fake_web_fetch(url, max_chars=20000):
-        return "Fetch error: request failed"
-    monkeypatch.setattr(srv, "web_fetch", fake_web_fetch)
+        error = "Fetch error: request failed"
+        return srv._FetchResult(error, error, False, 0.0, url, "")
+    monkeypatch.setattr(srv, "_web_fetch_impl", fake_web_fetch)
     result = await _call_tool("verify_url", {"url": "https://example.com/a"})
     payload = json.loads(_result_text(result))
     assert payload["method"] == "none"

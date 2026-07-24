@@ -65,6 +65,7 @@ def _reset_runtime_state(monkeypatch, tmp_path):
     monkeypatch.setattr(srv, "_breaker", srv._CircuitBreaker())
     monkeypatch.setattr(srv, "_last_search", None)
     monkeypatch.setattr(srv, "_telemetry", telemetry)
+    monkeypatch.setattr(srv, "LOCAL_SEARCH_DATA_DIR", tmp_path)
     monkeypatch.setattr(srv, "_PROVIDER_STACK", "brave")
     monkeypatch.setattr(srv, "_PROVIDERS", srv._build_provider_stack())
     yield telemetry
