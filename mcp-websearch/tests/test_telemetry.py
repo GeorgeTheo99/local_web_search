@@ -12,6 +12,7 @@ import pytest
 
 from telemetry import (
     DB_FILENAME,
+    FetchEvent,
     InvalidWindow,
     ProviderEvent,
     SearchEvent,
@@ -76,6 +77,47 @@ def test_persists_across_reopen_and_uses_private_permissions(tmp_path):
         reopened.close()
 
 
+def test_fetch_events_persist_only_normalized_hosts_and_bounded_outcomes(tmp_path):
+    store = TelemetryStore(tmp_path / "data")
+    try:
+        assert store.record_fetch(
+            FetchEvent(
+                url_host="Example.COM",
+                http_status=200,
+                outcome="success",
+                tier_used="direct",
+                bytes=123,
+                latency_ms=4.5,
+                created_at=2_000_000_000,
+            )
+        )
+        assert store.record_fetch(
+            FetchEvent(
+                url_host="https://example.com/private?q=secret",
+                http_status=999,
+                outcome="unbounded-value",
+                tier_used="unbounded-value",
+                bytes=-1,
+                latency_ms=-1,
+                created_at=2_000_000_001,
+            )
+        )
+        assert store.flush()
+        with sqlite3.connect(store.db_path) as conn:
+            rows = conn.execute(
+                "SELECT url_host, http_status, outcome, tier_used, bytes, latency_ms "
+                "FROM fetch_events ORDER BY id"
+            ).fetchall()
+        assert rows == [
+            ("example.com", 200, "success", "direct", 123, 4.5),
+            ("unknown", None, "connection_error", "direct", 0, 0.0),
+        ]
+        assert "private" not in repr(rows)
+        assert "secret" not in repr(rows)
+    finally:
+        store.close()
+
+
 def test_persists_current_modes_and_quality_reasons_without_normalizing_them_away(tmp_path):
     store = TelemetryStore(tmp_path / "data")
     try:
@@ -131,12 +173,30 @@ def test_schema_and_rows_cannot_contain_sensitive_search_fields(tmp_path):
             schema = json.dumps(schema_rows).lower()
             row_values = [
                 value
-                for table in ("search_events", "provider_events", "engine_failures")
+                for table in (
+                    "search_events",
+                    "provider_events",
+                    "engine_failures",
+                    "fetch_events",
+                )
                 for row in conn.execute(f"SELECT * FROM {table}")
                 for value in row
             ]
-        for forbidden in ("query", "url", "title", "snippet", "content", "api_key", "credential_value"):
+            fetch_columns = [
+                row[1] for row in conn.execute("PRAGMA table_info(fetch_events)")
+            ]
+        for forbidden in (
+            "query",
+            "full_url",
+            "url_path",
+            "title",
+            "snippet",
+            "content",
+            "api_key",
+            "credential_value",
+        ):
             assert forbidden not in schema
+        assert "url_host" in fetch_columns
         assert not any("secret" in str(value).lower() for value in row_values)
     finally:
         store.close()
@@ -170,6 +230,9 @@ def test_invalid_window_disabled_and_unavailable_store(tmp_path):
 
     disabled = TelemetryStore(tmp_path / "disabled", enabled=False)
     assert disabled.record(_event(created_at=2_000_000_000)) is False
+    assert disabled.record_fetch(
+        FetchEvent("example.com", None, "connection_error", "direct", None, 1.0)
+    ) is False
     with pytest.raises(TelemetryUnavailable):
         disabled.stats("24h")
 
@@ -187,10 +250,15 @@ def test_explicit_reset_clears_events_but_keeps_database(tmp_path):
     try:
         store.record(_event(created_at=2_000_000_000))
         store.record(_event(created_at=2_000_000_001))
+        store.record_fetch(
+            FetchEvent("example.com", 200, "success", "direct", 10, 1.0)
+        )
         assert store.flush()
         assert store.reset() == 2
         assert store.db_path.exists()
         assert store.stats("30d", now=2_000_000_100)["searches"]["total"] == 0
+        with sqlite3.connect(store.db_path) as conn:
+            assert conn.execute("SELECT COUNT(*) FROM fetch_events").fetchone()[0] == 0
     finally:
         store.close()
 

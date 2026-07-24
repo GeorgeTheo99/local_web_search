@@ -100,6 +100,7 @@ case "$(printf '%s' "$LOCAL_SEARCH_TELEMETRY_ENABLED" | tr '[:upper:]' '[:lower:
   0|false|no|off) LOCAL_SEARCH_TELEMETRY_ENABLED=false ;;
   *) LOCAL_SEARCH_TELEMETRY_ENABLED=true ;;
 esac
+SEARXNG_SECRET_FILE="$LOCAL_SEARCH_DATA_DIR/searxng_secret_key"
 
 SEARXNG_VENV="$SEARXNG_SRC_DIR/.venv"
 MCP_VENV="$MCP_DIR/.venv"
@@ -121,6 +122,30 @@ require_cmd() { command -v "$1" >/dev/null 2>&1 || die "required command not fou
 ensure_data_dir() {
   mkdir -p "$LOCAL_SEARCH_DATA_DIR"
   chmod 700 "$LOCAL_SEARCH_DATA_DIR"
+}
+
+ensure_searxng_secret() {
+  ensure_data_dir
+  require_cmd openssl
+  if [ -L "$SEARXNG_SECRET_FILE" ]; then
+    die "refusing symlinked SearXNG secret file: $SEARXNG_SECRET_FILE"
+  fi
+  if [ -e "$SEARXNG_SECRET_FILE" ] && [ ! -f "$SEARXNG_SECRET_FILE" ]; then
+    die "SearXNG secret path is not a regular file: $SEARXNG_SECRET_FILE"
+  fi
+  if [ ! -e "$SEARXNG_SECRET_FILE" ]; then
+    (umask 077; openssl rand -hex 32 >"$SEARXNG_SECRET_FILE")
+  fi
+  chmod 600 "$SEARXNG_SECRET_FILE"
+  if ! grep -Eq '^[0-9a-fA-F]{64}$' "$SEARXNG_SECRET_FILE" \
+    || [ "$(wc -l <"$SEARXNG_SECRET_FILE" | tr -d ' ')" -ne 1 ]; then
+    die "SearXNG secret file must contain exactly one 64-character hex key: $SEARXNG_SECRET_FILE"
+  fi
+}
+
+searxng_secret() {
+  ensure_searxng_secret
+  tr -d '\r\n' <"$SEARXNG_SECRET_FILE"
 }
 
 persist_install_config() {
@@ -277,6 +302,7 @@ searxng_plist() {
 <key>WorkingDirectory</key><string>${SEARXNG_SRC_DIR}</string>
 <key>EnvironmentVariables</key><dict>
   <key>SEARXNG_SETTINGS_PATH</key><string>${SEARXNG_SETTINGS}</string>
+  <key>SEARXNG_SECRET</key><string>$(searxng_secret)</string>
 </dict>
 <key>StandardOutPath</key><string>${LOG_DIR}/searxng.log</string>
 <key>StandardErrorPath</key><string>${LOG_DIR}/searxng.log</string>
@@ -371,6 +397,7 @@ bootstrap_service() {
 
 start_services() {
   check_provider_credentials
+  ensure_searxng_secret
   bootstrap_service "$SEARXNG_LABEL"
   bootstrap_service "$MCP_LABEL"
   launchctl enable "gui/$(id -u)/$SEARXNG_LABEL" 2>/dev/null || true
@@ -516,6 +543,7 @@ SEARXNG_SRC_DIR=$SEARXNG_SRC_DIR
 SEARXNG_SETTINGS=$SEARXNG_SETTINGS
 SEARXNG_RUNNER=$SEARXNG_RUNNER
 SEARXNG_REF=$(searxng_ref)
+SEARXNG_SECRET_FILE=$SEARXNG_SECRET_FILE
 SEARXNG_URL=$SEARXNG_URL
 SEARXNG_LABEL=$SEARXNG_LABEL
 MCP_DIR=$MCP_DIR

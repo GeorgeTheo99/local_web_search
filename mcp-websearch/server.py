@@ -45,6 +45,7 @@ from __future__ import annotations
 
 import asyncio
 import atexit
+import importlib.util
 import ipaddress
 import json
 import logging
@@ -72,6 +73,7 @@ from starlette.responses import JSONResponse
 
 import html_extraction as htmlx
 from telemetry import (
+    FetchEvent,
     InvalidWindow,
     ProviderEvent,
     SearchEvent,
@@ -246,6 +248,14 @@ def _admission_queue(size: int) -> asyncio.Queue[None]:
 
 
 _http_client: httpx.AsyncClient | None = None
+# httpx's optional HTTP/2 and Brotli codecs are enabled when present. The base
+# dependency always supports HTTP/1.1 plus gzip/deflate without extra packages.
+_HTTP2_AVAILABLE = importlib.util.find_spec("h2") is not None
+_BROTLI_AVAILABLE = any(
+    importlib.util.find_spec(module_name) is not None
+    for module_name in ("brotli", "brotlicffi")
+)
+_FETCH_ACCEPT_ENCODING = "gzip, deflate, br" if _BROTLI_AVAILABLE else "gzip, deflate"
 _pdf_extract_semaphore = asyncio.Semaphore(2)
 _html_extract_semaphore = asyncio.Semaphore(2)
 _pdf_extract_admission = _admission_queue(PDF_EXTRACT_MAX_ADMITTED)
@@ -261,13 +271,21 @@ _extract_html_content = htmlx.extract_html_content
 async def _client() -> httpx.AsyncClient:
     global _http_client
     if _http_client is None or _http_client.is_closed:
-        _http_client = httpx.AsyncClient(timeout=FETCH_TIMEOUT, trust_env=False)
+        _http_client = httpx.AsyncClient(
+            timeout=FETCH_TIMEOUT,
+            trust_env=False,
+            http2=_HTTP2_AVAILABLE,
+        )
     return _http_client
 
 
 async def _public_fetch_client() -> httpx.AsyncClient:
     """Return a one-hop client so TLS pools cannot cross original hostnames."""
-    return httpx.AsyncClient(timeout=FETCH_TIMEOUT, trust_env=False)
+    return httpx.AsyncClient(
+        timeout=FETCH_TIMEOUT,
+        trust_env=False,
+        http2=_HTTP2_AVAILABLE,
+    )
 
 
 mcp = FastMCP(
@@ -597,6 +615,33 @@ def _provider_event(outcome: _BackendOutcome) -> ProviderEvent:
             else int(snapshot["consecutive_failures"])
         ),
     )
+
+
+def _record_fetch_telemetry(
+    *,
+    url: str,
+    outcome: str,
+    started: float,
+    http_status: int | None = None,
+    body_bytes: int | None = None,
+    tier_used: str = "direct",
+) -> None:
+    """Queue a host-only fetch outcome; never retain a full URL or path."""
+    try:
+        url_host = urllib.parse.urlsplit(url).hostname or "unknown"
+        _get_telemetry().record_fetch(
+            FetchEvent(
+                url_host=url_host,
+                http_status=http_status,
+                outcome=outcome,
+                tier_used=tier_used,
+                bytes=body_bytes,
+                latency_ms=(time.monotonic() - started) * 1000,
+            )
+        )
+    except Exception as exc:
+        # Monitoring must never break or delay fetch behavior.
+        logger.warning("Fetch telemetry event dropped (%s)", type(exc).__name__)
 
 
 def _record_search_telemetry(
@@ -3076,7 +3121,7 @@ async def image_search(query: str, num_results: int = 8) -> str:
     )
 
 
-async def _fetch_public_body(url: str) -> tuple[str, bytes, str]:
+async def _fetch_public_body(url: str) -> tuple[str, bytes, str, int]:
     current_url = url
     for _ in range(FETCH_MAX_REDIRECTS + 1):
         addresses = await _validate_public_http_url(current_url)
@@ -3089,9 +3134,29 @@ async def _fetch_public_body(url: str) -> tuple[str, bytes, str]:
                 pinned_url,
                 headers={
                     "Host": host_header,
-                    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)",
-                    "Accept": "text/html,application/xhtml+xml,application/pdf,application/json,text/plain,*/*",
-                    "Accept-Encoding": "identity",
+                    "User-Agent": (
+                        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/131.0.0.0 Safari/537.36"
+                    ),
+                    "Accept": (
+                        "text/html,application/xhtml+xml,application/xml;q=0.9,"
+                        "image/avif,image/webp,image/apng,*/*;q=0.8,"
+                        "application/signed-exchange;v=b3;q=0.7"
+                    ),
+                    "Accept-Encoding": _FETCH_ACCEPT_ENCODING,
+                    "Accept-Language": "en-US,en;q=0.9",
+                    "Sec-CH-UA": (
+                        '"Google Chrome";v="131", "Chromium";v="131", '
+                        '"Not_A Brand";v="24"'
+                    ),
+                    "Sec-CH-UA-Mobile": "?0",
+                    "Sec-CH-UA-Platform": '"macOS"',
+                    "Sec-Fetch-Dest": "document",
+                    "Sec-Fetch-Mode": "navigate",
+                    "Sec-Fetch-Site": "none",
+                    "Sec-Fetch-User": "?1",
+                    "Upgrade-Insecure-Requests": "1",
                 },
                 follow_redirects=False,
                 extensions=extensions,
@@ -3104,18 +3169,15 @@ async def _fetch_public_body(url: str) -> tuple[str, bytes, str]:
                     redirect_url = urllib.parse.urljoin(current_url, location)
                 else:
                     resp.raise_for_status()
-                    content_encoding = resp.headers.get("content-encoding", "").lower().strip()
-                    if content_encoding not in {"", "identity"}:
-                        raise ValueError(f"unsupported encoded response: {content_encoding}")
-                    content_length = resp.headers.get("content-length")
-                    if content_length and content_length.isdigit() and int(content_length) > FETCH_MAX_BYTES:
+                    body = await resp.aread()
+                    if len(body) > FETCH_MAX_BYTES:
                         raise ValueError(f"response exceeds {FETCH_MAX_BYTES} byte limit")
-                    chunks = bytearray()
-                    async for chunk in resp.aiter_raw():
-                        if len(chunks) + len(chunk) > FETCH_MAX_BYTES:
-                            raise ValueError(f"response exceeds {FETCH_MAX_BYTES} byte limit")
-                        chunks.extend(chunk)
-                    return current_url, bytes(chunks), resp.headers.get("content-type", "").lower()
+                    return (
+                        current_url,
+                        body,
+                        resp.headers.get("content-type", "").lower(),
+                        int(resp.status_code),
+                    )
         finally:
             close = getattr(client, "aclose", None)
             if close is not None:
@@ -3128,21 +3190,43 @@ async def _fetch_public_body(url: str) -> tuple[str, bytes, str]:
 async def web_fetch(url: str, max_chars: int = 20000) -> str:
     """Fetch a public URL and return readable text, including bounded PDF OCR on macOS."""
     max_chars = min(50000, max(1, int(max_chars)))
+    fetch_started = time.monotonic()
     try:
-        current_url, body, content_type = await asyncio.wait_for(
+        current_url, body, content_type, http_status = await asyncio.wait_for(
             _fetch_public_body(url),
             timeout=FETCH_TIMEOUT,
         )
     except httpx.HTTPStatusError as e:
+        _record_fetch_telemetry(
+            url=url,
+            outcome="http_error",
+            started=fetch_started,
+            http_status=e.response.status_code,
+        )
         return _fetch_error(f"HTTP {e.response.status_code} from {url}")
+    except httpx.TimeoutException as e:
+        _record_fetch_telemetry(url=url, outcome="timeout", started=fetch_started)
+        return _fetch_error(f"request failed: {e}")
     except httpx.RequestError as e:
+        _record_fetch_telemetry(url=url, outcome="connection_error", started=fetch_started)
         return _fetch_error(f"request failed: {e}")
     except asyncio.TimeoutError:
+        _record_fetch_telemetry(url=url, outcome="timeout", started=fetch_started)
         return _fetch_error(f"request exceeded {FETCH_TIMEOUT:g} second deadline")
     except ValueError as e:
+        _record_fetch_telemetry(url=url, outcome="connection_error", started=fetch_started)
         return _fetch_error(str(e))
     except Exception as e:
+        _record_fetch_telemetry(url=url, outcome="connection_error", started=fetch_started)
         return _fetch_error(f"unexpected error: {e}")
+
+    _record_fetch_telemetry(
+        url=url,
+        outcome="success",
+        started=fetch_started,
+        http_status=http_status,
+        body_bytes=len(body),
+    )
 
     if "application/pdf" in content_type or body.startswith(b"%PDF-"):
         try:

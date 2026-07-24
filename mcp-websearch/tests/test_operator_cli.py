@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import plistlib
 import subprocess
 from pathlib import Path
 
@@ -47,6 +48,16 @@ def test_brave_credential_preflight_accepts_owner_only_key(tmp_path):
     key_file.write_text("test-key\n", encoding="utf-8")
     key_file.chmod(0o600)
     assert _source_and_run("check_provider_credentials; printf passed", tmp_path) == "passed"
+
+
+def test_searxng_plist_generates_and_injects_private_secret(tmp_path):
+    plist = plistlib.loads(_source_and_run("searxng_plist", tmp_path).encode())
+    secret_file = tmp_path / "data" / "searxng_secret_key"
+    secret = secret_file.read_text(encoding="utf-8").strip()
+    assert len(secret) == 64
+    assert all(character in "0123456789abcdef" for character in secret)
+    assert secret_file.stat().st_mode & 0o777 == 0o600
+    assert plist["EnvironmentVariables"]["SEARXNG_SECRET"] == secret
 
 
 def test_generated_plist_propagates_search_mode_and_provider_timeouts(tmp_path):

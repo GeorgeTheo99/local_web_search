@@ -28,7 +28,9 @@ search:
     - json
 
 server:
-  secret_key: "searxng-local-secret-key-change-me"
+  # Placeholder only; scripts/local-search injects the owner-only
+  # data/searxng_secret_key value at runtime through SEARXNG_SECRET.
+  secret_key: ""
   bind_address: "127.0.0.1"
   port: 8888
   limiter: false

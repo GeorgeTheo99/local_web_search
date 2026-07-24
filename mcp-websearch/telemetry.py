@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
 """Private, query-free SQLite telemetry for local-search.
 
-Only bounded operational fields from :class:`SearchEvent` are persisted. Search
-queries, URLs, result content, headers, credentials, and API keys are never
-accepted by this module's schema or event types.
+Only bounded operational fields from :class:`SearchEvent` and URL hostnames
+from :class:`FetchEvent` are persisted. Search queries, full URLs, paths, result
+content, headers, credentials, and API keys are never accepted by this module's
+schema or event types.
 """
 
 from __future__ import annotations
 
 import argparse
 import collections
+import ipaddress
 import json
 import logging
 import os
@@ -26,7 +28,7 @@ from typing import Any
 logger = logging.getLogger("websearch-mcp.telemetry")
 
 DB_FILENAME = "telemetry.sqlite3"
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 VALID_WINDOWS = {"24h": 24 * 60 * 60, "7d": 7 * 24 * 60 * 60, "30d": 30 * 24 * 60 * 60}
 
 _SEARCH_STATUSES = {"ok", "empty", "degraded", "error", "timeout"}
@@ -77,6 +79,15 @@ _KNOWN_ENGINE_NAMES = {
     "google images",
 }
 _CIRCUIT_TRANSITIONS = {"none", "opened", "reopened", "recovered"}
+_FETCH_OUTCOMES = {
+    "success",
+    "http_error",
+    "connection_error",
+    "timeout",
+    "proxy_success",
+    "proxy_error",
+}
+_FETCH_TIERS = {"direct", "proxy", "browser"}
 
 
 class InvalidWindow(ValueError):
@@ -114,6 +125,18 @@ class SearchEvent:
     fallback_reason: str | None = None
     providers: tuple[ProviderEvent, ...] = field(default_factory=tuple)
     engine_failures: tuple[tuple[str, str], ...] = field(default_factory=tuple)
+    created_at: int = field(default_factory=lambda: int(time.time()))
+    created_at_ns: int = field(default_factory=time.time_ns)
+
+
+@dataclass(frozen=True)
+class FetchEvent:
+    url_host: str
+    http_status: int | None
+    outcome: str
+    tier_used: str
+    bytes: int | None
+    latency_ms: float
     created_at: int = field(default_factory=lambda: int(time.time()))
     created_at_ns: int = field(default_factory=time.time_ns)
 
@@ -182,6 +205,32 @@ def _enum(value: str | None, allowed: set[str], default: str) -> str:
     return value if value in allowed else default
 
 
+def _url_host(value: str) -> str:
+    """Normalize a bare hostname and reject values that could contain URL details."""
+    raw = str(value).strip().lower().rstrip(".")
+    if not raw or len(raw) > 253 or any(char in raw for char in "/?#@"):
+        return "unknown"
+    try:
+        return ipaddress.ip_address(raw).compressed
+    except ValueError:
+        pass
+    try:
+        ascii_host = raw.encode("idna").decode("ascii")
+    except UnicodeError:
+        return "unknown"
+    labels = ascii_host.split(".")
+    if any(
+        not label
+        or len(label) > 63
+        or label.startswith("-")
+        or label.endswith("-")
+        or re.fullmatch(r"[a-z0-9-]+", label) is None
+        for label in labels
+    ):
+        return "unknown"
+    return ascii_host
+
+
 def _count_map(rows: list[sqlite3.Row], key: str = "name") -> dict[str, int]:
     return {str(row[key]): int(row["count"]) for row in rows}
 
@@ -199,7 +248,9 @@ class TelemetryStore:
         self.enabled = enabled
         self.available = False
         self._reason = "disabled" if not enabled else "unavailable"
-        self._queue: queue.Queue[SearchEvent | _FlushMarker | None] = queue.Queue(maxsize=queue_size)
+        self._queue: queue.Queue[SearchEvent | FetchEvent | _FlushMarker | None] = queue.Queue(
+            maxsize=queue_size
+        )
         self._operation_lock = threading.Lock()
         self._counter_lock = threading.Lock()
         self._dropped_events = 0
@@ -285,6 +336,21 @@ class TelemetryStore:
                 CREATE INDEX IF NOT EXISTS idx_engine_failures_search
                     ON engine_failures(search_event_id);
 
+                CREATE TABLE IF NOT EXISTS fetch_events (
+                    id INTEGER PRIMARY KEY,
+                    created_at INTEGER NOT NULL,
+                    url_host TEXT NOT NULL,
+                    http_status INTEGER,
+                    outcome TEXT NOT NULL,
+                    tier_used TEXT NOT NULL,
+                    bytes INTEGER,
+                    latency_ms REAL NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_fetch_events_created_at
+                    ON fetch_events(created_at);
+                CREATE INDEX IF NOT EXISTS idx_fetch_events_host
+                    ON fetch_events(url_host);
+
                 CREATE TABLE IF NOT EXISTS telemetry_health_events (
                     id INTEGER PRIMARY KEY,
                     created_at INTEGER NOT NULL,
@@ -341,6 +407,18 @@ class TelemetryStore:
             logger.warning("Telemetry queue full; dropping operational event")
             return False
 
+    def record_fetch(self, event: FetchEvent) -> bool:
+        """Queue a host-only fetch outcome without delaying the fetch response."""
+        if not self.available:
+            return False
+        try:
+            self._queue.put_nowait(event)
+            return True
+        except queue.Full:
+            self._note_drop()
+            logger.warning("Telemetry queue full; dropping operational event")
+            return False
+
     def _writer_loop(self) -> None:
         while True:
             item = self._queue.get()
@@ -352,7 +430,10 @@ class TelemetryStore:
                     continue
                 try:
                     with self._operation_lock:
-                        self._write_event(item)
+                        if isinstance(item, FetchEvent):
+                            self._write_fetch_event(item)
+                        else:
+                            self._write_event(item)
                 except Exception as exc:
                     self._note_drop()
                     logger.warning("Telemetry write failed (%s)", type(exc).__name__)
@@ -468,6 +549,41 @@ class TelemetryStore:
                             _enum(reason_kind, _ENGINE_REASON_KINDS, "other"),
                         ),
                     )
+        self._mark_drops_persisted(len(pending_drops))
+        self._secure_files()
+
+    def _write_fetch_event(self, event: FetchEvent) -> None:
+        http_status = event.http_status
+        if http_status is not None and not 100 <= int(http_status) <= 599:
+            http_status = None
+        body_bytes = None if event.bytes is None else max(0, int(event.bytes))
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            reset_before_ns = int(
+                conn.execute(
+                    "SELECT reset_before_ns FROM telemetry_meta WHERE singleton = 1"
+                ).fetchone()[0]
+            )
+            pending_drops = self._pending_drops()
+            self._persist_drop_batch(conn, pending_drops, reset_before_ns)
+            if int(event.created_at_ns) > reset_before_ns:
+                conn.execute(
+                    """
+                    INSERT INTO fetch_events(
+                        created_at, url_host, http_status, outcome, tier_used,
+                        bytes, latency_ms
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        max(0, int(event.created_at)),
+                        _url_host(event.url_host),
+                        http_status,
+                        _enum(event.outcome, _FETCH_OUTCOMES, "connection_error"),
+                        _enum(event.tier_used, _FETCH_TIERS, "direct"),
+                        body_bytes,
+                        max(0.0, float(event.latency_ms)),
+                    ),
+                )
         self._mark_drops_persisted(len(pending_drops))
         self._secure_files()
 
@@ -708,6 +824,7 @@ class TelemetryStore:
                 ).fetchone()[0]
             )
             conn.execute("DELETE FROM search_events")
+            conn.execute("DELETE FROM fetch_events")
             conn.execute("DELETE FROM telemetry_health_events")
             conn.commit()
             conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")

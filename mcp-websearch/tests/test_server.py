@@ -16,8 +16,10 @@ Run:  cd mcp-websearch && uv run pytest -q
 from __future__ import annotations
 
 import asyncio
+import gzip
 import json
 import logging
+import sqlite3
 from typing import Any
 
 import pytest
@@ -330,6 +332,7 @@ class _FakeStream:
 
 class _StaticResponse:
     is_redirect = False
+    status_code = 200
 
     def __init__(self, url: str, body: bytes, content_type: str):
         self.url = srv.httpx.URL(url)
@@ -339,8 +342,8 @@ class _StaticResponse:
     def raise_for_status(self):
         return None
 
-    async def aiter_raw(self):
-        yield self.body
+    async def aread(self):
+        return self.body
 
 
 @pytest.mark.asyncio
@@ -364,15 +367,26 @@ async def test_fetch_pins_validated_ip_against_dns_rebinding(monkeypatch):
 
     monkeypatch.setattr(srv, "_resolve_host_ips", alternating_resolve)
     monkeypatch.setattr(srv, "_client", fake_client)
-    final_url, body, content_type = await srv._fetch_public_body("https://example.com/path")
+    final_url, body, content_type, status = await srv._fetch_public_body(
+        "https://example.com/path"
+    )
 
     assert resolutions == 1
     assert request["url"] == "https://93.184.216.34/path"
     assert request["headers"]["Host"] == "example.com"
+    assert request["headers"]["User-Agent"].endswith("Chrome/131.0.0.0 Safari/537.36")
+    assert request["headers"]["Accept-Encoding"] == srv._FETCH_ACCEPT_ENCODING
+    assert request["headers"]["Accept-Language"] == "en-US,en;q=0.9"
+    assert request["headers"]["Sec-Fetch-Dest"] == "document"
+    assert request["headers"]["Sec-Fetch-Mode"] == "navigate"
+    assert request["headers"]["Sec-Fetch-Site"] == "none"
+    assert request["headers"]["Sec-Fetch-User"] == "?1"
+    assert request["headers"]["Upgrade-Insecure-Requests"] == "1"
     assert request["extensions"] == {"sni_hostname": "example.com"}
     assert final_url == "https://example.com/path"
     assert body == b"safe"
     assert content_type == "text/plain"
+    assert status == 200
 
 
 @pytest.mark.asyncio
@@ -444,7 +458,9 @@ async def test_fetch_uses_fresh_tls_pool_for_each_redirect_host(monkeypatch):
 
     monkeypatch.setattr(srv, "_resolve_host_ips", same_public_ip)
     monkeypatch.setattr(srv, "_public_fetch_client", fresh_client)
-    final_url, body, _ = await srv._fetch_public_body("https://first.example/start")
+    final_url, body, _, status = await srv._fetch_public_body(
+        "https://first.example/start"
+    )
 
     assert created == closed == 2
     assert requests == [
@@ -461,6 +477,84 @@ async def test_fetch_uses_fresh_tls_pool_for_each_redirect_host(monkeypatch):
     ]
     assert final_url == "https://second.example/final"
     assert body == b"safe"
+    assert status == 200
+
+
+@pytest.mark.asyncio
+async def test_fetch_decodes_gzip_before_returning_body(monkeypatch):
+    decoded = b"decoded response body"
+
+    class CompressedStream(srv.httpx.AsyncByteStream):
+        async def __aiter__(self):
+            yield gzip.compress(decoded)
+
+    class FakeClient:
+        def stream(self, method, url, **kwargs):
+            response = srv.httpx.Response(
+                200,
+                headers={
+                    "content-type": "text/plain",
+                    "content-encoding": "gzip",
+                },
+                stream=CompressedStream(),
+                request=srv.httpx.Request(method, url),
+            )
+            return _FakeStream(response)
+
+    async def fake_client():
+        return FakeClient()
+
+    monkeypatch.setattr(srv, "_validate_public_http_url", _allow_public_url)
+    monkeypatch.setattr(srv, "_public_fetch_client", fake_client)
+    _, body, _, status = await srv._fetch_public_body("https://example.com/compressed")
+    assert body == decoded
+    assert status == 200
+
+
+@pytest.mark.asyncio
+async def test_web_fetch_records_host_only_success_telemetry(monkeypatch):
+    async def successful_fetch(url):
+        return url, b"fetched text", "text/plain", 200
+
+    monkeypatch.setattr(srv, "_fetch_public_body", successful_fetch)
+    result = await _call_tool(
+        "web_fetch",
+        {"url": "https://Example.COM/private/path?q=secret"},
+    )
+    assert _result_text(result) == "fetched text"
+    assert srv._telemetry is not None
+    assert srv._telemetry.flush()
+    with sqlite3.connect(srv._telemetry.db_path) as conn:
+        row = conn.execute(
+            "SELECT url_host, http_status, outcome, tier_used, bytes "
+            "FROM fetch_events"
+        ).fetchone()
+    assert row == ("example.com", 200, "success", "direct", 12)
+    assert "private" not in repr(row)
+    assert "secret" not in repr(row)
+
+
+@pytest.mark.asyncio
+async def test_web_fetch_records_http_error_telemetry(monkeypatch):
+    async def failed_fetch(_url):
+        request = srv.httpx.Request("GET", "https://example.com/")
+        response = srv.httpx.Response(403, request=request)
+        raise srv.httpx.HTTPStatusError("forbidden", request=request, response=response)
+
+    monkeypatch.setattr(srv, "_fetch_public_body", failed_fetch)
+    result = await _call_tool(
+        "web_fetch",
+        {"url": "https://example.com/private?q=secret"},
+    )
+    assert _result_text(result).startswith("Fetch error: HTTP 403")
+    assert srv._telemetry is not None
+    assert srv._telemetry.flush()
+    with sqlite3.connect(srv._telemetry.db_path) as conn:
+        row = conn.execute(
+            "SELECT url_host, http_status, outcome, tier_used, bytes "
+            "FROM fetch_events"
+        ).fetchone()
+    assert row == ("example.com", 403, "http_error", "direct", None)
 
 
 @pytest.mark.asyncio
@@ -624,18 +718,18 @@ async def test_short_pdftotext_output_is_preserved_when_ocr_unavailable(monkeypa
 
 
 @pytest.mark.asyncio
-async def test_web_fetch_stops_stream_at_byte_limit(monkeypatch):
+async def test_web_fetch_checks_decoded_body_byte_limit(monkeypatch):
     class ChunkedResponse:
         is_redirect = False
+        status_code = 200
         headers = {"content-type": "text/plain"}
         url = srv.httpx.URL("https://example.com/large")
 
         def raise_for_status(self):
             return None
 
-        async def aiter_raw(self):
-            yield b"a" * 6
-            yield b"b" * 6
+        async def aread(self):
+            return b"a" * 6 + b"b" * 6
 
     class FakeClient:
         def stream(self, method, url, **kwargs):
@@ -1089,7 +1183,16 @@ async def test_search_telemetry_never_persists_query_or_result_content(monkeypat
     assert secret_query not in persisted
     assert secret_result not in persisted
     lowered_schema = schema.lower()
-    for forbidden in ("query", "url", "title", "snippet", "content", "api_key", "credential_value"):
+    for forbidden in (
+        "query",
+        "full_url",
+        "url_path",
+        "title",
+        "snippet",
+        "content",
+        "api_key",
+        "credential_value",
+    ):
         assert forbidden not in lowered_schema
 
 
