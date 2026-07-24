@@ -139,13 +139,12 @@ BRAVE_TIMEOUT = _bounded_float(
 _SEARCH_MODE = os.environ.get("WEBSEARCH_SEARCH_MODE", "normal").strip().lower()
 if _SEARCH_MODE not in {"normal", "sensitive", "maximum_recall"}:
     raise RuntimeError("WEBSEARCH_SEARCH_MODE must be normal, sensitive, or maximum_recall")
-# Provider stack selection (ADR 0002). Brave is the default raw-search
-# provider (independent index, strong privacy posture, $0.005/query).
-# SearXNG remains available as an optional loopback provider.
+# Provider stack selection (ADR 0002). Brave remains the default while the
+# SearXNG-first dual stack is measured in shadow mode.
 _PROVIDER_STACK = os.environ.get("WEBSEARCH_PROVIDER_STACK", "brave").strip().lower()
-if _PROVIDER_STACK not in {"brave", "searxng"}:
+if _PROVIDER_STACK not in {"brave", "searxng", "searxng+brave"}:
     raise RuntimeError(
-        "WEBSEARCH_PROVIDER_STACK must be one of: brave, searxng"
+        "WEBSEARCH_PROVIDER_STACK must be one of: brave, searxng, searxng+brave"
     )
 SUPPLEMENT_MIN_RESULTS = _bounded_int(
     "WEBSEARCH_SUPPLEMENT_MIN_RESULTS", 5, minimum=1, maximum=20
@@ -155,8 +154,8 @@ SUPPLEMENT_MIN_RESULTS = _bounded_int(
 # duplicate/generic. Defaults are conservative starting points to be tuned
 # against the local smoke set.
 _QUALITY_GATE_MODE = os.environ.get("WEBSEARCH_QUALITY_GATE", "auto").strip().lower()
-if _QUALITY_GATE_MODE not in {"auto", "on", "off"}:
-    raise RuntimeError("WEBSEARCH_QUALITY_GATE must be auto, on, or off")
+if _QUALITY_GATE_MODE not in {"auto", "on", "off", "shadow"}:
+    raise RuntimeError("WEBSEARCH_QUALITY_GATE must be auto, on, off, or shadow")
 QUALITY_MIN_RESULTS = _bounded_int(
     "WEBSEARCH_QUALITY_MIN_RESULTS", 3, minimum=1, maximum=10
 )
@@ -445,6 +444,8 @@ class _BraveProvider:
 def _build_provider_stack() -> list[SearchProvider]:
     if _PROVIDER_STACK == "searxng":
         return [_SearXNGProvider()]
+    if _PROVIDER_STACK == "searxng+brave":
+        return [_SearXNGProvider(), _BraveProvider()]
     return [_BraveProvider()]
 
 
@@ -700,11 +701,15 @@ def _record_search_telemetry(
     outcomes: list[_BackendOutcome | None] | None = None,
     mode: str | None = None,
     cache_hit: bool = False,
+    would_escalate: bool | None = None,
+    would_escalate_reason: str | None = None,
 ) -> None:
     """Queue only explicitly allowlisted operational fields, never a search payload."""
     try:
         outcomes = [] if cache_hit else (outcomes or [])
         fallback_reason = None if cache_hit else fallback_reason
+        would_escalate = None if cache_hit else would_escalate
+        would_escalate_reason = None if cache_hit else would_escalate_reason
         providers = tuple(
             _provider_event(outcome)
             for outcome in outcomes
@@ -728,6 +733,8 @@ def _record_search_telemetry(
                 providers=providers,
                 engine_failures=engine_failures,
                 cache_hit=cache_hit,
+                would_escalate=would_escalate,
+                would_escalate_reason=would_escalate_reason,
             )
         )
     except Exception as exc:
@@ -803,6 +810,8 @@ def _finish_search(
     cache_hit: bool = False,
     cache_query: str | None = None,
     cache_variant: str | None = None,
+    would_escalate: bool | None = None,
+    would_escalate_reason: str | None = None,
 ) -> str:
     total_latency_ms = float((timings_ms or {}).get("total") or 0.0)
     _record_search_telemetry(
@@ -815,6 +824,8 @@ def _finish_search(
         outcomes=outcomes,
         mode=mode,
         cache_hit=cache_hit,
+        would_escalate=would_escalate,
+        would_escalate_reason=would_escalate_reason,
     )
     if (
         not cache_hit
@@ -2556,7 +2567,8 @@ def _quality_gate(
 
 
 def _quality_gate_enabled() -> bool:
-    return _QUALITY_GATE_MODE == "on"
+    """Enable quality fallback only when the active stack has a secondary."""
+    return len(_PROVIDERS) > 1 and _QUALITY_GATE_MODE in {"auto", "on"}
 
 
 def _fallback_reason(primary: _BackendOutcome, result_count: int, threshold: int) -> str:
@@ -2823,17 +2835,117 @@ async def _web_search_impl(query: str, num_results: int = 8, *, mode: str | None
     primary_candidates = _dedupe_and_rank(primary_outcome.results, candidate_limit)
     threshold = min(SUPPLEMENT_MIN_RESULTS, requested)
     provider_states = {primary.name: primary_outcome.state}
-    policy_triggers_fallback = fallback is not None and not primary_candidates
+    shadow_mode = fallback is not None and _QUALITY_GATE_MODE == "shadow"
+    policy_triggers_fallback = fallback is not None and (
+        not primary_outcome.ok or not primary_candidates
+    )
     # Quality gate (ADR 0002 Phase 3): only evaluated when the policy rules did
     # not already trigger fallback, and only on a nonempty, reachable primary.
     # The gate is transient and query-free; it never persists snippets/titles.
     quality_reason: str | None = None
     if not policy_triggers_fallback and fallback is not None and primary_outcome.ok:
-        if _quality_gate_enabled():
+        if _quality_gate_enabled() or shadow_mode:
             passed, quality_reason = _quality_gate(primary_candidates)
             if passed:
                 quality_reason = None
     should_use_fallback = policy_triggers_fallback or quality_reason is not None
+
+    if shadow_mode:
+        shadow_reason = quality_reason if quality_reason is not None else (
+            _fallback_reason(primary_outcome, len(primary_candidates), threshold)
+            if policy_triggers_fallback else None
+        )
+        logger.info(
+            "Quality shadow primary_state=%s result_count=%d "
+            "would_escalate=%s reason=%s",
+            primary_outcome.state,
+            len(primary_candidates),
+            should_use_fallback,
+            shadow_reason or "none",
+        )
+        remaining = SEARCH_TOTAL_TIMEOUT - (time.monotonic() - started)
+        if remaining <= 0:
+            circuit = _breaker.snapshot(fallback.name)
+            shadow_outcome = _BackendOutcome(
+                backend=fallback.name,
+                state="timeout",
+                error="total deadline exceeded",
+                circuit_before=str(circuit["state"]),
+                circuit_after=str(circuit["state"]),
+                circuit_failures=int(circuit["consecutive_failures"]),
+            )
+        else:
+            shadow_outcome = await _run_backend(
+                fallback.name,
+                fallback.search(query, candidate_limit),
+                min(fallback.timeout, remaining),
+            )
+        provider_states[fallback.name] = shadow_outcome.state
+        outcomes_shadow = [primary_outcome, shadow_outcome]
+        attempted = _attempted_providers(outcomes_shadow)
+        results = _dedupe_and_rank(shadow_outcome.results, requested)
+        backend = _result_backend(results)
+        timings_ms = _timings(started, outcomes_shadow)
+        if results or shadow_outcome.answer:
+            status = "degraded" if shadow_outcome.state == "degraded" else "ok"
+            rendered = _format_results(
+                query,
+                results,
+                shadow_outcome.suggestions,
+                status=status,
+                backend=backend,
+                attempted=attempted,
+                timings_ms=timings_ms,
+                unresponsive_engines=primary_outcome.unresponsive_engines,
+                provider_states=provider_states,
+                answer=shadow_outcome.answer or None,
+                citations=shadow_outcome.citations or None,
+                mode=effective_mode,
+                search_mode=effective_mode,
+            )
+        elif shadow_outcome.ok:
+            status = "degraded" if shadow_outcome.state == "degraded" else "empty"
+            rendered = _format_results(
+                query,
+                [],
+                shadow_outcome.suggestions,
+                status=status,
+                backend="none",
+                attempted=attempted,
+                timings_ms=timings_ms,
+                unresponsive_engines=primary_outcome.unresponsive_engines,
+                provider_states=provider_states,
+                mode=effective_mode,
+                search_mode=effective_mode,
+            )
+        else:
+            status = "error"
+            backend = "none"
+            rendered = _search_error_payload(
+                query,
+                f"Search error: {fallback.name} search failed in shadow mode.",
+                shadow_outcome.suggestions,
+                attempted=attempted,
+                timings_ms=timings_ms,
+                unresponsive_engines=primary_outcome.unresponsive_engines,
+                provider_states=provider_states,
+                mode=effective_mode,
+                search_mode=effective_mode,
+            )
+        return _finish_search(
+            rendered,
+            status=status,
+            backend=backend,
+            requested_count=requested,
+            result_count=len(results),
+            timings_ms=timings_ms,
+            outcomes=outcomes_shadow,
+            mode=effective_mode,
+            cache_query=query,
+            cache_variant=cache_variant,
+            would_escalate=should_use_fallback,
+            would_escalate_reason=shadow_reason,
+        )
 
     if not should_use_fallback:
         results = _dedupe_and_rank(primary_candidates, requested)
@@ -3005,7 +3117,7 @@ async def _web_search_impl(query: str, num_results: int = 8, *, mode: str | None
 
 @mcp.tool()
 async def web_search(query: str, num_results: int = 8, mode: str | None = None) -> str:
-    """Search the configured Brave (default) or SearXNG provider stack.
+    """Search the configured Brave, SearXNG, or SearXNG-first dual stack.
 
     Optional `mode` selects the ADR 0002 routing mode: `normal` (default),
     `sensitive` (no external egress; refuses without a local corpus), or

@@ -30,6 +30,9 @@ def _event(
     mode: str = "normal",
     fallback_reason: str | None = None,
     cache_hit: bool = False,
+    backend: str = "brave",
+    would_escalate: bool | None = None,
+    would_escalate_reason: str | None = None,
 ) -> SearchEvent:
     providers = [
         ProviderEvent(
@@ -46,7 +49,7 @@ def _event(
     return SearchEvent(
         created_at=created_at,
         status=status,
-        backend="brave",
+        backend=backend,
         mode=mode,
         requested_count=5,
         result_count=2,
@@ -55,6 +58,8 @@ def _event(
         providers=tuple(providers),
         engine_failures=(),
         cache_hit=cache_hit,
+        would_escalate=would_escalate,
+        would_escalate_reason=would_escalate_reason,
     )
 
 
@@ -200,7 +205,7 @@ def test_cache_hit_fields_aggregate_without_provider_or_fallback_inflation(tmp_p
         store.close()
 
 
-def test_v2_schema_migrates_cache_hit_columns_to_v3(tmp_path):
+def test_v2_schema_migrates_cache_and_shadow_columns_to_v4(tmp_path):
     data_dir = tmp_path / "data"
     data_dir.mkdir()
     db_path = data_dir / DB_FILENAME
@@ -225,7 +230,7 @@ def test_v2_schema_migrates_cache_hit_columns_to_v3(tmp_path):
     try:
         assert store.available is True
         with sqlite3.connect(db_path) as conn:
-            assert conn.execute("PRAGMA user_version").fetchone()[0] == 3
+            assert conn.execute("PRAGMA user_version").fetchone()[0] == 4
             search_columns = {
                 row[1] for row in conn.execute("PRAGMA table_info(search_events)")
             }
@@ -234,6 +239,89 @@ def test_v2_schema_migrates_cache_hit_columns_to_v3(tmp_path):
             }
         assert "cache_hit" in search_columns
         assert "cache_hit" in fetch_columns
+        assert "would_escalate" in search_columns
+        assert "would_escalate_reason" in search_columns
+    finally:
+        store.close()
+
+
+def test_v3_schema_migrates_shadow_columns_to_v4(tmp_path):
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    db_path = data_dir / DB_FILENAME
+    with sqlite3.connect(db_path) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE search_events (
+                id INTEGER PRIMARY KEY, created_at INTEGER NOT NULL,
+                status TEXT NOT NULL, backend TEXT NOT NULL, mode TEXT NOT NULL,
+                requested_count INTEGER NOT NULL, result_count INTEGER NOT NULL,
+                fallback_reason TEXT, total_latency_ms REAL NOT NULL,
+                cache_hit INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE fetch_events (
+                id INTEGER PRIMARY KEY, created_at INTEGER NOT NULL,
+                url_host TEXT NOT NULL, http_status INTEGER, outcome TEXT NOT NULL,
+                tier_used TEXT NOT NULL, bytes INTEGER, latency_ms REAL NOT NULL,
+                cache_hit INTEGER NOT NULL DEFAULT 0
+            );
+            PRAGMA user_version = 3;
+            """
+        )
+    store = TelemetryStore(data_dir)
+    try:
+        assert store.available is True
+        with sqlite3.connect(db_path) as conn:
+            assert conn.execute("PRAGMA user_version").fetchone()[0] == 4
+            columns = {
+                row[1] for row in conn.execute("PRAGMA table_info(search_events)")
+            }
+        assert {"would_escalate", "would_escalate_reason"} <= columns
+    finally:
+        store.close()
+
+
+def test_shadow_decisions_aggregate_without_cache_hit_inflation(tmp_path):
+    now = 2_000_000_000
+    store = TelemetryStore(tmp_path / "data")
+    try:
+        store.record(_event(
+            created_at=now - 3,
+            backend="searxng+brave",
+            would_escalate=True,
+            would_escalate_reason="quality_below_min_results",
+        ))
+        store.record(_event(
+            created_at=now - 2,
+            backend="searxng+brave",
+            would_escalate=False,
+        ))
+        store.record(_event(
+            created_at=now - 1,
+            cache_hit=True,
+            would_escalate=True,
+            would_escalate_reason="searxng_error",
+        ))
+        assert store.flush()
+
+        stats = store.stats("24h", now=now)
+        assert stats["searches"]["backends"]["searxng+brave"] == 2
+        assert stats["shadow"] == {
+            "evaluated_count": 2,
+            "would_escalate_count": 1,
+            "would_escalate_rate": 0.5,
+            "reasons": {"quality_below_min_results": 1},
+        }
+        with sqlite3.connect(store.db_path) as conn:
+            rows = conn.execute(
+                "SELECT would_escalate, would_escalate_reason "
+                "FROM search_events ORDER BY id"
+            ).fetchall()
+        assert rows == [
+            (1, "quality_below_min_results"),
+            (0, None),
+            (None, None),
+        ]
     finally:
         store.close()
 

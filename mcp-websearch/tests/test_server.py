@@ -1438,6 +1438,16 @@ async def test_provider_list_default_order_and_names(monkeypatch):
     assert all(p.output == "raw" for p in srv._PROVIDERS)
 
 
+def test_dual_provider_stack_is_searxng_then_brave(monkeypatch):
+    monkeypatch.setattr(srv, "_PROVIDER_STACK", "searxng+brave")
+    providers = srv._build_provider_stack()
+    assert [provider.name for provider in providers] == ["searxng", "brave"]
+    assert [type(provider) for provider in providers] == [
+        srv._SearXNGProvider,
+        srv._BraveProvider,
+    ]
+
+
 def test_default_timings_ms_has_all_provider_keys(monkeypatch):
     monkeypatch.setattr(srv, "_PROVIDER_STACK", "brave")
     monkeypatch.setattr(srv, "_PROVIDERS", srv._build_provider_stack())

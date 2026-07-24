@@ -28,11 +28,11 @@ from typing import Any
 logger = logging.getLogger("websearch-mcp.telemetry")
 
 DB_FILENAME = "telemetry.sqlite3"
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 VALID_WINDOWS = {"24h": 24 * 60 * 60, "7d": 7 * 24 * 60 * 60, "30d": 30 * 24 * 60 * 60}
 
 _SEARCH_STATUSES = {"ok", "empty", "degraded", "error", "timeout"}
-_BACKENDS = {"none", "searxng", "brave"}
+_BACKENDS = {"none", "searxng", "brave", "searxng+brave"}
 _MODES = {"normal", "sensitive", "maximum_recall", "disabled"}
 _FALLBACK_REASONS = {
     "searxng_degraded",
@@ -128,6 +128,8 @@ class SearchEvent:
     created_at: int = field(default_factory=lambda: int(time.time()))
     created_at_ns: int = field(default_factory=time.time_ns)
     cache_hit: bool = False
+    would_escalate: bool | None = None
+    would_escalate_reason: str | None = None
 
 
 @dataclass(frozen=True)
@@ -303,7 +305,9 @@ class TelemetryStore:
                     result_count INTEGER NOT NULL,
                     fallback_reason TEXT,
                     total_latency_ms REAL NOT NULL,
-                    cache_hit INTEGER NOT NULL DEFAULT 0
+                    cache_hit INTEGER NOT NULL DEFAULT 0,
+                    would_escalate INTEGER,
+                    would_escalate_reason TEXT
                 );
                 CREATE INDEX IF NOT EXISTS idx_search_events_created_at
                     ON search_events(created_at);
@@ -390,6 +394,20 @@ class TelemetryStore:
                     conn.execute(
                         "ALTER TABLE fetch_events "
                         "ADD COLUMN cache_hit INTEGER NOT NULL DEFAULT 0"
+                    )
+            # v3 -> v4: shadow quality-gate decisions are nullable so ordinary
+            # searches and cache hits do not count as evaluated searches.
+            if current_version < 4:
+                search_columns = {
+                    str(row[1]) for row in conn.execute("PRAGMA table_info(search_events)")
+                }
+                if "would_escalate" not in search_columns:
+                    conn.execute(
+                        "ALTER TABLE search_events ADD COLUMN would_escalate INTEGER"
+                    )
+                if "would_escalate_reason" not in search_columns:
+                    conn.execute(
+                        "ALTER TABLE search_events ADD COLUMN would_escalate_reason TEXT"
                     )
             conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         self._secure_files()
@@ -500,6 +518,16 @@ class TelemetryStore:
             if event.cache_hit
             else (_enum(event.fallback_reason, _FALLBACK_REASONS, "") or None)
         )
+        would_escalate = (
+            None
+            if event.cache_hit or event.would_escalate is None
+            else int(bool(event.would_escalate))
+        )
+        would_escalate_reason = (
+            _enum(event.would_escalate_reason, _FALLBACK_REASONS, "") or None
+            if would_escalate
+            else None
+        )
         with self._connect() as conn:
             # Serialize with reset across every process. Events queued before a
             # reset carry an older nanosecond timestamp and are discarded.
@@ -516,8 +544,9 @@ class TelemetryStore:
                     """
                     INSERT INTO search_events(
                         created_at, status, backend, mode, requested_count,
-                        result_count, fallback_reason, total_latency_ms, cache_hit
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        result_count, fallback_reason, total_latency_ms, cache_hit,
+                        would_escalate, would_escalate_reason
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         max(0, int(event.created_at)),
@@ -529,6 +558,8 @@ class TelemetryStore:
                         fallback_reason,
                         max(0.0, float(event.total_latency_ms)),
                         int(bool(event.cache_hit)),
+                        would_escalate,
+                        would_escalate_reason,
                     ),
                 )
                 search_id = int(cursor.lastrowid)
@@ -697,6 +728,28 @@ class TelemetryStore:
                 """,
                 (since, until),
             ).fetchall()
+            shadow_row = conn.execute(
+                """
+                SELECT COUNT(would_escalate) AS evaluated_count,
+                       COALESCE(SUM(would_escalate), 0) AS would_escalate_count
+                FROM search_events
+                WHERE created_at >= ? AND created_at <= ?
+                  AND cache_hit = 0
+                """,
+                (since, until),
+            ).fetchone()
+            shadow_reason_rows = conn.execute(
+                """
+                SELECT would_escalate_reason AS name, COUNT(*) AS count
+                FROM search_events
+                WHERE created_at >= ? AND created_at <= ?
+                  AND cache_hit = 0 AND would_escalate = 1
+                  AND would_escalate_reason IS NOT NULL
+                GROUP BY would_escalate_reason
+                ORDER BY count DESC, name
+                """,
+                (since, until),
+            ).fetchall()
             provider_rows = conn.execute(
                 """
                 SELECT p.provider,
@@ -770,6 +823,8 @@ class TelemetryStore:
         dropped_events = durable_drops + pending_drops
         total = int(search_row["total"] or 0)
         fallback_count = sum(int(row["count"]) for row in fallback_rows)
+        shadow_evaluated = int(shadow_row["evaluated_count"] or 0)
+        shadow_would_escalate = int(shadow_row["would_escalate_count"] or 0)
         search_cache_total = int(search_cache_row["total"] or 0)
         search_cache_hits = int(search_cache_row["hits"] or 0)
         fetch_cache_total = int(fetch_cache_row["total"] or 0)
@@ -837,6 +892,15 @@ class TelemetryStore:
                 "searches": fallback_count,
                 "rate": round(fallback_count / total, 4) if total else 0.0,
                 "reasons": _count_map(fallback_rows),
+            },
+            "shadow": {
+                "evaluated_count": shadow_evaluated,
+                "would_escalate_count": shadow_would_escalate,
+                "would_escalate_rate": (
+                    round(shadow_would_escalate / shadow_evaluated, 4)
+                    if shadow_evaluated else 0.0
+                ),
+                "reasons": _count_map(shadow_reason_rows),
             },
             "cache": {
                 "search": {
