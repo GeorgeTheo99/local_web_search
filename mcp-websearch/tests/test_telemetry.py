@@ -16,6 +16,7 @@ from telemetry import (
     InvalidWindow,
     ProviderEvent,
     SearchEvent,
+    ShadowParity,
     TelemetryStore,
     TelemetryUnavailable,
     classify_error,
@@ -33,11 +34,14 @@ def _event(
     backend: str = "brave",
     would_escalate: bool | None = None,
     would_escalate_reason: str | None = None,
+    shadow_parity: ShadowParity | None = None,
+    primary_state: str = "ok",
+    reference_state: str = "ok",
 ) -> SearchEvent:
     providers = [
         ProviderEvent(
             provider="brave",
-            state="ok",
+            state=reference_state,
             attempts=1,
             result_count=2,
             latency_ms=10.0,
@@ -46,6 +50,20 @@ def _event(
             circuit_after="closed",
         )
     ]
+    if shadow_parity is not None:
+        providers.insert(
+            0,
+            ProviderEvent(
+                provider="searxng",
+                state=primary_state,
+                attempts=1,
+                result_count=2,
+                latency_ms=8.0,
+                http_status=200,
+                circuit_before="closed",
+                circuit_after="closed",
+            ),
+        )
     return SearchEvent(
         created_at=created_at,
         status=status,
@@ -60,6 +78,36 @@ def _event(
         cache_hit=cache_hit,
         would_escalate=would_escalate,
         would_escalate_reason=would_escalate_reason,
+        shadow_parity=shadow_parity,
+    )
+
+
+def _parity(**overrides) -> ShadowParity:
+    values = {
+        "top_k": 3,
+        "primary_result_count": 3,
+        "reference_result_count": 3,
+        "canonical_url_overlap_count": 1,
+        "primary_distinct_domain_count": 2,
+        "reference_distinct_domain_count": 3,
+        "domain_overlap_count": 2,
+        "reference_top_domain_in_primary": 1,
+        "primary_general_web_result_count": 2,
+    }
+    values.update(overrides)
+    return ShadowParity(**values)
+
+
+def _empty_parity() -> ShadowParity:
+    return _parity(
+        primary_result_count=0,
+        reference_result_count=0,
+        canonical_url_overlap_count=0,
+        primary_distinct_domain_count=0,
+        reference_distinct_domain_count=0,
+        domain_overlap_count=0,
+        reference_top_domain_in_primary=0,
+        primary_general_web_result_count=0,
     )
 
 
@@ -205,7 +253,7 @@ def test_cache_hit_fields_aggregate_without_provider_or_fallback_inflation(tmp_p
         store.close()
 
 
-def test_v2_schema_migrates_cache_and_shadow_columns_to_v4(tmp_path):
+def test_v2_schema_migrates_cache_shadow_and_parity_to_v5(tmp_path):
     data_dir = tmp_path / "data"
     data_dir.mkdir()
     db_path = data_dir / DB_FILENAME
@@ -230,22 +278,30 @@ def test_v2_schema_migrates_cache_and_shadow_columns_to_v4(tmp_path):
     try:
         assert store.available is True
         with sqlite3.connect(db_path) as conn:
-            assert conn.execute("PRAGMA user_version").fetchone()[0] == 4
+            assert conn.execute("PRAGMA user_version").fetchone()[0] == 5
             search_columns = {
                 row[1] for row in conn.execute("PRAGMA table_info(search_events)")
             }
             fetch_columns = {
                 row[1] for row in conn.execute("PRAGMA table_info(fetch_events)")
             }
+            parity_columns = {
+                row[1] for row in conn.execute("PRAGMA table_info(shadow_parity)")
+            }
         assert "cache_hit" in search_columns
         assert "cache_hit" in fetch_columns
         assert "would_escalate" in search_columns
         assert "would_escalate_reason" in search_columns
+        assert {
+            "top_k",
+            "canonical_url_overlap_count",
+            "domain_overlap_count",
+        } <= parity_columns
     finally:
         store.close()
 
 
-def test_v3_schema_migrates_shadow_columns_to_v4(tmp_path):
+def test_v3_schema_migrates_shadow_columns_and_parity_to_v5(tmp_path):
     data_dir = tmp_path / "data"
     data_dir.mkdir()
     db_path = data_dir / DB_FILENAME
@@ -272,11 +328,53 @@ def test_v3_schema_migrates_shadow_columns_to_v4(tmp_path):
     try:
         assert store.available is True
         with sqlite3.connect(db_path) as conn:
-            assert conn.execute("PRAGMA user_version").fetchone()[0] == 4
+            assert conn.execute("PRAGMA user_version").fetchone()[0] == 5
             columns = {
                 row[1] for row in conn.execute("PRAGMA table_info(search_events)")
             }
+            parity_table = conn.execute(
+                "SELECT name FROM sqlite_master WHERE name = 'shadow_parity'"
+            ).fetchone()
         assert {"would_escalate", "would_escalate_reason"} <= columns
+        assert parity_table == ("shadow_parity",)
+    finally:
+        store.close()
+
+
+def test_v4_schema_migrates_to_v5_without_rewriting_search_rows(tmp_path):
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    db_path = data_dir / DB_FILENAME
+    with sqlite3.connect(db_path) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE search_events (
+                id INTEGER PRIMARY KEY, created_at INTEGER NOT NULL,
+                status TEXT NOT NULL, backend TEXT NOT NULL, mode TEXT NOT NULL,
+                requested_count INTEGER NOT NULL, result_count INTEGER NOT NULL,
+                fallback_reason TEXT, total_latency_ms REAL NOT NULL,
+                cache_hit INTEGER NOT NULL DEFAULT 0,
+                would_escalate INTEGER, would_escalate_reason TEXT
+            );
+            INSERT INTO search_events VALUES (
+                1, 2000000000, 'ok', 'brave', 'normal', 3, 2,
+                NULL, 10.0, 0, NULL, NULL
+            );
+            CREATE TABLE fetch_events (
+                id INTEGER PRIMARY KEY, created_at INTEGER NOT NULL,
+                url_host TEXT NOT NULL, http_status INTEGER, outcome TEXT NOT NULL,
+                tier_used TEXT NOT NULL, bytes INTEGER, latency_ms REAL NOT NULL,
+                cache_hit INTEGER NOT NULL DEFAULT 0
+            );
+            PRAGMA user_version = 4;
+            """
+        )
+    store = TelemetryStore(data_dir)
+    try:
+        with sqlite3.connect(db_path) as conn:
+            assert conn.execute("PRAGMA user_version").fetchone()[0] == 5
+            assert conn.execute("SELECT COUNT(*) FROM search_events").fetchone()[0] == 1
+            assert conn.execute("SELECT COUNT(*) FROM shadow_parity").fetchone()[0] == 0
     finally:
         store.close()
 
@@ -306,12 +404,11 @@ def test_shadow_decisions_aggregate_without_cache_hit_inflation(tmp_path):
 
         stats = store.stats("24h", now=now)
         assert stats["searches"]["backends"]["searxng+brave"] == 2
-        assert stats["shadow"] == {
-            "evaluated_count": 2,
-            "would_escalate_count": 1,
-            "would_escalate_rate": 0.5,
-            "reasons": {"quality_below_min_results": 1},
-        }
+        assert stats["shadow"]["evaluated_count"] == 2
+        assert stats["shadow"]["would_escalate_count"] == 1
+        assert stats["shadow"]["would_escalate_rate"] == 0.5
+        assert stats["shadow"]["reasons"] == {"quality_below_min_results": 1}
+        assert stats["shadow"]["parity"]["sample_count"] == 0
         with sqlite3.connect(store.db_path) as conn:
             rows = conn.execute(
                 "SELECT would_escalate, would_escalate_reason "
@@ -322,6 +419,167 @@ def test_shadow_decisions_aggregate_without_cache_hit_inflation(tmp_path):
             (0, None),
             (None, None),
         ]
+    finally:
+        store.close()
+
+
+def test_shadow_parity_persists_and_aggregates_successful_and_empty_samples(tmp_path):
+    now = 2_000_000_000
+    store = TelemetryStore(tmp_path / "data")
+    try:
+        store.record(_event(
+            created_at=now - 2,
+            backend="brave",
+            would_escalate=False,
+            shadow_parity=_parity(),
+        ))
+        store.record(_event(
+            created_at=now - 1,
+            status="empty",
+            backend="none",
+            would_escalate=True,
+            would_escalate_reason="searxng_empty",
+            shadow_parity=_empty_parity(),
+            primary_state="empty",
+            reference_state="empty",
+        ))
+        assert store.flush()
+        with sqlite3.connect(store.db_path) as conn:
+            rows = conn.execute(
+                "SELECT top_k, primary_result_count, reference_result_count, "
+                "canonical_url_overlap_count, primary_distinct_domain_count, "
+                "reference_distinct_domain_count, domain_overlap_count, "
+                "reference_top_domain_in_primary, primary_general_web_result_count "
+                "FROM shadow_parity ORDER BY search_event_id"
+            ).fetchall()
+        assert rows == [
+            (3, 3, 3, 1, 2, 3, 2, 1, 2),
+            (3, 0, 0, 0, 0, 0, 0, 0, 0),
+        ]
+
+        parity = store.stats("24h", now=now)["shadow"]["parity"]
+        assert parity == {
+            "sample_count": 2,
+            "comparable_sample_count": 2,
+            "reference_result_total": 3,
+            "reference_result_nonempty_sample_count": 1,
+            "reference_domain_total": 3,
+            "reference_domain_nonempty_sample_count": 1,
+            "primary_result_total": 3,
+            "primary_result_nonempty_sample_count": 1,
+            "average_top_k": 3.0,
+            "average_primary_result_count": 1.5,
+            "average_reference_result_count": 1.5,
+            "average_canonical_url_overlap_count": 0.5,
+            "canonical_url_overlap_rate": 0.3333,
+            "average_primary_distinct_domain_count": 1.0,
+            "average_reference_distinct_domain_count": 1.5,
+            "average_domain_overlap_count": 1.0,
+            "domain_overlap_rate": 0.6667,
+            "reference_top_domain_in_primary_rate": 1.0,
+            "average_primary_general_web_result_count": 1.0,
+            "primary_general_web_result_rate": 0.6667,
+        }
+    finally:
+        store.close()
+
+
+def test_all_empty_shadow_parity_rates_are_undefined(tmp_path):
+    now = 2_000_000_000
+    store = TelemetryStore(tmp_path / "data")
+    try:
+        store.record(_event(
+            created_at=now - 1,
+            status="empty",
+            backend="none",
+            would_escalate=True,
+            would_escalate_reason="searxng_empty",
+            shadow_parity=_empty_parity(),
+            primary_state="empty",
+            reference_state="empty",
+        ))
+        assert store.flush()
+
+        parity = store.stats("24h", now=now)["shadow"]["parity"]
+        assert parity["sample_count"] == 1
+        assert parity["comparable_sample_count"] == 1
+        assert parity["reference_result_total"] == 0
+        assert parity["reference_result_nonempty_sample_count"] == 0
+        assert parity["reference_domain_total"] == 0
+        assert parity["reference_domain_nonempty_sample_count"] == 0
+        assert parity["primary_result_total"] == 0
+        assert parity["primary_result_nonempty_sample_count"] == 0
+        assert parity["canonical_url_overlap_rate"] is None
+        assert parity["domain_overlap_rate"] is None
+        assert parity["reference_top_domain_in_primary_rate"] is None
+        assert parity["primary_general_web_result_rate"] is None
+        assert parity["average_canonical_url_overlap_count"] == 0.0
+    finally:
+        store.close()
+
+
+def test_shadow_parity_is_excluded_for_cache_nonshadow_and_provider_failures(tmp_path):
+    store = TelemetryStore(tmp_path / "data")
+    try:
+        store.record(_event(
+            created_at=2_000_000_000,
+            cache_hit=True,
+            would_escalate=False,
+            shadow_parity=_parity(),
+        ))
+        store.record(_event(
+            created_at=2_000_000_001,
+            would_escalate=None,
+            shadow_parity=_parity(),
+        ))
+        store.record(_event(
+            created_at=2_000_000_002,
+            would_escalate=True,
+            shadow_parity=_parity(),
+            primary_state="error",
+        ))
+        store.record(_event(
+            created_at=2_000_000_003,
+            would_escalate=False,
+            shadow_parity=_parity(),
+            reference_state="timeout",
+        ))
+        assert store.flush()
+        with sqlite3.connect(store.db_path) as conn:
+            assert conn.execute("SELECT COUNT(*) FROM shadow_parity").fetchone()[0] == 0
+    finally:
+        store.close()
+
+
+def test_shadow_parity_values_are_clamped_to_consistent_bounds(tmp_path):
+    store = TelemetryStore(tmp_path / "data")
+    try:
+        untrusted = _parity(
+            top_k=99,
+            primary_result_count=99,
+            reference_result_count=2,
+            canonical_url_overlap_count=99,
+            primary_distinct_domain_count=99,
+            reference_distinct_domain_count=99,
+            domain_overlap_count=99,
+            reference_top_domain_in_primary=7,
+            primary_general_web_result_count=99,
+        )
+        store.record(_event(
+            created_at=2_000_000_000,
+            would_escalate=False,
+            shadow_parity=untrusted,
+        ))
+        assert store.flush()
+        with sqlite3.connect(store.db_path) as conn:
+            row = conn.execute(
+                "SELECT top_k, primary_result_count, reference_result_count, "
+                "canonical_url_overlap_count, primary_distinct_domain_count, "
+                "reference_distinct_domain_count, domain_overlap_count, "
+                "reference_top_domain_in_primary, primary_general_web_result_count "
+                "FROM shadow_parity"
+            ).fetchone()
+        assert row == (5, 5, 2, 2, 5, 2, 2, 1, 5)
     finally:
         store.close()
 
@@ -342,6 +600,7 @@ def test_schema_and_rows_cannot_contain_sensitive_search_fields(tmp_path):
                     "search_events",
                     "provider_events",
                     "engine_failures",
+                    "shadow_parity",
                     "fetch_events",
                 )
                 for row in conn.execute(f"SELECT * FROM {table}")
@@ -350,10 +609,15 @@ def test_schema_and_rows_cannot_contain_sensitive_search_fields(tmp_path):
             fetch_columns = [
                 row[1] for row in conn.execute("PRAGMA table_info(fetch_events)")
             ]
+            parity_column_types = {
+                row[2] for row in conn.execute("PRAGMA table_info(shadow_parity)")
+            }
         for forbidden in (
             "query",
             "full_url",
             "url_path",
+            "url_hash",
+            "domain_hash",
             "title",
             "snippet",
             "content",
@@ -362,6 +626,7 @@ def test_schema_and_rows_cannot_contain_sensitive_search_fields(tmp_path):
         ):
             assert forbidden not in schema
         assert "url_host" in fetch_columns
+        assert parity_column_types == {"INTEGER"}
         assert not any("secret" in str(value).lower() for value in row_values)
     finally:
         store.close()

@@ -1,7 +1,14 @@
 # Proxy & Hardening Roadmap
 
 **Last updated:** 2026-07-24
-**Status:** Free fixes in progress (GPT 5.6 Sol worker); paid proxy deferred pending measurement
+**Status:** Free hardening, cache, and dual-stack shadow are implemented; paid proxy deferred pending measurement
+
+> **Implementation-status amendment (2026-07-24):** The panel findings below
+> describe the pre-hardening baseline. Fetch telemetry, private caching,
+> raw-byte fetch limits with encoded-response rejection, SearXNG secret
+> injection, and `searxng+brave` shadow routing now exist. Shadow remains
+> evaluation-only; promotion requires numeric
+> result/domain parity evidence as well as fallback-rate data.
 
 ## How we got here
 
@@ -15,7 +22,7 @@ and measurement must come first, and the $13/month Brave baseline may be inflate
 | Finding | Source | Impact |
 |---|---|---|
 | Bing has **0 failures** in telemetry (1,046 events, 12 days) — all degradation was from already-removed engines | Opus 5 | Proxy may solve a problem that doesn't exist post-cleanup |
-| web_fetch 403s are **self-inflicted** (bot-like UA, `Accept-Encoding: identity`, no `sec-fetch-*`, HTTP/1.1) | Opus 5 | Free header fix plausibly recovers most 403s without any proxy |
+| Pre-hardening `web_fetch` fingerprint likely contributed to 403s (bot-like UA, no `sec-fetch-*`, HTTP/1.1); the panel also criticized `Accept-Encoding: identity` | Opus 5 | Browser-like headers/HTTP2 were adopted, but identity encoding is now intentional so the raw-byte cap cannot be bypassed by decompression |
 | Actual Brave spend is ~$3–10/month, not $13 (telemetry shows 70+20+24 calls on 7/22–24) | Opus 5 | Savings ceiling is ~$3–5/month, not ~$8 |
 | `searxng/settings.yml` is git-tracked with a committed `secret_key` | Kimi K3 | Real security issue, fix before adding any proxy creds |
 | Per-engine SearXNG `network` is all-or-nothing (every request proxied, not just failures) | Codex 5.6 | Can't do direct→proxy fallback per-engine without duplicate engine defs |
@@ -23,13 +30,13 @@ and measurement must come first, and the $13/month Brave baseline may be inflate
 | SearXNG isn't the primary provider yet (Brave is default) | Kimi K3 | Paying to stabilize a provider nothing routes through is premature |
 | IPRoyal Web Unblocker is more invasive than a dumb proxy (does fingerprinting/MITM to solve CAPTCHAs) | Codex 5.6 | Privacy claim needs verification against IPRoyal's logging/retention policy |
 
-## Phase 0: Free and immediate fixes (in progress)
+## Phase 0: Free and immediate fixes (implemented)
 
-**Status:** Delegated to GPT 5.6 Sol worker. No new vendors, no spend.
+**Status:** Implemented without a new vendor or paid service.
 
 | Fix | Cost | Why |
 |---|---|---|
-| web_fetch: modern Chrome headers + HTTP/2 + gzip/br decompression | $0 | Self-inflicted 403s from bot-like request fingerprint |
+| web_fetch: modern Chrome headers + HTTP/2; request identity encoding and reject encoded responses before raw streaming | $0 | Improve the request fingerprint without allowing pre-cap decompression allocation |
 | settings.yml: move `secret_key` to gitignored secret file (env injection) | $0 | Security: committed secret in git-tracked file |
 | Telemetry: add `fetch_events` table (host, status, outcome, tier, bytes, latency) | $0 | No fetch measurement plane exists — prerequisite for any pilot |
 | Verify actual Brave spend from telemetry | $0 | Baseline may be ~$3–10/mo not $13 |
@@ -38,27 +45,29 @@ and measurement must come first, and the $13/month Brave baseline may be inflate
 If this holds, the browser fallback (currently ~13% of fetches) shrinks to ~5%,
 and the paid proxy case for fetch may evaporate entirely.
 
-## Phase 1: Central web cache (free, highest ROI)
+## Phase 1: Central web cache (implemented)
 
-**Status:** Designed in roadmap.md Phase 1, not yet built.
+**Status:** Implemented in `mcp-websearch/cache.py`.
 
 - SQLite (WAL) for metadata + filesystem blobs for page content
-- `data/cache/cache.db` + `data/cache/content/<hash_prefix>/<hash>`
-- Search results: 2–6h TTL. Web content: 1–30d by content type.
-- Privacy: SHA-256 of normalized query (no query text), URLs stored, mode 0700
-- **25% cache hit rate → ~$9–10/month Brave savings** (or ~$2–3 if baseline is already low)
+- `data/cache/cache.sqlite3` + `data/cache/content/<hash_prefix>/<hash>`
+- Search results: 2h general TTL; 30m current/news TTL. Web content: 1–30d by content type.
+- Privacy: cache search keys are SHA-256 digests; cache entries may store result/content URLs. Search/parity telemetry stores no identifiers, while fetch telemetry stores only normalized destination hostnames.
+- **25% cache hit rate → about $3.25/month saved from the $13 planning baseline, leaving about $9.75/month** (or about $0.75–$2.50 saved if the baseline is $3–$10)
 
 **Why before proxy:** Shrinks total request volume, making every downstream
 provider (SearXNG, Brave, proxy) cheaper. The cache is free and benefits all
 providers regardless of which is primary.
 
-## Phase 2: SearXNG-first + Brave quality-gate fallback (free, the cost killer)
+## Phase 2: SearXNG-first + Brave quality-gate fallback (shadow evaluation)
 
-**Status:** Designed in roadmap.md Phase 3, not yet built.
+**Status:** Dual-stack routing and `auto|on|off|shadow` modes are implemented;
+shadow serves Brave when usable and is not a production promotion.
 
-- `WEBSEARCH_PROVIDER_STACK=searxng+brave` — SearXNG tried first, Brave on quality-gate fail
-- Quality gate: <3 results, <2 domains, duplicate-dominated → escalate to Brave
-- **Prerequisite:** Phase 1 cache (so SearXNG-first doesn't increase latency for repeat queries)
+- `WEBSEARCH_PROVIDER_STACK=searxng+brave` — SearXNG primary, Brave policy-controlled reference/fallback
+- The quality gate is implemented: <3 results, <2 domains, duplicate-dominated, or critical Bing unavailable → escalate in auto/on; shadow records the same decision while Brave serves when usable
+- Freshness is separate and explicit: `current`/`news` intents map to provider freshness filters rather than a gate heuristic
+- Schema-v5 telemetry compares deduped top-k URL/domain counts without storing identifiers
 
 **Why before proxy:** Kimi K3 is right — paying $2.60/month to stabilize a provider
 nothing routes through is premature. Flip SearXNG to primary first, measure for a
@@ -67,11 +76,11 @@ may never be needed.
 
 ## Phase 3: Measure (1 week, free)
 
-After Phase 0–2, instrument and observe:
+With Phase 0–2 implemented, observe:
 
 | Metric | How | Decision |
 |---|---|---|
-| SearXNG success rate (no Brave fallback) | `search_events` + `provider_events` | >80% → proxy unnecessary; <60% → consider proxy |
+| SearXNG success rate and parity | `search_events`, `provider_events`, `shadow.parity` stats | Promotion requires acceptable fallback plus URL/domain coverage; proxy decisions still depend on reliability |
 | Bing engine failures | `engine_failures` table | 0 failures → no proxy needed; recurring → proxy candidate |
 | web_fetch 403 rate by domain | new `fetch_events` table | <5% → done; >10% → consider header improvements or proxy |
 | Actual Brave spend | `provider_events` × $0.005 | Confirms monthly cost baseline |
@@ -114,8 +123,8 @@ engines:
   - name: arxiv               # keyless API — direct
 ```
 
-**Cost:** Bing-only = ~2,600 req/mo = ~$2.60/month. DO NOT re-enable all 6
-scrape engines (Codex 5.6: 6 engines × 2,600 = ~$15.66/mo, exceeding Brave).
+**Cost:** Bing-only = ~2,610 req/mo = ~$2.61/month. DO NOT re-enable all 6
+scrape engines (6 engines × 2,610 × $0.001 = $15.66/month, exceeding Brave).
 
 ### web_fetch proxy parameter (if header fix insufficient)
 

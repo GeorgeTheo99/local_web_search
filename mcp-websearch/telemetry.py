@@ -28,7 +28,7 @@ from typing import Any
 logger = logging.getLogger("websearch-mcp.telemetry")
 
 DB_FILENAME = "telemetry.sqlite3"
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 VALID_WINDOWS = {"24h": 24 * 60 * 60, "7d": 7 * 24 * 60 * 60, "30d": 30 * 24 * 60 * 60}
 
 _SEARCH_STATUSES = {"ok", "empty", "degraded", "error", "timeout"}
@@ -36,7 +36,6 @@ _BACKENDS = {"none", "searxng", "brave", "searxng+brave"}
 _MODES = {"normal", "sensitive", "maximum_recall", "disabled"}
 _FALLBACK_REASONS = {
     "searxng_degraded",
-    "below_minimum",
     "searxng_empty",
     "searxng_timeout",
     "searxng_circuit_open",
@@ -47,10 +46,10 @@ _FALLBACK_REASONS = {
     "brave_timeout",
     "brave_circuit_open",
     "brave_error",
+    "quality_critical_engine_unavailable",
     "quality_below_min_results",
     "quality_low_domain_diversity",
     "quality_duplicate_dominated",
-    "quality_stale_for_news_intent",
 }
 _PROVIDER_STATES = {"ok", "empty", "degraded", "error", "timeout", "circuit_open"}
 _CIRCUIT_STATES = {"closed", "open", "half_open", "unknown"}
@@ -115,6 +114,21 @@ class ProviderEvent:
 
 
 @dataclass(frozen=True)
+class ShadowParity:
+    """Identifier-free numeric overlap metrics for one shadow comparison."""
+
+    top_k: int
+    primary_result_count: int
+    reference_result_count: int
+    canonical_url_overlap_count: int
+    primary_distinct_domain_count: int
+    reference_distinct_domain_count: int
+    domain_overlap_count: int
+    reference_top_domain_in_primary: int
+    primary_general_web_result_count: int
+
+
+@dataclass(frozen=True)
 class SearchEvent:
     status: str
     backend: str
@@ -130,6 +144,7 @@ class SearchEvent:
     cache_hit: bool = False
     would_escalate: bool | None = None
     would_escalate_reason: str | None = None
+    shadow_parity: ShadowParity | None = None
 
 
 @dataclass(frozen=True)
@@ -409,6 +424,37 @@ class TelemetryStore:
                     conn.execute(
                         "ALTER TABLE search_events ADD COLUMN would_escalate_reason TEXT"
                     )
+            # v4 -> v5: a separate one-to-one numeric table keeps shadow parity
+            # absent (NULL at the event level) unless both providers completed.
+            if current_version < 5:
+                conn.executescript(
+                    """
+                    CREATE TABLE IF NOT EXISTS shadow_parity (
+                        search_event_id INTEGER PRIMARY KEY
+                            REFERENCES search_events(id) ON DELETE CASCADE,
+                        top_k INTEGER NOT NULL CHECK(top_k BETWEEN 0 AND 5),
+                        primary_result_count INTEGER NOT NULL
+                            CHECK(primary_result_count BETWEEN 0 AND top_k),
+                        reference_result_count INTEGER NOT NULL
+                            CHECK(reference_result_count BETWEEN 0 AND top_k),
+                        canonical_url_overlap_count INTEGER NOT NULL
+                            CHECK(canonical_url_overlap_count BETWEEN 0 AND
+                                  MIN(primary_result_count, reference_result_count)),
+                        primary_distinct_domain_count INTEGER NOT NULL
+                            CHECK(primary_distinct_domain_count BETWEEN 0 AND primary_result_count),
+                        reference_distinct_domain_count INTEGER NOT NULL
+                            CHECK(reference_distinct_domain_count BETWEEN 0 AND reference_result_count),
+                        domain_overlap_count INTEGER NOT NULL
+                            CHECK(domain_overlap_count BETWEEN 0 AND
+                                  MIN(primary_distinct_domain_count,
+                                      reference_distinct_domain_count)),
+                        reference_top_domain_in_primary INTEGER NOT NULL
+                            CHECK(reference_top_domain_in_primary IN (0, 1)),
+                        primary_general_web_result_count INTEGER NOT NULL
+                            CHECK(primary_general_web_result_count BETWEEN 0 AND primary_result_count)
+                    );
+                    """
+                )
             conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         self._secure_files()
 
@@ -509,6 +555,68 @@ class TelemetryStore:
                 (eligible[0] // 1_000_000_000, eligible[0], len(eligible)),
             )
 
+    @staticmethod
+    def _validated_shadow_parity(event: SearchEvent) -> ShadowParity | None:
+        """Clamp numeric metrics and reject non-shadow/incomplete comparisons."""
+        parity = event.shadow_parity
+        if event.cache_hit or event.would_escalate is None or parity is None:
+            return None
+        provider_states = {
+            provider.provider: _enum(provider.state, _PROVIDER_STATES, "error")
+            for provider in event.providers
+        }
+        completed_states = {"ok", "empty", "degraded"}
+        if (
+            provider_states.get("searxng") not in completed_states
+            or provider_states.get("brave") not in completed_states
+        ):
+            return None
+
+        def bounded(value: Any, upper: int) -> int:
+            try:
+                parsed = int(value)
+            except (TypeError, ValueError, OverflowError):
+                parsed = 0
+            return min(max(0, parsed), max(0, upper))
+
+        requested_count = bounded(event.requested_count, 5)
+        top_k = bounded(parity.top_k, requested_count)
+        primary_count = bounded(parity.primary_result_count, top_k)
+        reference_count = bounded(parity.reference_result_count, top_k)
+        url_overlap = bounded(
+            parity.canonical_url_overlap_count,
+            min(primary_count, reference_count),
+        )
+        primary_domains = bounded(
+            parity.primary_distinct_domain_count, primary_count
+        )
+        reference_domains = bounded(
+            parity.reference_distinct_domain_count, reference_count
+        )
+        domain_overlap = bounded(
+            parity.domain_overlap_count,
+            min(primary_domains, reference_domains),
+        )
+        top_domain_match = (
+            int(bool(parity.reference_top_domain_in_primary))
+            if domain_overlap > 0 and reference_domains > 0
+            else 0
+        )
+        general_web_count = bounded(
+            parity.primary_general_web_result_count, primary_count
+        )
+        return ShadowParity(
+            top_k=top_k,
+            primary_result_count=primary_count,
+            reference_result_count=reference_count,
+            canonical_url_overlap_count=url_overlap,
+            primary_distinct_domain_count=primary_domains,
+            reference_distinct_domain_count=reference_domains,
+            domain_overlap_count=domain_overlap,
+            reference_top_domain_in_primary=top_domain_match,
+            primary_general_web_result_count=general_web_count,
+        )
+
     def _write_event(self, event: SearchEvent) -> None:
         status = _enum(event.status, _SEARCH_STATUSES, "error")
         backend = _enum(event.backend, _BACKENDS, "none")
@@ -528,6 +636,7 @@ class TelemetryStore:
             if would_escalate
             else None
         )
+        shadow_parity = self._validated_shadow_parity(event)
         with self._connect() as conn:
             # Serialize with reset across every process. Events queued before a
             # reset carry an older nanosecond timestamp and are discarded.
@@ -595,6 +704,31 @@ class TelemetryStore:
                             _enum(provider.circuit_after, _CIRCUIT_STATES, "unknown"),
                             _enum(provider.circuit_transition, _CIRCUIT_TRANSITIONS, "none"),
                             max(0, int(provider.circuit_failures)),
+                        ),
+                    )
+                if shadow_parity is not None:
+                    conn.execute(
+                        """
+                        INSERT INTO shadow_parity(
+                            search_event_id, top_k, primary_result_count,
+                            reference_result_count, canonical_url_overlap_count,
+                            primary_distinct_domain_count,
+                            reference_distinct_domain_count, domain_overlap_count,
+                            reference_top_domain_in_primary,
+                            primary_general_web_result_count
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            search_id,
+                            shadow_parity.top_k,
+                            shadow_parity.primary_result_count,
+                            shadow_parity.reference_result_count,
+                            shadow_parity.canonical_url_overlap_count,
+                            shadow_parity.primary_distinct_domain_count,
+                            shadow_parity.reference_distinct_domain_count,
+                            shadow_parity.domain_overlap_count,
+                            shadow_parity.reference_top_domain_in_primary,
+                            shadow_parity.primary_general_web_result_count,
                         ),
                     )
                 engine_failures = () if event.cache_hit else event.engine_failures[:100]
@@ -750,6 +884,41 @@ class TelemetryStore:
                 """,
                 (since, until),
             ).fetchall()
+            parity_row = conn.execute(
+                """
+                SELECT COUNT(*) AS sample_count,
+                       AVG(p.top_k) AS average_top_k,
+                       AVG(p.primary_result_count) AS average_primary_result_count,
+                       AVG(p.reference_result_count) AS average_reference_result_count,
+                       AVG(p.canonical_url_overlap_count)
+                           AS average_canonical_url_overlap_count,
+                       SUM(p.canonical_url_overlap_count) AS canonical_url_overlap_sum,
+                       SUM(p.reference_result_count) AS reference_result_sum,
+                       AVG(p.primary_distinct_domain_count)
+                           AS average_primary_distinct_domain_count,
+                       AVG(p.reference_distinct_domain_count)
+                           AS average_reference_distinct_domain_count,
+                       AVG(p.domain_overlap_count) AS average_domain_overlap_count,
+                       SUM(p.domain_overlap_count) AS domain_overlap_sum,
+                       SUM(p.reference_distinct_domain_count) AS reference_domain_sum,
+                       SUM(p.reference_top_domain_in_primary) AS top_domain_match_sum,
+                       SUM(CASE WHEN p.reference_result_count > 0 THEN 1 ELSE 0 END)
+                           AS reference_result_nonempty_sample_count,
+                       SUM(CASE WHEN p.reference_distinct_domain_count > 0 THEN 1 ELSE 0 END)
+                           AS reference_domain_nonempty_sample_count,
+                       AVG(p.primary_general_web_result_count)
+                           AS average_primary_general_web_result_count,
+                       SUM(p.primary_general_web_result_count) AS general_web_result_sum,
+                       SUM(p.primary_result_count) AS primary_result_sum,
+                       SUM(CASE WHEN p.primary_result_count > 0 THEN 1 ELSE 0 END)
+                           AS primary_result_nonempty_sample_count
+                FROM shadow_parity p
+                JOIN search_events s ON s.id = p.search_event_id
+                WHERE s.created_at >= ? AND s.created_at <= ?
+                  AND s.cache_hit = 0
+                """,
+                (since, until),
+            ).fetchone()
             provider_rows = conn.execute(
                 """
                 SELECT p.provider,
@@ -825,6 +994,19 @@ class TelemetryStore:
         fallback_count = sum(int(row["count"]) for row in fallback_rows)
         shadow_evaluated = int(shadow_row["evaluated_count"] or 0)
         shadow_would_escalate = int(shadow_row["would_escalate_count"] or 0)
+        parity_samples = int(parity_row["sample_count"] or 0)
+        reference_result_sum = int(parity_row["reference_result_sum"] or 0)
+        reference_domain_sum = int(parity_row["reference_domain_sum"] or 0)
+        reference_result_nonempty_samples = int(
+            parity_row["reference_result_nonempty_sample_count"] or 0
+        )
+        reference_domain_nonempty_samples = int(
+            parity_row["reference_domain_nonempty_sample_count"] or 0
+        )
+        primary_result_sum = int(parity_row["primary_result_sum"] or 0)
+        primary_result_nonempty_samples = int(
+            parity_row["primary_result_nonempty_sample_count"] or 0
+        )
         search_cache_total = int(search_cache_row["total"] or 0)
         search_cache_hits = int(search_cache_row["hits"] or 0)
         fetch_cache_total = int(fetch_cache_row["total"] or 0)
@@ -901,6 +1083,79 @@ class TelemetryStore:
                     if shadow_evaluated else 0.0
                 ),
                 "reasons": _count_map(shadow_reason_rows),
+                "parity": {
+                    "sample_count": parity_samples,
+                    "comparable_sample_count": parity_samples,
+                    "reference_result_total": reference_result_sum,
+                    "reference_result_nonempty_sample_count": (
+                        reference_result_nonempty_samples
+                    ),
+                    "reference_domain_total": reference_domain_sum,
+                    "reference_domain_nonempty_sample_count": (
+                        reference_domain_nonempty_samples
+                    ),
+                    "primary_result_total": primary_result_sum,
+                    "primary_result_nonempty_sample_count": (
+                        primary_result_nonempty_samples
+                    ),
+                    "average_top_k": round(float(parity_row["average_top_k"] or 0.0), 4),
+                    "average_primary_result_count": round(
+                        float(parity_row["average_primary_result_count"] or 0.0), 4
+                    ),
+                    "average_reference_result_count": round(
+                        float(parity_row["average_reference_result_count"] or 0.0), 4
+                    ),
+                    "average_canonical_url_overlap_count": round(
+                        float(parity_row["average_canonical_url_overlap_count"] or 0.0), 4
+                    ),
+                    "canonical_url_overlap_rate": (
+                        round(
+                            int(parity_row["canonical_url_overlap_sum"] or 0)
+                            / reference_result_sum,
+                            4,
+                        )
+                        if reference_result_sum else None
+                    ),
+                    "average_primary_distinct_domain_count": round(
+                        float(parity_row["average_primary_distinct_domain_count"] or 0.0), 4
+                    ),
+                    "average_reference_distinct_domain_count": round(
+                        float(parity_row["average_reference_distinct_domain_count"] or 0.0), 4
+                    ),
+                    "average_domain_overlap_count": round(
+                        float(parity_row["average_domain_overlap_count"] or 0.0), 4
+                    ),
+                    "domain_overlap_rate": (
+                        round(
+                            int(parity_row["domain_overlap_sum"] or 0)
+                            / reference_domain_sum,
+                            4,
+                        )
+                        if reference_domain_sum else None
+                    ),
+                    "reference_top_domain_in_primary_rate": (
+                        round(
+                            int(parity_row["top_domain_match_sum"] or 0)
+                            / reference_domain_nonempty_samples,
+                            4,
+                        )
+                        if reference_domain_nonempty_samples else None
+                    ),
+                    "average_primary_general_web_result_count": round(
+                        float(
+                            parity_row["average_primary_general_web_result_count"] or 0.0
+                        ),
+                        4,
+                    ),
+                    "primary_general_web_result_rate": (
+                        round(
+                            int(parity_row["general_web_result_sum"] or 0)
+                            / primary_result_sum,
+                            4,
+                        )
+                        if primary_result_sum else None
+                    ),
+                },
             },
             "cache": {
                 "search": {

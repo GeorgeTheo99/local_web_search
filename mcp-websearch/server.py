@@ -2,8 +2,8 @@
 """Policy-aware MCP web search broker for Brave Search and local SearXNG.
 
 Tools:
-  - web_search(query, num_results=8)          Brave (default) or optional SearXNG stack
-  - batch_web_search(queries, num_results=8)  up to three searches under one deadline
+  - web_search(query, num_results=8, intent="general")
+  - batch_web_search(queries, num_results=8, intent="general")
   - image_search(query, num_results=8)        Brave (default) or loopback SearXNG images
   - web_fetch(url, max_chars=20000)           direct fetch with SSRF guard
   - verify_url(url)                           direct-fetch verification
@@ -33,7 +33,7 @@ Key configuration:
   WEBSEARCH_SEARXNG_TIMEOUT           default 7 seconds
   WEBSEARCH_BRAVE_TIMEOUT             default 8 seconds
   WEBSEARCH_SEARCH_MAX_BYTES          default 2 MiB per provider response
-  WEBSEARCH_SUPPLEMENT_MIN_RESULTS    default 5
+  WEBSEARCH_QUALITY_MIN_RESULTS       default 3
   LOCAL_SEARCH_DATA_DIR               default ../data beside this package
   LOCAL_SEARCH_TELEMETRY_ENABLED      default true
   BRAVE_API_KEY                       optional stdio/server fallback key
@@ -45,6 +45,7 @@ from __future__ import annotations
 
 import asyncio
 import atexit
+import hashlib
 import importlib.util
 import ipaddress
 import json
@@ -58,6 +59,7 @@ import sys
 import tempfile
 import time
 import urllib.parse
+from collections import OrderedDict
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -73,12 +75,13 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 
 import html_extraction as htmlx
-from cache import WebCache
+from cache import WebCache, canonicalize_url
 from telemetry import (
     FetchEvent,
     InvalidWindow,
     ProviderEvent,
     SearchEvent,
+    ShadowParity,
     TelemetryStore,
     TelemetryUnavailable,
     classify_error,
@@ -146,9 +149,6 @@ if _PROVIDER_STACK not in {"brave", "searxng", "searxng+brave"}:
     raise RuntimeError(
         "WEBSEARCH_PROVIDER_STACK must be one of: brave, searxng, searxng+brave"
     )
-SUPPLEMENT_MIN_RESULTS = _bounded_int(
-    "WEBSEARCH_SUPPLEMENT_MIN_RESULTS", 5, minimum=1, maximum=20
-)
 # Quality gate (ADR 0002 Phase 3). When enabled, a nonempty primary result set
 # can still trigger fallback if it is thin, single-domain-dominated, or
 # duplicate/generic. Defaults are conservative starting points to be tuned
@@ -178,6 +178,14 @@ _PROVIDER_COST_USD: dict[str, float] = {
 MAX_NUM_RESULTS = 20
 RESULT_OVERFETCH_FACTOR = 2
 MAX_QUERY_CHARS = 512
+SEARCH_INTENT_VALUES = ("general", "current", "news")
+SEARCH_INTENTS = frozenset(SEARCH_INTENT_VALUES)
+SearchIntent = Annotated[
+    str,
+    WithJsonSchema({"type": "string", "enum": list(SEARCH_INTENT_VALUES)}),
+]
+_SEARXNG_TIME_RANGES = {"current": "month", "news": "day"}
+_BRAVE_FRESHNESS = {"current": "pm", "news": "pd"}
 SEARCH_RESPONSE_MAX_BYTES = _bounded_int(
     "WEBSEARCH_SEARCH_MAX_BYTES", 2 * 1024 * 1024, minimum=4096, maximum=10 * 1024 * 1024
 )
@@ -249,14 +257,11 @@ def _admission_queue(size: int) -> asyncio.Queue[None]:
 
 
 _http_client: httpx.AsyncClient | None = None
-# httpx's optional HTTP/2 and Brotli codecs are enabled when present. The base
-# dependency always supports HTTP/1.1 plus gzip/deflate without extra packages.
+# HTTP/2 is used when available. Public fetches explicitly request an
+# unencoded representation so the raw-byte cap is enforced before allocation
+# by any transparent decompressor.
 _HTTP2_AVAILABLE = importlib.util.find_spec("h2") is not None
-_BROTLI_AVAILABLE = any(
-    importlib.util.find_spec(module_name) is not None
-    for module_name in ("brotli", "brotlicffi")
-)
-_FETCH_ACCEPT_ENCODING = "gzip, deflate, br" if _BROTLI_AVAILABLE else "gzip, deflate"
+_FETCH_ACCEPT_ENCODING = "identity"
 _pdf_extract_semaphore = asyncio.Semaphore(2)
 _html_extract_semaphore = asyncio.Semaphore(2)
 _pdf_extract_admission = _admission_queue(PDF_EXTRACT_MAX_ADMITTED)
@@ -383,6 +388,55 @@ class _CircuitBreaker:
 _breaker = _CircuitBreaker()
 
 
+class _BraveAuthState:
+    """Track known-bad credentials without retaining or exposing their keys.
+
+    Process-local salted digests let readiness recover immediately when a
+    configured credential rotates. Only a 401/403 marks that credential
+    unusable; a successful request clears only that credential's failure.
+    """
+
+    _MAX_FAILED_FINGERPRINTS = 32
+
+    def __init__(self) -> None:
+        self._salt = os.urandom(32)
+        self._failed_fingerprints: OrderedDict[bytes, None] = OrderedDict()
+        self._lock = Lock()
+
+    def _fingerprint(self, api_key: str) -> bytes:
+        return hashlib.sha256(self._salt + api_key.encode("utf-8")).digest()
+
+    def usable(self, api_key: str) -> bool:
+        if not api_key:
+            return False
+        fingerprint = self._fingerprint(api_key)
+        with self._lock:
+            if fingerprint not in self._failed_fingerprints:
+                return True
+            self._failed_fingerprints.move_to_end(fingerprint)
+            return False
+
+    def record_auth_failure(self, api_key: str) -> None:
+        if not api_key:
+            return
+        fingerprint = self._fingerprint(api_key)
+        with self._lock:
+            self._failed_fingerprints[fingerprint] = None
+            self._failed_fingerprints.move_to_end(fingerprint)
+            if len(self._failed_fingerprints) > self._MAX_FAILED_FINGERPRINTS:
+                self._failed_fingerprints.popitem(last=False)
+
+    def record_success(self, api_key: str) -> None:
+        if not api_key:
+            return
+        fingerprint = self._fingerprint(api_key)
+        with self._lock:
+            self._failed_fingerprints.pop(fingerprint, None)
+
+
+_brave_auth_state = _BraveAuthState()
+
+
 # --------------------------------------------------------------------------- #
 # Provider abstraction (ADR 0002). Raw ranked-search backends implement one
 # contract so the broker can route, gate, and fail over without naming each
@@ -399,7 +453,9 @@ class SearchProvider(Protocol):
     output: str
     timeout: float
 
-    def search(self, query: str, num_results: int) -> Awaitable[_BackendOutcome]:
+    def search(
+        self, query: str, num_results: int, intent: str = "general"
+    ) -> Awaitable[_BackendOutcome]:
         ...
 
 
@@ -414,9 +470,14 @@ class _SearXNGProvider:
         return SEARCH_TIMEOUT
 
     @staticmethod
-    def search(query: str, num_results: int) -> Awaitable[_BackendOutcome]:
-        # Module-global lookup so tests monkeypatching srv._searxng_search win.
-        return _searxng_search(query, num_results)
+    def search(
+        query: str, num_results: int, intent: str = "general"
+    ) -> Awaitable[_BackendOutcome]:
+        # Keep the default call shape compatible with existing integrations and
+        # test doubles while forwarding explicit freshness intent when present.
+        if intent == "general":
+            return _searxng_search(query, num_results)
+        return _searxng_search(query, num_results, intent=intent)
 
 
 class _BraveProvider:
@@ -430,8 +491,14 @@ class _BraveProvider:
         return BRAVE_TIMEOUT
 
     @staticmethod
-    def search(query: str, num_results: int) -> Awaitable[_BackendOutcome]:
-        return _brave_search(query, num_results, _resolve_brave_key())
+    def search(
+        query: str, num_results: int, intent: str = "general"
+    ) -> Awaitable[_BackendOutcome]:
+        if intent == "general":
+            return _brave_search(query, num_results, _resolve_brave_key())
+        return _brave_search(
+            query, num_results, _resolve_brave_key(), intent=intent
+        )
 
     @staticmethod
     def credential_label() -> str:
@@ -458,6 +525,15 @@ def _provider_credential_configured(name: str) -> bool:
         return True  # loopback SearXNG is keyless.
     if name == "brave":
         return bool(_resolve_brave_key())
+    return False
+
+
+def _provider_credential_usable(name: str) -> bool:
+    """Return whether the current credential has no known authentication failure."""
+    if name == "searxng":
+        return True
+    if name == "brave":
+        return _brave_auth_state.usable(_resolve_brave_key())
     return False
 
 
@@ -703,6 +779,7 @@ def _record_search_telemetry(
     cache_hit: bool = False,
     would_escalate: bool | None = None,
     would_escalate_reason: str | None = None,
+    shadow_parity: ShadowParity | None = None,
 ) -> None:
     """Queue only explicitly allowlisted operational fields, never a search payload."""
     try:
@@ -710,6 +787,7 @@ def _record_search_telemetry(
         fallback_reason = None if cache_hit else fallback_reason
         would_escalate = None if cache_hit else would_escalate
         would_escalate_reason = None if cache_hit else would_escalate_reason
+        shadow_parity = None if cache_hit else shadow_parity
         providers = tuple(
             _provider_event(outcome)
             for outcome in outcomes
@@ -735,6 +813,7 @@ def _record_search_telemetry(
                 cache_hit=cache_hit,
                 would_escalate=would_escalate,
                 would_escalate_reason=would_escalate_reason,
+                shadow_parity=shadow_parity,
             )
         )
     except Exception as exc:
@@ -757,26 +836,30 @@ _SEARCH_CACHE_PAYLOAD_KEYS = {
 }
 
 
-def _search_cache_variant(requested: int, mode: str) -> str:
+def _search_cache_variant(
+    requested: int, mode: str, intent: str = "general"
+) -> str:
     """Describe every policy input that can change a cached search result."""
     return json.dumps(
         {
             "num_results": requested,
             "search_mode": mode,
+            "intent": intent,
             "provider_stack": _PROVIDER_STACK,
             "providers": [provider.name for provider in _PROVIDERS],
             "quality_gate": _QUALITY_GATE_MODE,
             "quality_min_results": QUALITY_MIN_RESULTS,
             "quality_min_domains": QUALITY_MIN_DOMAINS,
             "quality_duplicate_fraction": QUALITY_DUPLICATE_FRACTION,
-            "supplement_min_results": SUPPLEMENT_MIN_RESULTS,
         },
         sort_keys=True,
         separators=(",", ":"),
     )
 
 
-def _put_search_cache(query: str, variant: str, rendered: str) -> None:
+def _put_search_cache(
+    query: str, variant: str, rendered: str, *, news: bool = False
+) -> None:
     """Persist only the fields needed to reconstruct a successful response."""
     try:
         payload = json.loads(rendered)
@@ -791,7 +874,7 @@ def _put_search_cache(query: str, variant: str, rendered: str) -> None:
         }
         cache = _get_cache()
         if cache is not None:
-            cache.put_search(query, allowlisted, variant=variant)
+            cache.put_search(query, allowlisted, variant=variant, news=news)
     except Exception:
         return
 
@@ -810,8 +893,10 @@ def _finish_search(
     cache_hit: bool = False,
     cache_query: str | None = None,
     cache_variant: str | None = None,
+    cache_news: bool = False,
     would_escalate: bool | None = None,
     would_escalate_reason: str | None = None,
+    shadow_parity: ShadowParity | None = None,
 ) -> str:
     total_latency_ms = float((timings_ms or {}).get("total") or 0.0)
     _record_search_telemetry(
@@ -826,6 +911,7 @@ def _finish_search(
         cache_hit=cache_hit,
         would_escalate=would_escalate,
         would_escalate_reason=would_escalate_reason,
+        shadow_parity=shadow_parity,
     )
     if (
         not cache_hit
@@ -833,7 +919,9 @@ def _finish_search(
         and cache_variant is not None
         and status in {"ok", "degraded"}
     ):
-        _put_search_cache(cache_query, cache_variant, rendered)
+        _put_search_cache(
+            cache_query, cache_variant, rendered, news=cache_news
+        )
     return rendered
 
 
@@ -908,7 +996,8 @@ def _public_http_url(value: Any) -> str | None:
         return None
     try:
         parsed = urllib.parse.urlsplit(url)
-        host = (parsed.hostname or "").rstrip(".").lower()
+        canonical = urllib.parse.urlsplit(canonicalize_url(url))
+        host = canonical.hostname or ""
         if (
             parsed.scheme.lower() not in {"http", "https"}
             or not host
@@ -1101,31 +1190,21 @@ def _normalize_brave_image_result(r: dict) -> dict[str, Any] | None:
 
 
 def _domain(url: str) -> str:
+    """Return the canonical hostname used by result identity comparisons."""
     if not url:
         return ""
     try:
-        return urllib.parse.urlparse(url).netloc
-    except Exception:
+        return urllib.parse.urlsplit(canonicalize_url(url)).hostname or ""
+    except (TypeError, UnicodeError, ValueError):
         return ""
 
 
 def _canonical_result_url(url: str) -> str:
+    """Use the cache's canonical URL identity contract for result comparisons."""
     try:
-        parsed = urllib.parse.urlsplit(url)
-        if not parsed.scheme or not parsed.netloc:
-            return url.split("#", 1)[0].rstrip("/")
-        query = [
-            (key, value)
-            for key, value in urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
-            if not key.lower().startswith("utm_")
-            and key.lower() not in {"fbclid", "gclid", "mc_cid", "mc_eid"}
-        ]
-        path = parsed.path.rstrip("/") or "/"
-        return urllib.parse.urlunsplit(
-            (parsed.scheme.lower(), parsed.netloc.lower(), path, urllib.parse.urlencode(sorted(query)), "")
-        )
-    except Exception:
-        return url.split("#", 1)[0].rstrip("/")
+        return canonicalize_url(url)
+    except (TypeError, UnicodeError, ValueError):
+        return ""
 
 
 def _dedupe_and_rank(results: list[dict[str, Any]], num_results: int) -> list[dict[str, Any]]:
@@ -1149,6 +1228,68 @@ def _dedupe_and_rank(results: list[dict[str, Any]], num_results: int) -> list[di
     for index, result in enumerate(unique, 1):
         result["rank"] = index
     return unique
+
+
+_SEARXNG_GENERAL_WEB_ENGINES = frozenset({"bing", "mwmbl"})
+
+
+def _compute_shadow_parity(
+    primary: _BackendOutcome,
+    reference: _BackendOutcome,
+    requested: int,
+) -> ShadowParity | None:
+    """Compare deduped top-k results without retaining any identifiers."""
+    if (
+        primary.backend != "searxng"
+        or reference.backend != "brave"
+        or not primary.ok
+        or not reference.ok
+    ):
+        return None
+    top_k = min(5, max(0, int(requested)))
+    primary_results = _dedupe_and_rank(primary.results, top_k) if top_k else []
+    reference_results = _dedupe_and_rank(reference.results, top_k) if top_k else []
+
+    primary_urls = {
+        _canonical_result_url(str(result.get("url") or ""))
+        for result in primary_results
+    }
+    reference_urls = {
+        _canonical_result_url(str(result.get("url") or ""))
+        for result in reference_results
+    }
+
+    def result_domain(result: dict[str, Any]) -> str:
+        return _domain(str(result.get("url") or ""))
+
+    primary_domain_list = [
+        domain for result in primary_results if (domain := result_domain(result))
+    ]
+    reference_domain_list = [
+        domain for result in reference_results if (domain := result_domain(result))
+    ]
+    primary_domains = set(primary_domain_list)
+    reference_domains = set(reference_domain_list)
+    reference_top_domain = reference_domain_list[0] if reference_domain_list else None
+    primary_general_web_count = sum(
+        1
+        for result in primary_results
+        if str(result.get("engine") or "").strip().lower()
+        in _SEARXNG_GENERAL_WEB_ENGINES
+    )
+    return ShadowParity(
+        top_k=top_k,
+        primary_result_count=len(primary_results),
+        reference_result_count=len(reference_results),
+        canonical_url_overlap_count=len(primary_urls & reference_urls),
+        primary_distinct_domain_count=len(primary_domains),
+        reference_distinct_domain_count=len(reference_domains),
+        domain_overlap_count=len(primary_domains & reference_domains),
+        reference_top_domain_in_primary=int(
+            reference_top_domain is not None and reference_top_domain in primary_domains
+        ),
+        primary_general_web_result_count=primary_general_web_count,
+    )
 
 
 def _dedupe_and_rank_images(
@@ -1846,7 +1987,9 @@ async def _searxng_request(
     return _RequestOutcome(None, last_state, attempts, last_error, last_http_status)
 
 
-async def _searxng_search(query: str, num_results: int) -> _BackendOutcome:
+async def _searxng_search(
+    query: str, num_results: int, intent: str = "general"
+) -> _BackendOutcome:
     started = time.monotonic()
     circuit_before = _breaker.snapshot("searxng")
     if not _searxng_url_is_loopback():
@@ -1871,10 +2014,11 @@ async def _searxng_search(query: str, num_results: int) -> _BackendOutcome:
             circuit_failures=int(circuit_after["consecutive_failures"]),
         )
 
+    params = {"q": query, "format": "json", "categories": "general"}
+    if time_range := _SEARXNG_TIME_RANGES.get(intent):
+        params["time_range"] = time_range
     try:
-        raw_outcome = await _searxng_request(
-            "/search", {"q": query, "format": "json", "categories": "general"}
-        )
+        raw_outcome = await _searxng_request("/search", params)
     except asyncio.CancelledError:
         _breaker.record_aborted("searxng")
         raise
@@ -1914,7 +2058,9 @@ async def _searxng_search(query: str, num_results: int) -> _BackendOutcome:
     unresponsive = request.data.get("unresponsive_engines", [])
     if not isinstance(unresponsive, list):
         unresponsive = []
-    state = "degraded" if unresponsive else ("ok" if results else "empty")
+    # Empty takes precedence over engine degradation so routing reports the
+    # primary failure as searxng_empty rather than the less useful degraded.
+    state = "empty" if not results else ("degraded" if unresponsive else "ok")
     return _BackendOutcome(
         backend="searxng",
         results=results,
@@ -2047,7 +2193,9 @@ def _brave_search_url() -> str:
     return urllib.parse.urlunsplit(("https", parsed.netloc, "/res/v1/web/search", "", ""))
 
 
-async def _brave_search(query: str, num_results: int, api_key: str) -> _BackendOutcome:
+async def _brave_search(
+    query: str, num_results: int, api_key: str, intent: str = "general"
+) -> _BackendOutcome:
     """Search Brave. Requires an API key (no keyless mode).
 
     Brave's web search endpoint returns a `web.results` array of ranked
@@ -2091,6 +2239,8 @@ async def _brave_search(query: str, num_results: int, api_key: str) -> _BackendO
         "safesearch": "moderate",
         "text_decorations": "false",
     }
+    if freshness := _BRAVE_FRESHNESS.get(intent):
+        params["freshness"] = freshness
     headers = {"X-Subscription-Token": api_key, "Accept": "application/json",
                "Accept-Encoding": "identity"}
     try:
@@ -2116,11 +2266,14 @@ async def _brave_search(query: str, num_results: int, api_key: str) -> _BackendO
     except httpx.HTTPStatusError as exc:
         status_code = exc.response.status_code
         http_status = status_code
-        # Auth/client errors prove reachability; do not circuit-break a valid key.
+        # Auth/client errors prove reachability, so they do not trip the circuit.
+        # Track only known authentication failures separately for readiness.
         if status_code in {400, 401, 403, 404, 422}:
             circuit_transition = _breaker.record_success("brave")
         else:
             circuit_transition = _breaker.record_failure("brave")
+        if status_code in {401, 403}:
+            _brave_auth_state.record_auth_failure(api_key)
         state = "error"
         error = f"HTTP {status_code}"
     except Exception as exc:
@@ -2130,6 +2283,7 @@ async def _brave_search(query: str, num_results: int, api_key: str) -> _BackendO
         http_status = None
     else:
         circuit_transition = _breaker.record_success("brave")
+        _brave_auth_state.record_success(api_key)
         circuit_after = _breaker.snapshot("brave")
         web_block = data.get("web") if isinstance(data, dict) else None
         raw_results = (
@@ -2259,6 +2413,8 @@ async def _brave_image_search(query: str, num_results: int, api_key: str) -> _Ba
             circuit_transition = _breaker.record_success("brave")
         else:
             circuit_transition = _breaker.record_failure("brave")
+        if status_code in {401, 403}:
+            _brave_auth_state.record_auth_failure(api_key)
         state = "error"
         error = f"HTTP {status_code}"
     except Exception as exc:
@@ -2268,6 +2424,7 @@ async def _brave_image_search(query: str, num_results: int, api_key: str) -> _Ba
         http_status = None
     else:
         circuit_transition = _breaker.record_success("brave")
+        _brave_auth_state.record_success(api_key)
         circuit_after = _breaker.snapshot("brave")
         raw_results = data.get("results", []) if isinstance(data, dict) else []
         results = [
@@ -2341,20 +2498,28 @@ async def _health_payload() -> dict[str, Any]:
         bool(searxng.get("reachable"))
         and searxng_breaker["state"] != "open"
     )
-    # Provider-neutral readiness: any provider in the active stack whose
-    # credential is configured (or keyless) and whose circuit is not open.
-    stack_available = False
-    for p in _PROVIDERS:
-        breaker = _breaker.snapshot(p.name)
-        if breaker["state"] == "open":
-            continue
-        if p.name == "searxng":
-            if searxng_available:
+    # Shadow evaluates SearXNG against Brave on every uncached search, so both
+    # legs must be usable for the active policy to be ready. Other modes remain
+    # provider-neutral: any usable provider in the active stack is sufficient.
+    if _PROVIDER_STACK == "searxng+brave" and _QUALITY_GATE_MODE == "shadow":
+        stack_available = (
+            searxng_available
+            and _breaker.snapshot("brave")["state"] != "open"
+            and _provider_credential_usable("brave")
+        )
+    else:
+        stack_available = False
+        for p in _PROVIDERS:
+            breaker = _breaker.snapshot(p.name)
+            if breaker["state"] == "open":
+                continue
+            if p.name == "searxng":
+                if searxng_available:
+                    stack_available = True
+                    break
+            elif _provider_credential_usable(p.name):
                 stack_available = True
                 break
-        elif _provider_credential_configured(p.name):
-            stack_available = True
-            break
     # A healthy diagnostic SearXNG instance must not make an unrelated active
     # stack ready. Only providers selected by WEBSEARCH_PROVIDER_STACK count.
     ready = stack_available
@@ -2372,7 +2537,7 @@ async def _health_payload() -> dict[str, Any]:
         "policy": {
             "total_timeout_s": SEARCH_TOTAL_TIMEOUT,
             "searxng_timeout_s": SEARCH_TIMEOUT,
-            "supplement_min_results": SUPPLEMENT_MIN_RESULTS,
+            "quality_min_results": QUALITY_MIN_RESULTS,
         },
         "searxng_url": SEARXNG_URL,
         "searxng": {
@@ -2406,7 +2571,7 @@ async def live(request: Request) -> JSONResponse:
 
 @mcp.custom_route("/ready", methods=["GET"])
 async def ready(request: Request) -> JSONResponse:
-    """Dependency readiness; returns 503 only when no policy-allowed backend is usable."""
+    """Dependency readiness; returns 503 when active-policy requirements are unmet."""
     payload = await _health_payload()
     return JSONResponse(payload, status_code=200 if payload["ready"] else 503)
 
@@ -2518,7 +2683,9 @@ def _snippet_jaccard(a: str, b: str) -> float:
 
 
 def _quality_gate(
-    candidates: list[dict[str, Any]], *, news_intent: bool = False
+    candidates: list[dict[str, Any]],
+    *,
+    unresponsive_engines: list[Any] | None = None,
 ) -> tuple[bool, str | None]:
     """Evaluate the primary provider's deduped candidates in memory.
 
@@ -2528,6 +2695,14 @@ def _quality_gate(
     """
     if not candidates:
         return True, None  # emptiness is handled by the existing fallback rules.
+
+    # Bing is the broker-critical general-web index. Normalize untrusted engine
+    # failure data before checking it so no raw error or query text is retained.
+    failed_engines = {
+        engine for engine, _reason in normalize_engine_failures(unresponsive_engines or [])
+    }
+    if "bing" in failed_engines:
+        return False, "quality_critical_engine_unavailable"
 
     if len(candidates) < QUALITY_MIN_RESULTS:
         return False, "quality_below_min_results"
@@ -2550,19 +2725,6 @@ def _quality_gate(
         if total_pairs and near_dup_pairs / total_pairs >= QUALITY_DUPLICATE_FRACTION:
             return False, "quality_duplicate_dominated"
 
-    # Freshness for current/news intent. Intent is inferred only from explicit
-    # request metadata, never from stored query content. Phase 3 wires the hook;
-    # the staleness window is evaluated against result `published` hints when
-    # present and news_intent is True.
-    if news_intent:
-        fresh = 0
-        for item in candidates:
-            snippet = item.get("snippet") or ""
-            if "published " in snippet:  # set by _normalize_brave_result
-                fresh += 1
-        if fresh == 0:
-            return False, "quality_stale_for_news_intent"
-
     return True, None
 
 
@@ -2571,17 +2733,25 @@ def _quality_gate_enabled() -> bool:
     return len(_PROVIDERS) > 1 and _QUALITY_GATE_MODE in {"auto", "on"}
 
 
-def _fallback_reason(primary: _BackendOutcome, result_count: int, threshold: int) -> str:
-    name = primary.backend
-    if primary.state == "degraded":
+def _fallback_reason(outcome: _BackendOutcome) -> str:
+    name = outcome.backend
+    if outcome.state == "degraded":
         return f"{name}_degraded"
-    if result_count and result_count < threshold:
-        return "below_minimum"
     return {
+        "ok": f"{name}_empty",
         "empty": f"{name}_empty",
         "timeout": f"{name}_timeout",
         "circuit_open": f"{name}_circuit_open",
-    }.get(primary.state, f"{name}_error")
+    }.get(outcome.state, f"{name}_error")
+
+
+def _provider_search(
+    provider: SearchProvider, query: str, num_results: int, intent: str
+) -> Awaitable[_BackendOutcome]:
+    """Forward explicit intent while preserving the legacy general call shape."""
+    if intent == "general":
+        return provider.search(query, num_results)
+    return provider.search(query, num_results, intent)
 
 
 def _result_backend(results: list[dict[str, Any]]) -> str:
@@ -2610,7 +2780,13 @@ def _timings(
     return timings
 
 
-async def _web_search_impl(query: str, num_results: int = 8, *, mode: str | None = None) -> str:
+async def _web_search_impl(
+    query: str,
+    num_results: int = 8,
+    *,
+    mode: str | None = None,
+    intent: str = "general",
+) -> str:
     """Execute one web search using the public tool's stable payload contract."""
     started = time.monotonic()
     query = query.strip()
@@ -2618,6 +2794,25 @@ async def _web_search_impl(query: str, num_results: int = 8, *, mode: str | None
     effective_mode = (mode or _SEARCH_MODE).strip().lower()
     if effective_mode not in {"normal", "sensitive", "maximum_recall"}:
         effective_mode = "normal"
+    effective_intent = str(intent or "general").strip().lower()
+    if effective_intent not in SEARCH_INTENTS:
+        timings_ms = _default_timings_ms()
+        timings_ms["total"] = round((time.monotonic() - started) * 1000, 1)
+        return _finish_search(
+            _search_error_payload(
+                query,
+                "Search error: intent must be one of: general, current, news.",
+                timings_ms=timings_ms,
+                mode=effective_mode,
+                search_mode=effective_mode,
+            ),
+            status="error",
+            backend="none",
+            requested_count=requested,
+            result_count=0,
+            timings_ms=timings_ms,
+            mode=effective_mode,
+        )
     if not query:
         timings_ms = _default_timings_ms()
         timings_ms["total"] = round((time.monotonic() - started) * 1000, 1)
@@ -2680,7 +2875,9 @@ async def _web_search_impl(query: str, num_results: int = 8, *, mode: str | None
             mode=effective_mode,
         )
 
-    cache_variant = _search_cache_variant(requested, effective_mode)
+    cache_variant = _search_cache_variant(
+        requested, effective_mode, effective_intent
+    )
     cache = _get_cache()
     try:
         cache_hit = (
@@ -2769,7 +2966,9 @@ async def _web_search_impl(query: str, num_results: int = 8, *, mode: str | None
             else:
                 outcome = await _run_backend(
                     provider.name,
-                    provider.search(query, candidate_limit),
+                    _provider_search(
+                        provider, query, candidate_limit, effective_intent
+                    ),
                     min(provider.timeout, remaining),
                 )
                 outcomes.append(outcome)
@@ -2805,8 +3004,11 @@ async def _web_search_impl(query: str, num_results: int = 8, *, mode: str | None
         else:
             status = "error"
             backend = "none"
-            failed = next((outcome for outcome in reversed(outcomes) if not outcome.ok), outcomes[-1])
-            fallback_reason_mr = _fallback_reason(failed, 0, requested)
+            failed = next(
+                (outcome for outcome in reversed(outcomes) if not outcome.ok),
+                outcomes[-1],
+            )
+            fallback_reason_mr = _fallback_reason(failed)
             rendered = _search_error_payload(
                 query,
                 "Search error: all configured providers failed.",
@@ -2822,18 +3024,18 @@ async def _web_search_impl(query: str, num_results: int = 8, *, mode: str | None
             result_count=len(results), fallback_reason=fallback_reason_mr,
             timings_ms=timings_ms, outcomes=outcomes, mode=effective_mode,
             cache_query=query, cache_variant=cache_variant,
+            cache_news=effective_intent in {"current", "news"},
         )
 
     primary = _PROVIDERS[0]
     fallback = _PROVIDERS[1] if len(_PROVIDERS) > 1 else None
     primary_outcome = await _run_backend(
         primary.name,
-        primary.search(query, candidate_limit),
+        _provider_search(primary, query, candidate_limit, effective_intent),
         min(primary.timeout, SEARCH_TOTAL_TIMEOUT),
     )
     attempted = _attempted_providers([primary_outcome])
     primary_candidates = _dedupe_and_rank(primary_outcome.results, candidate_limit)
-    threshold = min(SUPPLEMENT_MIN_RESULTS, requested)
     provider_states = {primary.name: primary_outcome.state}
     shadow_mode = fallback is not None and _QUALITY_GATE_MODE == "shadow"
     policy_triggers_fallback = fallback is not None and (
@@ -2845,14 +3047,17 @@ async def _web_search_impl(query: str, num_results: int = 8, *, mode: str | None
     quality_reason: str | None = None
     if not policy_triggers_fallback and fallback is not None and primary_outcome.ok:
         if _quality_gate_enabled() or shadow_mode:
-            passed, quality_reason = _quality_gate(primary_candidates)
+            passed, quality_reason = _quality_gate(
+                primary_candidates,
+                unresponsive_engines=primary_outcome.unresponsive_engines,
+            )
             if passed:
                 quality_reason = None
     should_use_fallback = policy_triggers_fallback or quality_reason is not None
 
     if shadow_mode:
         shadow_reason = quality_reason if quality_reason is not None else (
-            _fallback_reason(primary_outcome, len(primary_candidates), threshold)
+            _fallback_reason(primary_outcome)
             if policy_triggers_fallback else None
         )
         logger.info(
@@ -2877,16 +3082,23 @@ async def _web_search_impl(query: str, num_results: int = 8, *, mode: str | None
         else:
             shadow_outcome = await _run_backend(
                 fallback.name,
-                fallback.search(query, candidate_limit),
+                _provider_search(
+                    fallback, query, candidate_limit, effective_intent
+                ),
                 min(fallback.timeout, remaining),
             )
         provider_states[fallback.name] = shadow_outcome.state
         outcomes_shadow = [primary_outcome, shadow_outcome]
+        shadow_parity = _compute_shadow_parity(
+            primary_outcome, shadow_outcome, requested
+        )
         attempted = _attempted_providers(outcomes_shadow)
         results = _dedupe_and_rank(shadow_outcome.results, requested)
         backend = _result_backend(results)
         timings_ms = _timings(started, outcomes_shadow)
-        if results or shadow_outcome.answer:
+        serving_fallback_reason: str | None = None
+        reference_usable = bool(results or shadow_outcome.answer)
+        if reference_usable:
             status = "degraded" if shadow_outcome.state == "degraded" else "ok"
             rendered = _format_results(
                 query,
@@ -2903,15 +3115,39 @@ async def _web_search_impl(query: str, num_results: int = 8, *, mode: str | None
                 mode=effective_mode,
                 search_mode=effective_mode,
             )
+        elif primary_candidates:
+            # Brave is the serving provider in shadow mode, but SearXNG is a
+            # safe degraded fallback when Brave is unusable for this request.
+            serving_fallback_reason = _fallback_reason(shadow_outcome)
+            results = _dedupe_and_rank(primary_candidates, requested)
+            backend = _result_backend(results)
+            status = "degraded"
+            rendered = _format_results(
+                query,
+                results,
+                primary_outcome.suggestions,
+                status=status,
+                backend=backend,
+                attempted=attempted,
+                fallback_reason=serving_fallback_reason,
+                timings_ms=timings_ms,
+                unresponsive_engines=primary_outcome.unresponsive_engines,
+                provider_states=provider_states,
+                mode=effective_mode,
+                search_mode=effective_mode,
+            )
         elif shadow_outcome.ok:
+            serving_fallback_reason = _fallback_reason(shadow_outcome)
             status = "degraded" if shadow_outcome.state == "degraded" else "empty"
+            backend = "none"
             rendered = _format_results(
                 query,
                 [],
                 shadow_outcome.suggestions,
                 status=status,
-                backend="none",
+                backend=backend,
                 attempted=attempted,
+                fallback_reason=serving_fallback_reason,
                 timings_ms=timings_ms,
                 unresponsive_engines=primary_outcome.unresponsive_engines,
                 provider_states=provider_states,
@@ -2919,6 +3155,7 @@ async def _web_search_impl(query: str, num_results: int = 8, *, mode: str | None
                 search_mode=effective_mode,
             )
         else:
+            serving_fallback_reason = _fallback_reason(shadow_outcome)
             status = "error"
             backend = "none"
             rendered = _search_error_payload(
@@ -2926,6 +3163,7 @@ async def _web_search_impl(query: str, num_results: int = 8, *, mode: str | None
                 f"Search error: {fallback.name} search failed in shadow mode.",
                 shadow_outcome.suggestions,
                 attempted=attempted,
+                fallback_reason=serving_fallback_reason,
                 timings_ms=timings_ms,
                 unresponsive_engines=primary_outcome.unresponsive_engines,
                 provider_states=provider_states,
@@ -2938,13 +3176,18 @@ async def _web_search_impl(query: str, num_results: int = 8, *, mode: str | None
             backend=backend,
             requested_count=requested,
             result_count=len(results),
+            fallback_reason=serving_fallback_reason,
             timings_ms=timings_ms,
             outcomes=outcomes_shadow,
             mode=effective_mode,
-            cache_query=query,
+            # Emergency SearXNG serving must not mask Brave recovery on a
+            # later call. Ordinary usable Brave shadow responses remain cached.
+            cache_query=query if reference_usable else None,
             cache_variant=cache_variant,
+            cache_news=effective_intent in {"current", "news"},
             would_escalate=should_use_fallback,
             would_escalate_reason=shadow_reason,
+            shadow_parity=shadow_parity,
         )
 
     if not should_use_fallback:
@@ -2988,7 +3231,7 @@ async def _web_search_impl(query: str, num_results: int = 8, *, mode: str | None
             )
         else:
             status = "error"
-            fallback_reason = _fallback_reason(primary_outcome, 0, threshold)
+            fallback_reason = _fallback_reason(primary_outcome)
             message = f"Search error: {primary.name} search failed and no fallback provider is configured."
             rendered = _search_error_payload(
                 query,
@@ -3014,10 +3257,11 @@ async def _web_search_impl(query: str, num_results: int = 8, *, mode: str | None
             mode=effective_mode,
             cache_query=query,
             cache_variant=cache_variant,
+            cache_news=effective_intent in {"current", "news"},
         )
 
     reason = quality_reason if quality_reason is not None else _fallback_reason(
-        primary_outcome, len(primary_candidates), threshold
+        primary_outcome
     )
     remaining = SEARCH_TOTAL_TIMEOUT - (time.monotonic() - started)
     if remaining <= 0:
@@ -3034,7 +3278,7 @@ async def _web_search_impl(query: str, num_results: int = 8, *, mode: str | None
         # Credentials are resolved only when policy permits external egress.
         fallback_outcome = await _run_backend(
             fallback.name,
-            fallback.search(query, candidate_limit),
+            _provider_search(fallback, query, candidate_limit, effective_intent),
             min(fallback.timeout, remaining),
         )
     provider_states[fallback.name] = fallback_outcome.state
@@ -3112,18 +3356,28 @@ async def _web_search_impl(query: str, num_results: int = 8, *, mode: str | None
         mode=effective_mode,
         cache_query=query,
         cache_variant=cache_variant,
+        cache_news=effective_intent in {"current", "news"},
     )
 
 
 @mcp.tool()
-async def web_search(query: str, num_results: int = 8, mode: str | None = None) -> str:
+async def web_search(
+    query: str,
+    num_results: int = 8,
+    mode: str | None = None,
+    intent: SearchIntent = "general",
+) -> str:
     """Search the configured Brave, SearXNG, or SearXNG-first dual stack.
 
     Optional `mode` selects the ADR 0002 routing mode: `normal` (default),
     `sensitive` (no external egress; refuses without a local corpus), or
     `maximum_recall` (opt-in serial escalation across all configured providers).
+    Explicit `intent` accepts `general` (default), `current`, or `news`; query
+    text is never inspected to infer freshness.
     """
-    return await _web_search_impl(query, num_results, mode=mode)
+    return await _web_search_impl(
+        query, num_results, mode=mode, intent=intent
+    )
 
 
 def _batch_error_payload(message: str, started: float, requested: int) -> str:
@@ -3186,10 +3440,19 @@ def _batch_timeout_item(query: str, requested: int, elapsed_ms: float) -> dict[s
 
 
 @mcp.tool()
-async def batch_web_search(queries: BatchQueries, num_results: int = 8) -> str:
-    """Run up to three deduplicated searches concurrently under one total deadline."""
+async def batch_web_search(
+    queries: BatchQueries, num_results: int = 8, intent: SearchIntent = "general"
+) -> str:
+    """Run up to three searches with one explicit general/current/news intent."""
     started = time.monotonic()
     requested = min(MAX_NUM_RESULTS, max(1, int(num_results)))
+    effective_intent = str(intent or "general").strip().lower()
+    if effective_intent not in SEARCH_INTENTS:
+        return _batch_error_payload(
+            "Batch search error: intent must be one of: general, current, news.",
+            started,
+            requested,
+        )
     if not queries:
         return _batch_error_payload("Batch search error: queries must not be empty.", started, requested)
     if len(queries) > BATCH_MAX_QUERIES:
@@ -3228,7 +3491,13 @@ async def batch_web_search(queries: BatchQueries, num_results: int = 8) -> str:
     async def run_one(query: str) -> dict[str, Any]:
         try:
             async with semaphore:
-                return _compact_batch_item(await _web_search_impl(query, requested))
+                if effective_intent == "general":
+                    rendered = await _web_search_impl(query, requested)
+                else:
+                    rendered = await _web_search_impl(
+                        query, requested, intent=effective_intent
+                    )
+                return _compact_batch_item(rendered)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -3403,7 +3672,7 @@ async def image_search(query: str, num_results: int = 8) -> str:
     else:
         status = "error"
         backend = "none"
-        fallback_reason = _fallback_reason(outcome, 0, requested)
+        fallback_reason = _fallback_reason(outcome)
         if outcome.backend == "searxng":
             message = (
                 "Image search error: loopback SearXNG is required."
@@ -3485,13 +3754,33 @@ async def _fetch_public_body(url: str) -> tuple[str, bytes, str, int]:
                         raise ValueError("redirect response missing Location header")
                     redirect_url = urllib.parse.urljoin(current_url, location)
                 else:
+                    # Preserve HTTP status precedence before applying body-size
+                    # policy, then reject a valid oversized declaration without
+                    # consuming the response stream.
                     resp.raise_for_status()
-                    body = await resp.aread()
-                    if len(body) > FETCH_MAX_BYTES:
-                        raise ValueError(f"response exceeds {FETCH_MAX_BYTES} byte limit")
+                    content_length = resp.headers.get("content-length", "").strip()
+                    if re.fullmatch(r"[0-9]+", content_length):
+                        if int(content_length) > FETCH_MAX_BYTES:
+                            raise ValueError(
+                                f"response exceeds {FETCH_MAX_BYTES} byte limit"
+                            )
+                    content_encoding = resp.headers.get(
+                        "content-encoding", ""
+                    ).strip().lower()
+                    if content_encoding and content_encoding != "identity":
+                        raise ValueError(
+                            f"response uses unsupported content encoding: {content_encoding}"
+                        )
+                    body = bytearray()
+                    async for chunk in resp.aiter_raw():
+                        if len(body) + len(chunk) > FETCH_MAX_BYTES:
+                            raise ValueError(
+                                f"response exceeds {FETCH_MAX_BYTES} byte limit"
+                            )
+                        body.extend(chunk)
                     return (
                         current_url,
-                        body,
+                        bytes(body),
                         resp.headers.get("content-type", "").lower(),
                         int(resp.status_code),
                     )

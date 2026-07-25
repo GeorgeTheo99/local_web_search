@@ -78,9 +78,31 @@ summary (for example, "3 results · Brave · estimated total $0.005").
 - Secrets are never returned to the frontend, never written to telemetry,
   logs, or repo files.
 
-## Implementation
+## Implementation record (2026-07-22)
 
-All code is implemented and tested (181 tests). The broker exposes `web_search`,
-`batch_web_search`, `image_search`, `web_fetch`, and `verify_url` tools over
-MCP (HTTP and stdio). Provider-neutral health, telemetry, and circuit-breaker
-infrastructure is in place for future provider additions.
+The initial decision was implemented with Brave as the default and SearXNG as
+an optional single-provider stack. The broker exposed `web_search`,
+`batch_web_search`, `image_search`, `web_fetch`, and `verify_url` over MCP (HTTP
+and stdio), with provider-neutral health, telemetry, and circuit breakers.
+
+## Implementation-status amendment (2026-07-24)
+
+The implementation has evolved without reversing the original Brave-default
+decision:
+
+- `brave`, `searxng`, and `searxng+brave` are supported stacks.
+- The dual stack uses SearXNG as web primary and Brave as reference/fallback.
+  Image search remains Brave-only in the dual stack.
+- `WEBSEARCH_QUALITY_GATE=auto|on` enables quality-gated fallback; `off` keeps
+  only availability/empty fallback; `shadow` evaluates both providers while
+  serving Brave when usable.
+- Web and batch searches accept explicit `general`, `current`, and `news`
+  intents. Freshness is not inferred from query text.
+- A private broker cache is implemented. Telemetry schema v5 records only
+  bounded numeric shadow parity (top-k counts and overlap rates), never result
+  identifiers or result content.
+
+Shadow is **evaluation-only**. Promotion to automatic SearXNG-first serving
+requires measured fallback decisions plus sufficient parity evidence from
+successful, non-cached dual-provider samples. Operational success rate alone is
+not evidence that SearXNG matches Brave's result coverage or domain quality.

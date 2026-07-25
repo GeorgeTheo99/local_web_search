@@ -53,11 +53,21 @@ def test_query_normalization_hashes_only_and_variants_are_isolated(tmp_path):
         cache.close()
 
 
-def test_url_canonicalization_removes_tracking_and_preserves_semantics(tmp_path):
+def test_url_canonicalization_normalizes_host_identity_and_preserves_semantics(tmp_path):
     canonical = canonicalize_url(
-        "HTTPS://Example.COM:443/Case/Path?utm_source=x&keep=One&gclid=y&blank=#frag"
+        "HTTPS://BÜCHER.Example.:443/Case/Path?utm_source=x&keep=One&gclid=y&blank=#frag"
     )
-    assert canonical == "https://example.com/Case/Path?keep=One&blank="
+    assert canonical == "https://xn--bcher-kva.example/Case/Path?keep=One&blank="
+    assert canonical == canonicalize_url(
+        "https://XN--BCHER-KVA.EXAMPLE/Case/Path?keep=One&blank="
+    )
+    assert canonicalize_url("http://Example.COM:80") == "http://example.com/"
+    assert canonicalize_url("https://example.com/Case?a=1&a=2") != canonicalize_url(
+        "https://example.com/Case?a=2&a=1"
+    )
+    assert canonicalize_url("https://example.com/case?a=1") != canonicalize_url(
+        "https://example.com/Case?a=1"
+    )
 
     cache = WebCache(tmp_path / "cache")
     try:

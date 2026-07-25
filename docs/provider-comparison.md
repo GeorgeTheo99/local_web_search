@@ -1,12 +1,16 @@
 # Search provider comparison
 
-Snapshot: 2026-07-22
+Snapshot: 2026-07-24
 
 ## Recommendation
 
-**Brave Search API** is the default and only external search provider. SearXNG
-is retained as an optional keyless loopback alternative for web and image
-search. See `docs/adr/0002-search-architecture-redesign.md`.
+**Brave Search API** remains the code default and paid reference provider.
+SearXNG is available alone or as the primary in the `searxng+brave` web stack.
+The dual stack is currently for shadow evaluation: both providers run, Brave is
+served when usable, and only identifier-free numeric parity is retained. Do not
+promote it based on fallback rate alone. Dual-stack image search uses Brave;
+SearXNG images are limited to the SearXNG-only stack. See
+`docs/adr/0002-search-architecture-redesign.md`.
 
 ## Brave Search API
 
@@ -28,14 +32,14 @@ Brave was chosen over alternatives:
 | **Perplexity Search API** | No standard ZDR; Search Addendum permits retention/use of Input and Output for product improvement. |
 | **Valyu** | Not a general web search product — RAG/structured-data platform. |
 
-## SearXNG (optional loopback)
+## SearXNG (loopback or dual-stack primary)
 
 | Dimension | Value |
 |---|---|
 | Product | Raw metasearch results |
 | Price | No per-query fee; machine/network/admin cost |
 | Privacy | Best local control, but upstream engines see the query and server IP. Not a no-egress mode. |
-| Reliability | Scrape-based engines chronically suspend from this home IP; Bing carries the general-web load. |
+| Reliability | Previously problematic scrape engines were removed; Bing is broker-critical for general-web coverage and its unavailability triggers dual-stack fallback. |
 
 ## Local smoke benchmark
 

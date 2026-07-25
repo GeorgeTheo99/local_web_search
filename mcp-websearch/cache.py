@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import fcntl
 import hashlib
+import ipaddress
 import json
 import os
 import sqlite3
@@ -124,17 +125,23 @@ def _is_tracking_parameter(name: str) -> bool:
     return lowered.startswith("utm_") or lowered in _TRACKING_PARAMETERS
 
 
+def _canonical_hostname(hostname: str) -> str:
+    """Return one ASCII form for equivalent DNS names and IP literals."""
+    host = hostname.rstrip(".")
+    try:
+        return ipaddress.ip_address(host).compressed.lower()
+    except ValueError:
+        return host.encode("idna").decode("ascii").lower()
+
+
 def canonicalize_url(url: str) -> str:
-    """Canonicalize a URL while preserving path case and semantic parameters."""
+    """Canonicalize identity details without changing path/query semantics."""
     parsed = urllib.parse.urlsplit(str(url).strip())
     scheme = parsed.scheme.lower()
-    hostname = (parsed.hostname or "").lower()
+    hostname = _canonical_hostname(parsed.hostname or "")
     if ":" in hostname and not hostname.startswith("["):
         hostname = f"[{hostname}]"
-    try:
-        port = parsed.port
-    except ValueError:
-        port = None
+    port = parsed.port
     default_port = (scheme == "http" and port == 80) or (scheme == "https" and port == 443)
     netloc = hostname
     if port is not None and not default_port:
@@ -145,7 +152,9 @@ def canonicalize_url(url: str) -> str:
         [(key, value) for key, value in query_items if not _is_tracking_parameter(key)],
         doseq=True,
     )
-    return urllib.parse.urlunsplit((scheme, netloc, parsed.path, filtered_query, ""))
+    return urllib.parse.urlunsplit(
+        (scheme, netloc, parsed.path or "/", filtered_query, "")
+    )
 
 
 def content_ttl_seconds(url: str, content_type: str) -> int:

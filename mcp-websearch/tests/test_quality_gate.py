@@ -26,13 +26,14 @@ def _result(
     title: str = "T",
     *,
     provider: str = "brave",
+    engine: str | None = None,
 ) -> dict[str, Any]:
     return {
         "title": title,
         "url": url,
         "domain": url.split("/")[2],
         "snippet": snippet,
-        "engine": provider,
+        "engine": engine or provider,
         "provider": provider,
         "score": None,
     }
@@ -62,6 +63,7 @@ def _searxng_outcome(
     results: list[dict[str, Any]] | None = None,
     *,
     state: str = "ok",
+    unresponsive_engines: list[Any] | None = None,
 ) -> srv._BackendOutcome:
     return srv._BackendOutcome(
         backend="searxng",
@@ -69,6 +71,7 @@ def _searxng_outcome(
         state=state,
         results=results or [],
         attempts=1,
+        unresponsive_engines=unresponsive_engines or [],
     )
 
 
@@ -157,28 +160,112 @@ def test_quality_gate_passes_diverse_results(monkeypatch):
     assert reason is None
 
 
-def test_quality_gate_news_intent_stale(monkeypatch):
-    monkeypatch.setattr(srv, "QUALITY_MIN_RESULTS", 2)
-    monkeypatch.setattr(srv, "QUALITY_MIN_DOMAINS", 2)
-    cands = [
-        _result("https://a.example/1", "alpha bravo"),
-        _result("https://b.example/2", "delta echo"),
-    ]
-    passed, reason = srv._quality_gate(cands, news_intent=True)
+def test_quality_gate_fails_when_bing_is_unavailable():
+    passed, reason = srv._quality_gate(
+        _passing_searxng_results(),
+        unresponsive_engines=[["bing", "timeout for SECRET QUERY"]],
+    )
     assert passed is False
-    assert reason == "quality_stale_for_news_intent"
+    assert reason == "quality_critical_engine_unavailable"
 
 
-def test_quality_gate_news_intent_fresh_passes(monkeypatch):
-    monkeypatch.setattr(srv, "QUALITY_MIN_RESULTS", 2)
-    monkeypatch.setattr(srv, "QUALITY_MIN_DOMAINS", 2)
-    cands = [
-        _result("https://a.example/1", "alpha (published 2026-07-20T00:00:00Z)"),
-        _result("https://b.example/2", "delta (published 2026-07-21T00:00:00Z)"),
-    ]
-    passed, reason = srv._quality_gate(cands, news_intent=True)
+def test_quality_gate_ignores_noncritical_engine_failures():
+    passed, reason = srv._quality_gate(
+        _passing_searxng_results(),
+        unresponsive_engines=[["mwmbl", "timeout"]],
+    )
     assert passed is True
     assert reason is None
+
+
+def test_shadow_parity_uses_deduped_top_k_and_numeric_overlap_only():
+    primary = srv._BackendOutcome(
+        backend="searxng",
+        ok=True,
+        state="ok",
+        results=[
+            _result(
+                "https://top.example/a?utm_source=private",
+                provider="searxng",
+                engine="bing",
+            ),
+            _result("https://top.example/a", provider="searxng", engine="bing"),
+            _result("https://top.example/b", provider="searxng", engine="wikipedia"),
+            _result("https://other.example/c", provider="searxng", engine="mwmbl"),
+            _result("https://ignored.example/d", provider="searxng", engine="github"),
+        ],
+    )
+    reference = srv._BackendOutcome(
+        backend="brave",
+        ok=True,
+        state="ok",
+        results=[
+            _result("https://top.example/z"),
+            _result("https://top.example/a"),
+            _result("https://ref.example/q"),
+            _result("https://other.example/x"),
+        ],
+    )
+
+    parity = srv._compute_shadow_parity(primary, reference, requested=4)
+
+    assert parity == srv.ShadowParity(
+        top_k=4,
+        primary_result_count=4,
+        reference_result_count=4,
+        canonical_url_overlap_count=1,
+        primary_distinct_domain_count=3,
+        reference_distinct_domain_count=3,
+        domain_overlap_count=2,
+        reference_top_domain_in_primary=1,
+        primary_general_web_result_count=2,
+    )
+    assert all(isinstance(value, int) for value in parity.__dict__.values())
+
+
+def test_shadow_parity_canonicalizes_default_ports_trailing_hosts_and_idna():
+    primary = _searxng_outcome([
+        _result(
+            "HTTPS://BÜCHER.Example.:443/Case?keep=One&utm_source=private",
+            provider="searxng",
+            engine="bing",
+        )
+    ])
+    reference = _brave_outcome([
+        _result("https://xn--bcher-kva.example/Case?keep=One#fragment")
+    ])
+
+    parity = srv._compute_shadow_parity(primary, reference, requested=1)
+
+    assert parity == srv.ShadowParity(
+        top_k=1,
+        primary_result_count=1,
+        reference_result_count=1,
+        canonical_url_overlap_count=1,
+        primary_distinct_domain_count=1,
+        reference_distinct_domain_count=1,
+        domain_overlap_count=1,
+        reference_top_domain_in_primary=1,
+        primary_general_web_result_count=1,
+    )
+
+
+def test_shadow_parity_includes_legitimate_empty_but_rejects_failures():
+    empty_primary = _searxng_outcome(state="empty")
+    empty_reference = _brave_outcome()
+    assert srv._compute_shadow_parity(empty_primary, empty_reference, 8) == srv.ShadowParity(
+        top_k=5,
+        primary_result_count=0,
+        reference_result_count=0,
+        canonical_url_overlap_count=0,
+        primary_distinct_domain_count=0,
+        reference_distinct_domain_count=0,
+        domain_overlap_count=0,
+        reference_top_domain_in_primary=0,
+        primary_general_web_result_count=0,
+    )
+    failed = srv._BackendOutcome(backend="brave", ok=False, state="timeout")
+    assert srv._compute_shadow_parity(empty_primary, failed, 3) is None
 
 
 # --------------------------------------------------------------------------- #
@@ -276,6 +363,94 @@ async def test_dual_stack_searxng_error_falls_back_to_brave(dual_runtime, monkey
 
 
 @pytest.mark.asyncio
+async def test_dual_stack_bing_failure_escalates_with_query_free_reason(
+    dual_runtime, monkeypatch
+):
+    secret_query = "SECRET BING FAILURE QUERY 91d2"
+    calls: list[str] = []
+
+    async def fake_searxng_search(query, num_results):
+        calls.append("searxng")
+        return _searxng_outcome(
+            _passing_searxng_results(),
+            state="degraded",
+            unresponsive_engines=[["bing", "timeout for SECRET QUERY"]],
+        )
+
+    async def fake_brave_search(query, num_results, api_key):
+        calls.append("brave")
+        return _brave_outcome(_brave_results())
+
+    monkeypatch.setattr(srv, "_searxng_search", fake_searxng_search)
+    monkeypatch.setattr(srv, "_brave_search", fake_brave_search)
+    payload = json.loads(await srv._web_search_impl(secret_query, 3))
+
+    assert calls == ["searxng", "brave"]
+    assert payload["fallback_reason"] == "quality_critical_engine_unavailable"
+    assert dual_runtime.flush()
+    with sqlite3.connect(dual_runtime.db_path) as conn:
+        reason = conn.execute(
+            "SELECT fallback_reason FROM search_events"
+        ).fetchone()[0]
+    assert reason == "quality_critical_engine_unavailable"
+    assert secret_query.encode() not in dual_runtime.db_path.read_bytes()
+
+
+@pytest.mark.asyncio
+async def test_dual_stack_noncritical_engine_failure_does_not_escalate(
+    dual_runtime, monkeypatch
+):
+    calls: list[str] = []
+
+    async def fake_searxng_search(query, num_results):
+        calls.append("searxng")
+        return _searxng_outcome(
+            _passing_searxng_results(),
+            state="degraded",
+            unresponsive_engines=[["mwmbl", "timeout"]],
+        )
+
+    async def fake_brave_search(query, num_results, api_key):
+        calls.append("brave")
+        return _brave_outcome(_brave_results())
+
+    monkeypatch.setattr(srv, "_searxng_search", fake_searxng_search)
+    monkeypatch.setattr(srv, "_brave_search", fake_brave_search)
+    payload = json.loads(await srv._web_search_impl("noncritical failure", 3))
+
+    assert calls == ["searxng"]
+    assert payload["status"] == "degraded"
+    assert payload["fallback_reason"] is None
+
+
+@pytest.mark.asyncio
+async def test_empty_searxng_with_engine_failures_is_labeled_empty(
+    dual_runtime, monkeypatch
+):
+    async def fake_searxng_request(path, params, timeout=None):
+        return {
+            "results": [],
+            "suggestions": [],
+            "unresponsive_engines": [["bing", "timeout"]],
+        }
+
+    monkeypatch.setattr(srv, "_searxng_request", fake_searxng_request)
+    outcome = await srv._searxng_search("empty", 3)
+    assert outcome.state == "empty"
+
+    async def fake_searxng_search(query, num_results):
+        return outcome
+
+    async def fake_brave_search(query, num_results, api_key):
+        return _brave_outcome(_brave_results())
+
+    monkeypatch.setattr(srv, "_searxng_search", fake_searxng_search)
+    monkeypatch.setattr(srv, "_brave_search", fake_brave_search)
+    payload = json.loads(await srv._web_search_impl("empty", 3))
+    assert payload["fallback_reason"] == "searxng_empty"
+
+
+@pytest.mark.asyncio
 async def test_dual_stack_quality_failure_merges_primary_and_brave(dual_runtime, monkeypatch):
     primary = [_result(
         "https://primary.example/a", "thin primary", provider="searxng"
@@ -363,14 +538,29 @@ async def test_shadow_mode_returns_brave_and_records_query_free_decision(
         row = conn.execute(
             "SELECT would_escalate, would_escalate_reason FROM search_events"
         ).fetchone()
+        parity_row = conn.execute(
+            "SELECT top_k, primary_result_count, reference_result_count, "
+            "canonical_url_overlap_count, primary_distinct_domain_count, "
+            "reference_distinct_domain_count, domain_overlap_count, "
+            "reference_top_domain_in_primary, primary_general_web_result_count "
+            "FROM shadow_parity"
+        ).fetchone()
         values = "\n".join(
             str(value)
-            for table in ("search_events", "provider_events", "engine_failures")
+            for table in (
+                "search_events",
+                "provider_events",
+                "engine_failures",
+                "shadow_parity",
+            )
             for db_row in conn.execute(f"SELECT * FROM {table}")
             for value in db_row
         )
     assert row == (1, "quality_below_min_results")
+    assert parity_row == (3, 1, 3, 0, 1, 3, 0, 0, 0)
     assert secret_query not in values
+    assert "primary.example" not in values
+    assert "brave-one.example" not in values
 
 
 @pytest.mark.asyncio
@@ -396,3 +586,171 @@ async def test_shadow_mode_records_quality_pass_without_returning_searxng(
             "SELECT would_escalate, would_escalate_reason FROM search_events"
         ).fetchone()
     assert row == (0, None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("brave_state", "brave_ok", "attempts", "expected_reason"),
+    [
+        ("error", False, 1, "brave_error"),
+        ("timeout", False, 1, "brave_timeout"),
+        ("circuit_open", False, 0, "brave_circuit_open"),
+        ("empty", True, 1, "brave_empty"),
+    ],
+)
+async def test_shadow_mode_uses_searxng_when_brave_is_unusable(
+    dual_runtime,
+    monkeypatch,
+    brave_state,
+    brave_ok,
+    attempts,
+    expected_reason,
+):
+    async def fake_searxng_search(query, num_results):
+        return _searxng_outcome(_passing_searxng_results())
+
+    async def fake_brave_search(query, num_results, api_key):
+        return srv._BackendOutcome(
+            backend="brave",
+            ok=brave_ok,
+            state=brave_state,
+            attempts=attempts,
+        )
+
+    monkeypatch.setattr(srv, "_QUALITY_GATE_MODE", "shadow")
+    monkeypatch.setattr(srv, "_searxng_search", fake_searxng_search)
+    monkeypatch.setattr(srv, "_brave_search", fake_brave_search)
+    payload = json.loads(await srv._web_search_impl("shadow fallback", 3))
+
+    assert payload["status"] == "degraded"
+    assert payload["backend"] == "searxng"
+    assert payload["fallback_reason"] == expected_reason
+    assert {result["provider"] for result in payload["results"]} == {"searxng"}
+    assert payload["provider_states"]["brave"] == brave_state
+    assert dual_runtime.flush()
+    with sqlite3.connect(dual_runtime.db_path) as conn:
+        parity_count = conn.execute("SELECT COUNT(*) FROM shadow_parity").fetchone()[0]
+    assert parity_count == int(brave_ok)
+
+
+@pytest.mark.asyncio
+async def test_shadow_emergency_response_is_not_cached_and_brave_is_retried(
+    dual_runtime, monkeypatch, tmp_path
+):
+    cache = srv.WebCache(tmp_path / "real-cache")
+    brave_calls = 0
+
+    async def fake_searxng_search(query, num_results):
+        return _searxng_outcome(_passing_searxng_results())
+
+    async def recovering_brave_search(query, num_results, api_key):
+        nonlocal brave_calls
+        brave_calls += 1
+        if brave_calls == 1:
+            return srv._BackendOutcome(
+                backend="brave", ok=False, state="error", attempts=1
+            )
+        return _brave_outcome(_brave_results())
+
+    monkeypatch.setattr(srv, "_QUALITY_GATE_MODE", "shadow")
+    monkeypatch.setattr(srv, "_get_cache", lambda: cache)
+    monkeypatch.setattr(srv, "_searxng_search", fake_searxng_search)
+    monkeypatch.setattr(srv, "_brave_search", recovering_brave_search)
+    try:
+        first = json.loads(await srv._web_search_impl("shadow recovery", 3))
+        second = json.loads(await srv._web_search_impl("shadow recovery", 3))
+    finally:
+        cache.close()
+
+    assert first["backend"] == "searxng"
+    assert first["cache_hit"] is False
+    assert second["backend"] == "brave"
+    assert second["cache_hit"] is False
+    assert brave_calls == 2
+
+
+@pytest.mark.asyncio
+async def test_shadow_usable_brave_response_remains_cacheable(
+    dual_runtime, monkeypatch, tmp_path
+):
+    cache = srv.WebCache(tmp_path / "real-cache")
+    calls = {"searxng": 0, "brave": 0}
+
+    async def fake_searxng_search(query, num_results):
+        calls["searxng"] += 1
+        return _searxng_outcome(_passing_searxng_results())
+
+    async def fake_brave_search(query, num_results, api_key):
+        calls["brave"] += 1
+        return _brave_outcome(_brave_results())
+
+    monkeypatch.setattr(srv, "_QUALITY_GATE_MODE", "shadow")
+    monkeypatch.setattr(srv, "_get_cache", lambda: cache)
+    monkeypatch.setattr(srv, "_searxng_search", fake_searxng_search)
+    monkeypatch.setattr(srv, "_brave_search", fake_brave_search)
+    try:
+        first = json.loads(await srv._web_search_impl("shadow cached", 3))
+        second = json.loads(await srv._web_search_impl("shadow cached", 3))
+    finally:
+        cache.close()
+
+    assert first["backend"] == "brave"
+    assert first["cache_hit"] is False
+    assert second["backend"] == "brave"
+    assert second["cache_hit"] is True
+    assert calls == {"searxng": 1, "brave": 1}
+
+
+@pytest.mark.asyncio
+async def test_shadow_mode_records_parity_for_two_legitimate_empty_outcomes(
+    dual_runtime, monkeypatch
+):
+    async def fake_searxng_search(query, num_results):
+        return _searxng_outcome(state="empty")
+
+    async def fake_brave_search(query, num_results, api_key):
+        return _brave_outcome()
+
+    monkeypatch.setattr(srv, "_QUALITY_GATE_MODE", "shadow")
+    monkeypatch.setattr(srv, "_searxng_search", fake_searxng_search)
+    monkeypatch.setattr(srv, "_brave_search", fake_brave_search)
+    payload = json.loads(await srv._web_search_impl("both empty", 8))
+
+    assert payload["status"] == "empty"
+    assert dual_runtime.flush()
+    with sqlite3.connect(dual_runtime.db_path) as conn:
+        row = conn.execute(
+            "SELECT top_k, primary_result_count, reference_result_count "
+            "FROM shadow_parity"
+        ).fetchone()
+    assert row == (5, 0, 0)
+
+
+@pytest.mark.asyncio
+async def test_shadow_readiness_requires_brave_usability(dual_runtime, monkeypatch):
+    async def reachable():
+        return {"reachable": True, "latency_ms": 1.0}
+
+    monkeypatch.setattr(srv, "_QUALITY_GATE_MODE", "shadow")
+    monkeypatch.setattr(srv, "_probe_searxng", reachable)
+    monkeypatch.setattr(srv, "BRAVE_API_KEY_ENV", "")
+    monkeypatch.setattr(srv, "_BRAVE_SECRET_FILE", srv.LOCAL_SEARCH_DATA_DIR / "missing")
+    monkeypatch.setattr(srv, "get_http_headers", lambda: {})
+    health = await srv._health_payload()
+
+    assert health["searxng"]["available"] is True
+    assert health["ready"] is False
+
+
+@pytest.mark.asyncio
+async def test_shadow_readiness_requires_searxng_usability(dual_runtime, monkeypatch):
+    async def unavailable():
+        return {"reachable": False, "latency_ms": 1.0}
+
+    monkeypatch.setattr(srv, "_QUALITY_GATE_MODE", "shadow")
+    monkeypatch.setattr(srv, "_probe_searxng", unavailable)
+    health = await srv._health_payload()
+
+    assert health["searxng"]["available"] is False
+    assert health["providers"][1]["credential_configured"] is True
+    assert health["ready"] is False

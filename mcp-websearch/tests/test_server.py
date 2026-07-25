@@ -16,7 +16,6 @@ Run:  cd mcp-websearch && uv run pytest -q
 from __future__ import annotations
 
 import asyncio
-import gzip
 import json
 import logging
 import sqlite3
@@ -350,8 +349,8 @@ class _StaticResponse:
     def raise_for_status(self):
         return None
 
-    async def aread(self):
-        return self.body
+    async def aiter_raw(self):
+        yield self.body
 
 
 @pytest.mark.asyncio
@@ -489,34 +488,40 @@ async def test_fetch_uses_fresh_tls_pool_for_each_redirect_host(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_fetch_decodes_gzip_before_returning_body(monkeypatch):
-    decoded = b"decoded response body"
+async def test_fetch_rejects_encoded_response_before_reading(monkeypatch):
+    streamed = False
+    request_headers: dict[str, str] = {}
 
-    class CompressedStream(srv.httpx.AsyncByteStream):
-        async def __aiter__(self):
-            yield gzip.compress(decoded)
+    class EncodedResponse:
+        is_redirect = False
+        status_code = 200
+        headers = {
+            "content-type": "text/plain",
+            "content-encoding": "gzip",
+        }
+
+        def raise_for_status(self):
+            return None
+
+        async def aiter_raw(self):
+            nonlocal streamed
+            streamed = True
+            yield b"encoded bytes must not be consumed"
 
     class FakeClient:
         def stream(self, method, url, **kwargs):
-            response = srv.httpx.Response(
-                200,
-                headers={
-                    "content-type": "text/plain",
-                    "content-encoding": "gzip",
-                },
-                stream=CompressedStream(),
-                request=srv.httpx.Request(method, url),
-            )
-            return _FakeStream(response)
+            request_headers.update(kwargs["headers"])
+            return _FakeStream(EncodedResponse())
 
     async def fake_client():
         return FakeClient()
 
     monkeypatch.setattr(srv, "_validate_public_http_url", _allow_public_url)
     monkeypatch.setattr(srv, "_public_fetch_client", fake_client)
-    _, body, _, status = await srv._fetch_public_body("https://example.com/compressed")
-    assert body == decoded
-    assert status == 200
+    with pytest.raises(ValueError, match="unsupported content encoding: gzip"):
+        await srv._fetch_public_body("https://example.com/compressed")
+    assert request_headers["Accept-Encoding"] == "identity"
+    assert streamed is False
 
 
 @pytest.mark.asyncio
@@ -752,7 +757,9 @@ async def test_short_pdftotext_output_is_preserved_when_ocr_unavailable(monkeypa
 
 
 @pytest.mark.asyncio
-async def test_web_fetch_checks_decoded_body_byte_limit(monkeypatch):
+async def test_web_fetch_caps_raw_chunks_and_stops_after_overflow(monkeypatch):
+    chunks_consumed = 0
+
     class ChunkedResponse:
         is_redirect = False
         status_code = 200
@@ -762,8 +769,11 @@ async def test_web_fetch_checks_decoded_body_byte_limit(monkeypatch):
         def raise_for_status(self):
             return None
 
-        async def aread(self):
-            return b"a" * 6 + b"b" * 6
+        async def aiter_raw(self):
+            nonlocal chunks_consumed
+            for chunk in (b"a" * 6, b"b" * 6, b"must not be consumed"):
+                chunks_consumed += 1
+                yield chunk
 
     class FakeClient:
         def stream(self, method, url, **kwargs):
@@ -777,6 +787,105 @@ async def test_web_fetch_checks_decoded_body_byte_limit(monkeypatch):
     monkeypatch.setattr(srv, "_client", fake_client)
     result = await _call_tool("web_fetch", {"url": "https://example.com/large"})
     assert _result_text(result) == "Fetch error: response exceeds 10 byte limit"
+    assert chunks_consumed == 2
+
+
+@pytest.mark.asyncio
+async def test_fetch_accepts_raw_body_at_exact_byte_limit(monkeypatch):
+    class ExactResponse:
+        is_redirect = False
+        status_code = 200
+        headers = {
+            "content-type": "text/plain",
+            "content-length": "10",
+            "content-encoding": "identity",
+        }
+
+        def raise_for_status(self):
+            return None
+
+        async def aiter_raw(self):
+            yield b"a" * 4
+            yield b"b" * 6
+
+    class FakeClient:
+        def stream(self, method, url, **kwargs):
+            return _FakeStream(ExactResponse())
+
+    async def fake_client():
+        return FakeClient()
+
+    monkeypatch.setattr(srv, "FETCH_MAX_BYTES", 10)
+    monkeypatch.setattr(srv, "_validate_public_http_url", _allow_public_url)
+    monkeypatch.setattr(srv, "_public_fetch_client", fake_client)
+    _, body, _, status = await srv._fetch_public_body("https://example.com/exact")
+    assert body == b"a" * 4 + b"b" * 6
+    assert status == 200
+
+
+@pytest.mark.asyncio
+async def test_fetch_rejects_oversized_content_length_before_stream(monkeypatch):
+    streamed = False
+
+    class OversizedResponse:
+        is_redirect = False
+        status_code = 200
+        headers = {"content-type": "text/plain", "content-length": "11"}
+
+        def raise_for_status(self):
+            return None
+
+        async def aiter_raw(self):
+            nonlocal streamed
+            streamed = True
+            yield b"not consumed"
+
+    class FakeClient:
+        def stream(self, method, url, **kwargs):
+            return _FakeStream(OversizedResponse())
+
+    async def fake_client():
+        return FakeClient()
+
+    monkeypatch.setattr(srv, "FETCH_MAX_BYTES", 10)
+    monkeypatch.setattr(srv, "_validate_public_http_url", _allow_public_url)
+    monkeypatch.setattr(srv, "_public_fetch_client", fake_client)
+    with pytest.raises(ValueError, match="response exceeds 10 byte limit"):
+        await srv._fetch_public_body("https://example.com/large")
+    assert streamed is False
+
+
+@pytest.mark.asyncio
+async def test_fetch_http_status_precedes_oversized_content_length(monkeypatch):
+    request = srv.httpx.Request("GET", "https://example.com/failure")
+    response = srv.httpx.Response(413, request=request)
+
+    class FailedResponse:
+        is_redirect = False
+        status_code = 413
+        headers = {"content-type": "text/plain", "content-length": "999"}
+
+        def raise_for_status(self):
+            raise srv.httpx.HTTPStatusError(
+                "too large", request=request, response=response
+            )
+
+        async def aiter_raw(self):
+            raise AssertionError("error response body must not be consumed")
+            yield b""  # pragma: no cover
+
+    class FakeClient:
+        def stream(self, method, url, **kwargs):
+            return _FakeStream(FailedResponse())
+
+    async def fake_client():
+        return FakeClient()
+
+    monkeypatch.setattr(srv, "FETCH_MAX_BYTES", 10)
+    monkeypatch.setattr(srv, "_validate_public_http_url", _allow_public_url)
+    monkeypatch.setattr(srv, "_public_fetch_client", fake_client)
+    with pytest.raises(srv.httpx.HTTPStatusError):
+        await srv._fetch_public_body("https://example.com/failure")
 
 
 @pytest.mark.asyncio
@@ -1339,6 +1448,15 @@ async def test_tools_list_exposes_expected_tools():
         "maxLength": srv.BATCH_MAX_QUERY_CHARS,
     }
     assert batch_schema["properties"]["num_results"] == {"default": 8, "type": "integer"}
+    expected_intent_schema = {
+        "default": "general",
+        "enum": ["general", "current", "news"],
+        "type": "string",
+    }
+    assert batch_schema["properties"]["intent"] == expected_intent_schema
+    web_tool = next(tool for tool in tools if tool.name == "web_search")
+    web_schema = web_tool.model_dump(by_alias=True)["inputSchema"]
+    assert web_schema["properties"]["intent"] == expected_intent_schema
     image_tool = next(tool for tool in tools if tool.name == "image_search")
     schema = image_tool.model_dump(by_alias=True)["inputSchema"]
     assert schema["required"] == ["query"]
@@ -1351,23 +1469,41 @@ async def test_tools_list_exposes_expected_tools():
 # --------------------------------------------------------------------------- #
 
 @pytest.mark.asyncio
-async def test_dedupe_by_url_brave_results(monkeypatch):
-    """Duplicate URLs (same URL, different fragments) collapse to one."""
+async def test_dedupe_normalizes_host_identity_without_changing_url_semantics(monkeypatch):
     async def fake_brave_search(query, num_results, api_key):
+        urls = [
+            ("host", "HTTPS://Example.COM.:443/Case?keep=1&utm_source=x"),
+            ("host duplicate", "https://example.com/Case?keep=1#fragment"),
+            ("idna", "https://BÜCHER.example/Page"),
+            ("idna duplicate", "https://xn--bcher-kva.EXAMPLE.:443/Page?fbclid=x"),
+            ("path case", "https://example.com/case?keep=1"),
+            ("query order one", "https://example.com/Case?a=1&a=2"),
+            ("query order two", "https://example.com/Case?a=2&a=1"),
+        ]
         return _brave_outcome([
-            {"title": "A", "url": "https://example.com/page", "snippet": "a",
-             "domain": "example.com", "engine": "brave", "provider": "brave", "score": None},
-            {"title": "A2", "url": "https://example.com/page#frag", "snippet": "a2",
-             "domain": "example.com", "engine": "brave", "provider": "brave", "score": None},
-            {"title": "B", "url": "https://other.com/", "snippet": "b",
-             "domain": "other.com", "engine": "brave", "provider": "brave", "score": None},
+            {
+                "title": title,
+                "url": url,
+                "snippet": title,
+                "domain": "unused.example",
+                "engine": "brave",
+                "provider": "brave",
+                "score": None,
+            }
+            for title, url in urls
         ])
+
     monkeypatch.setattr(srv, "_brave_search", fake_brave_search)
-    result = await _call_tool("web_search", {"query": "q"})
+    result = await _call_tool("web_search", {"query": "q", "num_results": 8})
     payload = json.loads(_result_text(result))
-    assert len(payload["results"]) == 2  # page + page#frag deduped, other.com kept
-    assert payload["results"][0]["rank"] == 1
-    assert payload["results"][1]["rank"] == 2
+    assert [item["title"] for item in payload["results"]] == [
+        "host",
+        "idna",
+        "path case",
+        "query order one",
+        "query order two",
+    ]
+    assert [item["rank"] for item in payload["results"]] == [1, 2, 3, 4, 5]
 
 
 # --------------------------------------------------------------------------- #

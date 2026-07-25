@@ -4,7 +4,7 @@ Local, loopback-only web-search services for macOS:
 
 - **FastMCP broker** on `http://127.0.0.1:8889/mcp`
 - **Brave Search API** as the default web and image provider
-- **SearXNG** on `http://127.0.0.1:8888` as an optional keyless provider
+- **SearXNG** on `http://127.0.0.1:8888` as a keyless provider or dual-stack primary
 - **launchd operator CLI** for install, health, logs, telemetry, and upgrades
 
 The broker is shared by Pi and my-ai. It returns structured ranked results,
@@ -16,25 +16,27 @@ query-free operational metadata, and an estimated per-search provider cost.
 MCP client
   │
   └── 127.0.0.1:8889/mcp
-        ├── web_search ───── Brave (default) or SearXNG
+        ├── web_search ───── Brave, SearXNG, or SearXNG → Brave
         ├── batch_web_search same provider stack, bounded concurrency
-        ├── image_search ─── Brave (default) or SearXNG
+        ├── image_search ─── Brave, except SearXNG-only stack
         ├── web_fetch ────── direct public-URL fetch + extraction
         └── verify_url ───── direct-fetch verification
 
 SearXNG: 127.0.0.1:8888
 ```
 
-Only two provider stacks are supported:
+Three provider stacks are supported:
 
 | `WEBSEARCH_PROVIDER_STACK` | Web search | Image search | External request cost |
 |---|---|---|---|
-| `brave` (default) | Brave Search API | Brave Images API | Estimated `$0.005` per issued API request |
+| `brave` (default) | Brave Search API | Brave Images API | Estimated `$0.005` per issued Brave request |
 | `searxng` | Loopback SearXNG | Loopback SearXNG | No provider fee |
+| `searxng+brave` | SearXNG primary plus policy-controlled Brave reference/fallback | Brave Images API only | `$0` until a Brave request is issued; then estimated `$0.005` |
 
 SearXNG is diagnostic-only when it is not in the active stack. A healthy
 SearXNG process does not make a Brave-only broker ready when the Brave
-credential is missing or its circuit is unavailable.
+credential is missing or its circuit is unavailable. The dual stack requires
+both loopback SearXNG and a usable Brave credential when shadow mode is active.
 
 See [`docs/adr/0002-search-architecture-redesign.md`](docs/adr/0002-search-architecture-redesign.md)
 and [`docs/provider-comparison.md`](docs/provider-comparison.md) for the provider
@@ -64,6 +66,12 @@ For a keyless SearXNG-only install:
 
 ```bash
 WEBSEARCH_PROVIDER_STACK=searxng ./install.sh
+```
+
+For dual-stack evaluation (SearXNG evaluated, Brave still served):
+
+```bash
+WEBSEARCH_PROVIDER_STACK=searxng+brave WEBSEARCH_QUALITY_GATE=shadow ./install.sh
 ```
 
 `install.sh` delegates to `scripts/local-search install`. It validates provider
@@ -117,10 +125,13 @@ credentials.
 
 ## MCP tools
 
-### `web_search(query, num_results=8, mode=None)`
+### `web_search(query, num_results=8, mode=None, intent="general")`
 
 Searches the active provider stack. Queries are limited to 512 characters and
 results to 20. Provider responses, retries, and total latency are bounded.
+`intent` must be explicit: `general` uses no freshness filter, `current` uses a
+recent window, and `news` uses the narrowest freshness window. Intent is never
+inferred from query text. `batch_web_search` accepts the same three intents.
 
 Routing modes:
 
@@ -129,6 +140,14 @@ Routing modes:
 | `normal` | Use the configured provider stack |
 | `sensitive` | Make no external request; currently returns a structured refusal because no local corpus is configured |
 | `maximum_recall` | Contact every provider in the configured stack serially and merge results |
+
+For `searxng+brave`, `WEBSEARCH_QUALITY_GATE` controls normal routing:
+
+| Gate | Dual-stack behavior |
+|---|---|
+| `shadow` | On every uncached search (cache miss), evaluate SearXNG and Brave, return Brave when usable, and record query-free decision/parity metrics; evaluation only |
+| `auto` or `on` | Return SearXNG when it passes; call Brave on empty/error/timeout/circuit skip or a quality-gate failure |
+| `off` | Disable quality checks; still use Brave for primary empty/error/timeout/circuit skip |
 
 The response includes:
 
@@ -143,17 +162,19 @@ Missing credentials, open-circuit skips, and providers excluded by the total
 deadline are not counted as billable attempts. Failed HTTP requests are counted
 because the upstream may still bill them.
 
-### `batch_web_search(queries, num_results=8)`
+### `batch_web_search(queries, num_results=8, intent="general")`
 
 Runs up to three unique queries with at most two active search pipelines and one
-shared deadline. Output ordering follows input ordering. Partial completions and
+shared deadline. One explicit `general`, `current`, or `news` intent applies to
+the batch. Output ordering follows input ordering. Partial completions and
 per-item timeouts remain explicit.
 
 ### `image_search(query, num_results=8)`
 
-Uses Brave Images for the `brave` stack and SearXNG images for the `searxng`
-stack. Brave Images uses `safesearch=strict`; SearXNG uses its moderate policy.
-The response includes the actual backend, request attempts, safety policy, and
+Uses Brave Images for the `brave` and `searxng+brave` stacks; the dual stack
+does not route images through SearXNG. The `searxng` stack uses SearXNG images.
+Brave Images uses `safesearch=strict`; SearXNG uses its moderate policy. The
+response includes the actual backend, request attempts, safety policy, and
 estimated cost.
 
 ### `web_fetch(url, max_chars=20000)`
@@ -161,6 +182,10 @@ estimated cost.
 Fetches a public HTTP(S) URL with DNS/IP validation, connection pinning,
 redirect revalidation, response-size limits, and isolated HTML/PDF extraction.
 Loopback, private, link-local, and other non-public destinations are rejected.
+The default 20 MiB body cap is enforced before reading a valid oversized
+`Content-Length` and again while streaming raw bytes, so chunked or misdeclared
+responses cannot bypass it. Fetches request `Accept-Encoding: identity` and
+reject encoded responses before reading their bodies.
 
 ### `verify_url(url)`
 
@@ -172,23 +197,41 @@ fall back to a search-provider extraction API.
 | Endpoint | Purpose |
 |---|---|
 | `GET /live` | Dependency-free process liveness |
-| `GET /ready` | Active-provider readiness; HTTP 503 when unusable |
+| `GET /ready` | Active-policy readiness; HTTP 503 when requirements are unmet (shadow evaluation requires usable SearXNG and Brave) |
 | `GET /health` | Compatibility diagnostics; always HTTP 200 |
 | `GET /stats?window=24h` | Query-free aggregates; windows: `24h`, `7d`, `30d` |
 
 Telemetry is enabled by default and stored in
-`$LOCAL_SEARCH_DATA_DIR/telemetry.sqlite3`. It stores bounded operational fields
-only: status, provider, routing mode, counts, latency, normalized failure reason,
-credential mode, and circuit state. It never accepts query text, URLs, snippets,
-headers, result content, or credentials.
+`$LOCAL_SEARCH_DATA_DIR/telemetry.sqlite3`. Search and parity telemetry stores
+bounded operational fields only: status, provider, routing mode, counts,
+latency, normalized failure reason, credential mode, circuit state, and numeric
+shadow parity. It stores no search/result identifiers: never queries, URLs,
+domains, hashes of URLs/domains, titles, snippets, headers, result content, or
+credentials. Fetch telemetry separately stores the normalized destination
+hostname plus bounded outcome/status/size/latency fields; it never stores a full
+URL, path, or query. The primary general-web count uses the normalized
+Bing/Mwmbl engine label supplied by SearXNG.
+
+`/stats` exposes numeric comparison aggregates under `shadow.parity`. Rate
+denominators are explicit in `reference_result_total`,
+`reference_domain_total`, and `primary_result_total`, with corresponding
+nonempty sample counts and `comparable_sample_count`. A rate is `null` when its
+denominator is zero, rather than reporting a misleading `0%`. Cache hits and
+incomplete comparisons are excluded.
+
+The private cache lives under `$LOCAL_SEARCH_DATA_DIR/cache/`. Search keys are
+query hashes and cached search payloads contain returned result data; fetched
+content entries retain canonical URLs and extracted bodies. Cache hits emit
+provider-free telemetry and report zero estimated provider cost.
 
 ```bash
 scripts/local-search stats 7d
 scripts/local-search telemetry-reset --yes
 ```
 
-Disable telemetry with `LOCAL_SEARCH_TELEMETRY_ENABLED=false` before install or
-restart.
+Disable telemetry with `LOCAL_SEARCH_TELEMETRY_ENABLED=false` when running
+`scripts/local-search install`; configuration changes require install to
+regenerate the LaunchAgent environment.
 
 ## Configuration
 
@@ -198,6 +241,10 @@ Important environment variables:
 |---|---|
 | `WEBSEARCH_PROVIDER_STACK` | `brave` |
 | `WEBSEARCH_SEARCH_MODE` | `normal` |
+| `WEBSEARCH_QUALITY_GATE` | `auto`; also `on`, `off`, or `shadow` |
+| `WEBSEARCH_QUALITY_MIN_RESULTS` | `3` |
+| `WEBSEARCH_QUALITY_MIN_DOMAINS` | `2` |
+| `WEBSEARCH_QUALITY_DUPLICATE_FRACTION` | `0.6` |
 | `WEBSEARCH_TOTAL_TIMEOUT` | `18` seconds, hard-capped at 18 |
 | `WEBSEARCH_BRAVE_TIMEOUT` | `8` seconds |
 | `WEBSEARCH_SEARXNG_TIMEOUT` | `7` seconds |
@@ -210,7 +257,11 @@ Important environment variables:
 | `BRAVE_BASE_URL` | `https://api.search.brave.com` |
 | `MCP_PORT` | `8889` |
 
-Use `scripts/local-search env` to inspect the installed non-secret values.
+Use `scripts/local-search env` to inspect resolved non-secret values. The
+`install` command persists settings, rewrites the launchd plist, and starts it
+unless `--no-start` is used. `restart` only restarts the already-installed
+plist; it does **not** re-render changed shell variables or `data/install.env`.
+Run `scripts/local-search install` after changing persistent configuration.
 
 ## Client configuration
 
@@ -263,7 +314,7 @@ configuration.
 - Redirect-chain revalidation
 - Bounded provider JSON, fetch bodies, extraction output, and subprocess stderr
 - Circuit breakers and total-deadline enforcement
-- Query-free telemetry and URL-query log redaction
+- Identifier-free search/parity telemetry, host-only fetch telemetry, and URL-query log redaction
 - Owner-only data directory, telemetry database, install config, and secret file
 - launchd `KeepAlive` with dependency-ordered restart and verification
 

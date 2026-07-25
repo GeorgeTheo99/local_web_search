@@ -49,8 +49,9 @@ engines:
   # Broad indexes verified from this host. The scrape-based engines that were
   # chronically suspended from this home IP (duckduckgo, google cse, startpage,
   # and mojeek) are removed: they only ever contributed a degraded flag. Bing
-  # carries the general-web load reliably; Mwmbl is a keyless API-backed
-  # independent index. Keep the custom defensive Mwmbl adapter; upstream
+  # is broker-critical and carries the general-web load; its unavailability
+  # triggers broker fallback. Mwmbl is a keyless API-backed independent index.
+  # Keep the custom defensive Mwmbl adapter; upstream
   # defaults provide the other implementations.
   - name: bing
     disabled: false

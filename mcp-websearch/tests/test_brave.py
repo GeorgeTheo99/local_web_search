@@ -49,6 +49,7 @@ def _result_text(result: Any) -> str:
 @pytest.fixture(autouse=True)
 def _reset_runtime(monkeypatch, tmp_path):
     monkeypatch.setattr(srv, "_breaker", srv._CircuitBreaker())
+    monkeypatch.setattr(srv, "_brave_auth_state", srv._BraveAuthState())
     monkeypatch.setattr(srv, "_last_search", None)
     monkeypatch.setattr(srv, "BRAVE_API_KEY_ENV", "")
     # Isolate the secret file to a tmp dir so real filesystem state can't leak in.
@@ -97,6 +98,19 @@ def test_normalize_brave_empty_description_is_ok():
 # --------------------------------------------------------------------------- #
 # Credential resolution.
 # --------------------------------------------------------------------------- #
+
+def test_brave_auth_state_tracks_interleaved_credentials():
+    state = srv._BraveAuthState()
+
+    state.record_auth_failure("credential-a")
+    state.record_auth_failure("credential-b")
+    assert state.usable("credential-a") is False
+    assert state.usable("credential-b") is False
+
+    state.record_success("credential-a")
+    assert state.usable("credential-a") is True
+    assert state.usable("credential-b") is False
+
 
 @pytest.mark.asyncio
 async def test_resolve_brave_key_env_fallback(monkeypatch):
@@ -196,6 +210,18 @@ def _async_client(client):
     return _factory
 
 
+def _configure_shadow_readiness(monkeypatch, api_key="brave-key"):
+    async def reachable():
+        return {"reachable": True, "latency_ms": 1.0}
+
+    monkeypatch.setattr(srv, "_PROVIDER_STACK", "searxng+brave")
+    monkeypatch.setattr(srv, "_PROVIDERS", srv._build_provider_stack())
+    monkeypatch.setattr(srv, "_QUALITY_GATE_MODE", "shadow")
+    monkeypatch.setattr(srv, "BRAVE_API_KEY_ENV", api_key)
+    monkeypatch.setattr(srv, "get_http_headers", lambda: {})
+    monkeypatch.setattr(srv, "_probe_searxng", reachable)
+
+
 @pytest.mark.asyncio
 async def test_brave_search_normalizes_web_results(monkeypatch):
     payload = {
@@ -259,21 +285,65 @@ async def test_brave_search_timeout_records_failure(monkeypatch):
     assert outcome.error == "request timed out"
     snap = srv._breaker.snapshot("brave")
     assert snap["consecutive_failures"] >= 1
+    assert srv._brave_auth_state.usable("brave-key") is True
 
 
 @pytest.mark.asyncio
-async def test_brave_search_401_does_not_circuit_break(monkeypatch):
+@pytest.mark.parametrize("status_code", [401, 403])
+async def test_brave_auth_failure_closes_readiness_not_circuit(
+    monkeypatch, status_code
+):
     class FakeClient:
         def stream(self, method, url, params=None, headers=None, timeout=None):
-            return _FakeStreamResponse({}, status=401)
+            return _FakeStreamResponse({}, status=status_code)
 
+    _configure_shadow_readiness(monkeypatch)
     monkeypatch.setattr(srv, "_client", _async_client(FakeClient()))
     outcome = await srv._brave_search("q", 5, "brave-key")
+    health = await srv._health_payload()
+
     assert outcome.state == "error"
-    assert outcome.http_status == 401
-    snap = srv._breaker.snapshot("brave")
-    assert snap["state"] == "closed"
-    assert snap["consecutive_failures"] == 0
+    assert outcome.http_status == status_code
+    assert health["providers"][1]["credential_configured"] is True
+    assert health["providers"][1]["circuit"]["state"] == "closed"
+    assert health["ready"] is False
+
+
+@pytest.mark.asyncio
+async def test_brave_auth_readiness_recovers_after_success(monkeypatch):
+    responses = iter([401, 200])
+
+    class FakeClient:
+        def stream(self, method, url, params=None, headers=None, timeout=None):
+            return _FakeStreamResponse(
+                {"web": {"results": []}}, status=next(responses)
+            )
+
+    _configure_shadow_readiness(monkeypatch)
+    monkeypatch.setattr(srv, "_client", _async_client(FakeClient()))
+
+    await srv._brave_search("q", 5, "brave-key")
+    assert (await srv._health_payload())["ready"] is False
+
+    outcome = await srv._brave_search("q", 5, "brave-key")
+    assert outcome.ok is True
+    assert (await srv._health_payload())["ready"] is True
+
+
+@pytest.mark.asyncio
+async def test_brave_auth_readiness_recovers_on_credential_rotation(monkeypatch):
+    class FakeClient:
+        def stream(self, method, url, params=None, headers=None, timeout=None):
+            return _FakeStreamResponse({}, status=403)
+
+    _configure_shadow_readiness(monkeypatch)
+    monkeypatch.setattr(srv, "_client", _async_client(FakeClient()))
+
+    await srv._brave_search("q", 5, "brave-key")
+    assert (await srv._health_payload())["ready"] is False
+
+    monkeypatch.setattr(srv, "BRAVE_API_KEY_ENV", "rotated-brave-key")
+    assert (await srv._health_payload())["ready"] is True
 
 
 @pytest.mark.asyncio
@@ -288,6 +358,7 @@ async def test_brave_search_429_circuit_breaks(monkeypatch):
     assert outcome.http_status == 429
     snap = srv._breaker.snapshot("brave")
     assert snap["consecutive_failures"] >= 1
+    assert srv._brave_auth_state.usable("brave-key") is True
 
 
 @pytest.mark.asyncio

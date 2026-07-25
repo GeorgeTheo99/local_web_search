@@ -1,18 +1,18 @@
 # Web Search Improvement Roadmap
 
-**Last updated:** 2026-07-22
-**Status:** Planning — no changes committed yet
+**Last updated:** 2026-07-24
+**Status:** Cache and dual-stack shadow evaluation implemented; promotion pending evidence
 
 ## Current state
 
-- **Brave Search API** is the default and only external search provider ($0.005/query)
-- **SearXNG** loopback instance running with Bing + mwmbl + focused indexes (Wikipedia, GitHub, arXiv); image search via SearXNG or Brave depending on stack
+- **Brave Search API** remains the code default ($0.005/issued request); supported stacks are `brave`, `searxng`, and `searxng+brave`
+- **SearXNG** loopback runs Bing + mwmbl + focused indexes (Wikipedia, GitHub, arXiv); dual-stack web search is in shadow evaluation and dual-stack images route only to Brave
 - **MCP broker** (`local_web_search/mcp-websearch/server.py`) exposes `web_search`, `batch_web_search`, `image_search`, `web_fetch`, `verify_url` over MCP (HTTP + stdio)
 - **Cost tracking** live: `estimated_cost_usd` in every search response, displayed as a badge in my-ai UI
 - **Planning estimate:** ~87 searches/day and ~$13/month at Brave-only usage; remeasure from telemetry before using this for a budget decision
 - **Informal smoke estimate:** `web_fetch` works for ~85% of sampled sites; 403s occur on anti-bot sites (Medium, Quora); browser fallback is handled by Pi's `browser_*` tools (not in broker)
-- **No caching** — every search and every fetch hits the network
-- **SearXNG has no Redis** — no result caching or limiter protection
+- **Private broker caching is live** for search results and fetched/extracted content; search cache keys retain only query hashes
+- **SearXNG has no Redis** — its limiter remains disabled; broker-level caching handles repeat search/fetch requests
 - Both **Pi** and **my-ai** route through the same MCP broker at `127.0.0.1:8889`
 
 ## Goals
@@ -25,12 +25,14 @@
 
 ## Roadmap
 
-### Phase 1: Central web cache (highest ROI, free)
+### Phase 1: Central web cache (implemented)
+
+**Status:** Implemented in `mcp-websearch/cache.py` with search/fetch integration and cache telemetry.
 
 **What:** A persistent on-disk cache for both search results and fetched web content.
 
 **Storage:**
-- `data/cache/cache.db` — SQLite (WAL mode) for metadata (keys, TTLs, hit counts, eviction ordering)
+- `data/cache/cache.sqlite3` — SQLite (WAL mode) for metadata (keys, TTLs, hit counts, eviction ordering)
 - `data/cache/content/<hash_prefix>/<hash>` — filesystem blobs for web page content
 - 50 GB size limit with LRU eviction
 
@@ -38,7 +40,7 @@
 
 | Layer | Key | Size/entry | TTL | Saves |
 |---|---|---|---|---|
-| Search results | SHA-256 of normalized query | ~2-5 KB (JSON inline in SQLite) | 2-6 hours | $0.005 per Brave hit avoided |
+| Search results | SHA-256 of normalized query | ~2-5 KB (JSON inline in SQLite) | 2 hours general; 30 min current/news | $0.005 per Brave hit avoided |
 | Web content | SHA-256 of canonical URL | ~10-100 KB (filesystem blob) | 1-30 days (per content type) | Network latency + bandwidth |
 
 **TTL by content type:**
@@ -53,7 +55,7 @@
 - Query text is never stored — only SHA-256 hashes
 - URLs are stored (needed for revalidation)
 - Cache directory is mode 0700, gitignored
-- Telemetry records hit/miss counts, never query text or URLs
+- Search/parity telemetry records no identifiers; fetch telemetry retains only a normalized destination hostname, never a full URL/path/query
 
 **Integration:**
 - Transparent to tool API — no changes to `web_search`/`web_fetch` signatures
@@ -64,7 +66,7 @@
 
 **Module:** `mcp-websearch/cache.py` — standalone `WebCache` class, no broker dependency
 
-**Estimated savings:** 20-30% cache hit rate → ~$9-10/month (down from $13)
+**Estimated savings:** A 20-30% hit rate against the $13/month planning baseline saves about $2.60-$3.90/month, leaving about $9.10-$10.40/month.
 
 **Tests:** `mcp-websearch/tests/test_cache.py` — hit/miss, TTL expiry, eviction, privacy, concurrent access
 
@@ -107,7 +109,11 @@ outgoing:
 
 ---
 
-### Phase 3: SearXNG-first with Brave fallback (free, the cost killer)
+### Phase 3: SearXNG-first with Brave fallback (shadow evaluation)
+
+**Status:** Dual-stack routing and `auto|on|off|shadow` gate modes are implemented.
+Shadow still serves Brave when usable; promotion requires fallback and numeric
+result/domain parity evidence from non-cached successful comparisons.
 
 **What:** Make SearXNG the primary search provider with Brave as quality-gated fallback.
 
@@ -115,14 +121,15 @@ outgoing:
 - `_build_provider_stack()` returns `[_SearXNGProvider(), _BraveProvider()]`
 - SearXNG is tried first (free)
 - If SearXNG returns no results, errors, or fails the quality gate (< 3 results, < 2 domains, duplicate-dominated), Brave is called ($0.005)
-- The quality gate infrastructure already exists — just needs re-enabling
+- The quality gate is implemented in `auto|on|off|shadow`; shadow currently records decisions/parity while Brave remains the serving reference when usable
 
-**Default stack:** `WEBSEARCH_PROVIDER_STACK=searxng+brave` (replaces `brave`)
+**Promotion target:** `WEBSEARCH_PROVIDER_STACK=searxng+brave`; the code default remains `brave` during evaluation.
 
-**Quality gate re-enablement:**
-- `_quality_gate_enabled()` returns `True` when a fallback provider exists
-- Gate checks: min results (3), min domains (2), duplicate fraction (0.6), freshness
-- Gate is transient and query-free (never persists snippets/titles)
+**Quality gate implementation:**
+- `_quality_gate_enabled()` returns `True` when a fallback provider exists in `auto`/`on`; `shadow` evaluates the same checks without promoting SearXNG serving
+- Gate checks: min results (3), min domains (2), duplicate fraction (0.6), and critical Bing availability
+- Freshness is not a quality-gate heuristic: explicit `current`/`news` intent maps directly to each provider's freshness filter
+- Gate evaluation is transient and query-free (never persists snippets/titles)
 
 **Cost tracking:**
 - SearXNG-only success: `estimated_cost_usd: $0.000`
@@ -130,9 +137,9 @@ outgoing:
 - UI badge shows the difference — users can see the savings
 
 **Measurement period:**
-- Before flipping the default, log would-escalate decisions for 1 week
-- Measure actual SearXNG success rate and fallback rate
-- Only switch if fallback rate is < 50% (otherwise Brave-only is simpler)
+- Before flipping the default, collect would-escalate decisions and schema-v5 parity samples
+- Measure SearXNG success/fallback rate plus Brave-reference URL/domain coverage
+- Promote only when both operational and parity evidence support it; fallback rate alone is insufficient
 
 **Estimated savings (with Phase 1 + Phase 2):**
 
@@ -140,8 +147,8 @@ outgoing:
 |---|---|---|
 | Current (Brave only) | ~87 | ~$13 |
 | + Phase 1 (cache) | ~61-70 | ~$9-10 |
-| + Phase 2 (SearXNG hardening) | ~52-61 | ~$8-9 |
-| + Phase 3 (SearXNG-first fallback) | ~15-25 | ~$2-4 |
+| + Phase 2 (hardening only; Brave still serving) | ~61-70 | ~$9.10-10.40 |
+| + Phase 3 (30-40% Brave fallback after cache) | ~18-28 | ~$2.75-4.60 |
 
 ---
 
@@ -158,10 +165,10 @@ outgoing:
 - `web_search`: "Searches the web. SearXNG is tried first; Brave is used as fallback only when SearXNG returns insufficient results. Prefer `web_fetch` when you know the URL."
 - `web_fetch`: "Fetches full page content from a URL. Free and cached. Prefer this over `web_search` when you know the URL."
 
-**4c. Query-class routing (future):**
-- Code/docs queries → route to SearXNG with GitHub/arXiv/Wikipedia engines only
-- General/current events → Brave
-- Expose a `search_class` or `category` parameter in the tool schema
+**4c. Explicit intent (implemented):**
+- `web_search` and `batch_web_search` accept explicit `general`, `current`, and `news` intents
+- Current/news apply explicit provider freshness filters; freshness is not a quality gate and no intent is inferred from query text
+- Engine-specific code/docs routing remains future work
 
 **Estimated impact:** ~30% reduction in total search volume (many searches are for pages whose URLs the model could know)
 
@@ -215,10 +222,10 @@ MCP Broker (lightweight)              Browser MCP (heavy, separate launchd)
 
 | Priority | Phase | Effort | Cost savings | Status |
 |---|---|---|---|---|
-| 1 | Phase 1: Central web cache | ~200 lines | 20-30% | Ready to build |
+| 1 | Phase 1: Central web cache | Implemented | 20-30% estimate | Complete |
 | 2 | Phase 6: Brave free tier check | 30 min research | Potentially 75%+ | Ready to verify |
 | 3 | Phase 2: SearXNG hardening | ~1 day | Reduces fallback rate | Ready to build |
-| 4 | Phase 3: SearXNG-first fallback | ~100 lines + measurement week | 60-70% | Depends on Phase 2 |
+| 4 | Phase 3: SearXNG-first fallback | Dual stack built; measurement remains | 60-70% estimate | Shadow evaluation |
 | 5 | Phase 4: Model-level optimizations | Prompt changes | ~30% volume reduction | Ready to build |
 | 6 | Phase 5: Browser MCP | ~2 days | No direct cost savings | Future, low priority |
 
