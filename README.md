@@ -173,7 +173,7 @@ per-item timeouts remain explicit.
 
 Uses Brave Images for the `brave` and `searxng+brave` stacks; the dual stack
 does not route images through SearXNG. The `searxng` stack uses SearXNG images.
-Brave Images uses `safesearch=moderate`; SearXNG uses its moderate policy. The
+Brave Images uses `safesearch=strict`; SearXNG uses its moderate policy. The
 response includes the actual backend, request attempts, safety policy, and
 estimated cost.
 

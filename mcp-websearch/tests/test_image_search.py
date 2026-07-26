@@ -268,7 +268,7 @@ async def test_brave_image_search_normalizes_results(monkeypatch, brave_stack):
     assert payload["status"] == "ok"
     assert payload["backend"] == "brave"
     assert payload["attempted"] == ["brave"]
-    assert payload["safe_search"] == "moderate"
+    assert payload["safe_search"] == "strict"
     assert payload["estimated_cost_usd"] == 0.005
     assert len(payload["results"]) == 1
     img = payload["results"][0]
@@ -295,7 +295,7 @@ async def test_brave_image_search_missing_key_returns_error(monkeypatch, brave_s
     payload = await _call_image_search({"query": "test"})
     assert payload["status"] == "error"
     assert payload["attempted"] == []
-    assert payload["safe_search"] == "moderate"
+    assert payload["safe_search"] == "strict"
     assert payload["estimated_cost_usd"] == 0.0
     assert called["network"] is False
 
