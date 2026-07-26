@@ -2382,7 +2382,7 @@ async def _brave_image_search(query: str, num_results: int, api_key: str) -> _Ba
     params = {
         "q": query,
         "count": str(fetch_count),
-        "safesearch": "strict",
+        "safesearch": "moderate",
     }
     headers = {"X-Subscription-Token": api_key, "Accept": "application/json",
                "Accept-Encoding": "identity"}
@@ -3573,7 +3573,7 @@ async def batch_web_search(
 async def image_search(query: str, num_results: int = 8) -> str:
     """Search public image metadata via Brave (default) or loopback SearXNG."""
     started = time.monotonic()
-    safe_search = "moderate" if _PROVIDER_STACK == "searxng" else "strict"
+    safe_search = "moderate"
     query = query.strip()
     requested = min(MAX_NUM_RESULTS, max(1, int(num_results)))
     if not query:
