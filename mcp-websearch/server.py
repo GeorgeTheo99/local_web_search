@@ -210,6 +210,12 @@ BatchQueries = Annotated[
 
 # Other tunables.
 FETCH_TIMEOUT = _bounded_float("WEBSEARCH_FETCH_TIMEOUT", 30.0, minimum=1.0, maximum=60.0)
+JINA_FALLBACK_ENABLED = os.environ.get("JINA_FALLBACK_ENABLED", "1").strip().lower() not in {
+    "0",
+    "false",
+    "no",
+    "off",
+}
 FETCH_MAX_REDIRECTS = _bounded_int("WEBSEARCH_FETCH_MAX_REDIRECTS", 6, minimum=0, maximum=12)
 FETCH_MAX_BYTES = _bounded_int("WEBSEARCH_FETCH_MAX_BYTES", 20 * 1024 * 1024, minimum=1024, maximum=50 * 1024 * 1024)
 PDF_MAX_PAGES = _bounded_int("WEBSEARCH_PDF_MAX_PAGES", 20, minimum=1, maximum=50)
@@ -3809,6 +3815,79 @@ def _bound_fetch_text(text: str, max_chars: int) -> str:
     return _truncate_text(text, max_chars, "\n\n... (truncated)")
 
 
+def _looks_like_antibot_page(html: str) -> bool:
+    """Detect common challenge pages without retaining or scanning full bodies."""
+    sample = html[:2000].casefold()
+    return any(
+        marker.casefold() in sample
+        for marker in (
+            "Just a moment",
+            "cf-browser-verification",
+            "Performing security verification",
+            "Human Verification",
+            "Access Denied",
+            "Pardon Our Interruption",
+            "captcha",
+        )
+    )
+
+
+async def _jina_reader_fetch(url: str, max_chars: int) -> _FetchResult:
+    """Fetch a public page through Jina Reader as a server-side fallback.
+
+    Jina receives the public URL being fetched; this is intentionally only used
+    after direct public-URL validation, never for authenticated/private traffic.
+    """
+    started = time.monotonic()
+    headers = {"Accept": "text/plain"}
+    api_key = os.environ.get("JINA_API_KEY", "").strip()
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    def failure(message: str, *, status: int | None = None) -> _FetchResult:
+        text = _fetch_error(message)
+        _record_fetch_telemetry(
+            url=url,
+            outcome="proxy_error",
+            started=started,
+            http_status=status,
+            tier_used="proxy",
+        )
+        return _FetchResult(text, text, False, 0.0, url, "")
+
+    try:
+        async with httpx.AsyncClient(timeout=30.0, trust_env=False) as client:
+            response = await client.get(f"https://r.jina.ai/{url}", headers=headers)
+        response.raise_for_status()
+        marker = "Markdown Content:"
+        if marker not in response.text:
+            return failure("Jina Reader returned an invalid response", status=response.status_code)
+        content = response.text.split(marker, 1)[1].strip()
+        if len(content) < 100 or _looks_like_antibot_page(content):
+            return failure("Jina Reader returned unusable content", status=response.status_code)
+        extracted = _bound_fetch_text(content, max_chars)
+        _record_fetch_telemetry(
+            url=url,
+            outcome="proxy_success",
+            started=started,
+            http_status=response.status_code,
+            body_bytes=len(response.content),
+            tier_used="proxy",
+        )
+        return _FetchResult(extracted, None, False, 0.0, url, "text/markdown")
+    except httpx.HTTPStatusError as exc:
+        return failure(
+            f"Jina Reader HTTP {exc.response.status_code} for {url}",
+            status=exc.response.status_code,
+        )
+    except httpx.TimeoutException as exc:
+        return failure(f"Jina Reader request failed: {exc}")
+    except httpx.RequestError as exc:
+        return failure(f"Jina Reader request failed: {exc}")
+    except Exception as exc:
+        return failure(f"Jina Reader request failed: {exc}")
+
+
 async def _web_fetch_impl(url: str, max_chars: int = 20000) -> _FetchResult:
     """Fetch and extract one URL, returning text plus internal cache metadata."""
     max_chars = min(50000, max(1, int(max_chars)))
@@ -3845,19 +3924,57 @@ async def _web_fetch_impl(url: str, max_chars: int = 20000) -> _FetchResult:
         text = _fetch_error(message)
         return _FetchResult(text, text, False, 0.0, url, "")
 
+    async def jina_success() -> _FetchResult | None:
+        if not JINA_FALLBACK_ENABLED:
+            return None
+        try:
+            result = await _jina_reader_fetch(url, max_chars)
+        except Exception as exc:
+            logger.warning("Jina Reader fallback failed (%s)", type(exc).__name__)
+            return None
+        if result.error is not None:
+            return None
+        if cache is not None:
+            try:
+                cache.put_content(
+                    url,
+                    result.text,
+                    content_type="text/markdown",
+                    final_url=url,
+                )
+            except Exception:
+                pass
+        return result
+
     try:
         current_url, body, content_type, http_status = await asyncio.wait_for(
             _fetch_public_body(url),
             timeout=FETCH_TIMEOUT,
         )
     except httpx.HTTPStatusError as exc:
+        status = exc.response.status_code
         _record_fetch_telemetry(
             url=url,
             outcome="http_error",
             started=fetch_started,
-            http_status=exc.response.status_code,
+            http_status=status,
         )
-        return failure(f"HTTP {exc.response.status_code} from {url}")
+        direct_failure = failure(f"HTTP {status} from {url}")
+        error_content_type = exc.response.headers.get("content-type", "").lower()
+        error_media_type = error_content_type.split(";", 1)[0].strip()
+        error_is_textual = (
+            "html" in error_media_type
+            or error_media_type.startswith("text/")
+            or "json" in error_media_type
+            or "xml" in error_media_type
+        )
+        if status in {403, 429} and (
+            not error_media_type or error_is_textual
+        ):
+            jina = await jina_success()
+            if jina is not None:
+                return jina
+        return direct_failure
     except httpx.TimeoutException as exc:
         _record_fetch_telemetry(url=url, outcome="timeout", started=fetch_started)
         return failure(f"request failed: {exc}")
@@ -3882,9 +3999,36 @@ async def _web_fetch_impl(url: str, max_chars: int = 20000) -> _FetchResult:
         body_bytes=len(body),
     )
 
+    # Do not send PDFs or binary responses to Jina. For a public HTML response,
+    # escalate only when the direct body is empty, tiny, or a challenge page.
+    media_type = content_type.split(";", 1)[0].strip()
+    is_pdf = "application/pdf" in content_type or body.startswith(b"%PDF-")
+    is_textual = (
+        "html" in media_type
+        or media_type.startswith("text/")
+        or "json" in media_type
+        or "xml" in media_type
+    )
+    if JINA_FALLBACK_ENABLED and not is_pdf and (not media_type or is_textual):
+        decoded_for_fallback = _decode_text_body(body, content_type)
+        is_html = "html" in media_type
+        if not body or (is_html and (
+            len(body) < 200 or _looks_like_antibot_page(decoded_for_fallback)
+        )):
+            reason = (
+                "empty response"
+                if not body
+                else "response appears to be an anti-bot page"
+            )
+            direct_failure = failure(f"{reason} from {url}")
+            jina = await jina_success()
+            if jina is not None:
+                return jina
+            return direct_failure
+
     full_extracted: str
     effective_content_type = content_type
-    if "application/pdf" in content_type or body.startswith(b"%PDF-"):
+    if is_pdf:
         effective_content_type = "application/pdf"
         try:
             async with _bounded_extraction_slot(

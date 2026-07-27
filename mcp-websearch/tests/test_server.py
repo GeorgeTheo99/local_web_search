@@ -575,6 +575,8 @@ async def test_web_fetch_cache_hit_skips_network_and_exposes_metadata(monkeypatc
 
 @pytest.mark.asyncio
 async def test_web_fetch_records_http_error_telemetry(monkeypatch):
+    monkeypatch.setattr(srv, "JINA_FALLBACK_ENABLED", False)
+
     async def failed_fetch(_url):
         request = srv.httpx.Request("GET", "https://example.com/")
         response = srv.httpx.Response(403, request=request)
