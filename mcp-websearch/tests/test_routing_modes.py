@@ -2,8 +2,7 @@
 
 Covers:
   - sensitive/no-egress: no external provider is contacted; the broker refuses
-    with a structured error because no local corpus is configured. SearXNG is
-    not used (it is not no-egress).
+    with a structured error because no local corpus is configured.
   - maximum_recall: opt-in serial escalation across every configured provider;
     results are merged and deduped.
   - normal mode (default) is unchanged.

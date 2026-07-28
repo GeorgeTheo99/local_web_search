@@ -54,7 +54,7 @@ def _single_payload(query: str, *, status: str = "ok") -> str:
             "timings_ms": {"total": 1.0, "brave": 1.0},
             "mode": "normal",
             "unresponsive_engines": [],
-            "provider_states": {"searxng": "ok"},
+            "provider_states": {"brave": "ok"},
         }
     )
 

@@ -1,24 +1,23 @@
 # Web Search Improvement Roadmap
 
 **Last updated:** 2026-07-24
-**Status:** Cache and dual-stack shadow evaluation implemented; promotion pending evidence
+**Status:** Cache implemented; Brave-only search retained after SearXNG retirement
 
 ## Current state
 
-- **Brave Search API** remains the code default ($0.005/issued request); supported stacks are `brave`, `searxng`, and `searxng+brave`
-- **SearXNG** loopback runs Bing + mwmbl + focused indexes (Wikipedia, GitHub, arXiv); dual-stack web search is in shadow evaluation and dual-stack images route only to Brave
+- **Brave Search API** is the sole search provider ($0.005/issued request); image search also uses Brave with strict SafeSearch
+- **SearXNG** was evaluated and retired: shadow comparisons showed 0% URL parity with Brave, frequent degradation, and negligible savings against the roughly $2.25/month Brave spend
 - **MCP broker** (`local_web_search/mcp-websearch/server.py`) exposes `web_search`, `batch_web_search`, `image_search`, `web_fetch`, `verify_url` over MCP (HTTP + stdio)
 - **Cost tracking** live: `estimated_cost_usd` in every search response, displayed as a badge in my-ai UI
 - **Planning estimate:** ~87 searches/day and ~$13/month at Brave-only usage; remeasure from telemetry before using this for a budget decision
 - **Informal smoke estimate:** `web_fetch` works for ~85% of sampled sites; 403s occur on anti-bot sites (Medium, Quora); browser fallback is handled by Pi's `browser_*` tools (not in broker)
 - **Private broker caching is live** for search results and fetched/extracted content; search cache keys retain only query hashes
-- **SearXNG has no Redis** — its limiter remains disabled; broker-level caching handles repeat search/fetch requests
 - Both **Pi** and **my-ai** route through the same MCP broker at `127.0.0.1:8889`
 
 ## Goals
 
 1. **Minimize Brave costs** while maintaining search accuracy
-2. **Improve SearXNG reliability** so it can serve as a free primary
+2. **Retire evaluated providers** that do not meet reliability or parity targets
 3. **Cache web content** to eliminate repeat network calls
 4. **Handle 403-blocked sites** without embedding Chromium in the broker
 5. **Keep the broker lightweight** and reliable
@@ -72,9 +71,9 @@
 
 ---
 
-### Phase 2: SearXNG hardening (free, reduces fallback rate)
+### Phase 2: SearXNG hardening (retired)
 
-**What:** Improve SearXNG reliability so more queries are served free, reducing Brave fallback volume.
+**Status:** Retired after evaluation showed frequent degradation and no meaningful cost benefit; no fallback hardening work is planned.
 
 **2a. Redis/Valkey for limiter + caching**
 - Add a Valkey sidecar (local, ~20 MB RAM)
@@ -109,11 +108,9 @@ outgoing:
 
 ---
 
-### Phase 3: SearXNG-first with Brave fallback (shadow evaluation)
+### Phase 3: SearXNG-first with Brave fallback (retired)
 
-**Status:** Dual-stack routing and `auto|on|off|shadow` gate modes are implemented.
-Shadow still serves Brave when usable; promotion requires fallback and numeric
-result/domain parity evidence from non-cached successful comparisons.
+**Status:** Retired after shadow evaluation found 0% URL parity with Brave and frequent degradation; the broker remains Brave-only.
 
 **What:** Make SearXNG the primary search provider with Brave as quality-gated fallback.
 
@@ -162,7 +159,7 @@ result/domain parity evidence from non-cached successful comparisons.
 - "Don't search for the same query twice in a conversation"
 
 **4b. Update MCP tool descriptions:**
-- `web_search`: "Searches the web. SearXNG is tried first; Brave is used as fallback only when SearXNG returns insufficient results. Prefer `web_fetch` when you know the URL."
+- `web_search`: "Searches the web with Brave. Prefer `web_fetch` when you know the URL."
 - `web_fetch`: "Fetches full page content from a URL. Free and cached. Prefer this over `web_search` when you know the URL."
 
 **4c. Explicit intent (implemented):**
@@ -187,7 +184,7 @@ result/domain parity evidence from non-cached successful comparisons.
 **Architecture:**
 ```
 MCP Broker (lightweight)              Browser MCP (heavy, separate launchd)
-├── web_search → Brave/SearXNG        ├── browser_open
+├── web_search → Brave                ├── browser_open
 ├── web_fetch → httpx + cache         ├── browser_navigate
 ├── image_search                      ├── browser_extract_text
 └── verify_url                        └── browser_screenshot
@@ -224,8 +221,8 @@ MCP Broker (lightweight)              Browser MCP (heavy, separate launchd)
 |---|---|---|---|---|
 | 1 | Phase 1: Central web cache | Implemented | 20-30% estimate | Complete |
 | 2 | Phase 6: Brave free tier check | 30 min research | Potentially 75%+ | Ready to verify |
-| 3 | Phase 2: SearXNG hardening | ~1 day | Reduces fallback rate | Ready to build |
-| 4 | Phase 3: SearXNG-first fallback | Dual stack built; measurement remains | 60-70% estimate | Shadow evaluation |
+| 3 | Phase 2: SearXNG hardening | Retired | — | Retired |
+| 4 | Phase 3: SearXNG-first fallback | Retired | — | Retired |
 | 5 | Phase 4: Model-level optimizations | Prompt changes | ~30% volume reduction | Ready to build |
 | 6 | Phase 5: Browser MCP | ~2 days | No direct cost savings | Future, low priority |
 

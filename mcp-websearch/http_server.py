@@ -9,7 +9,6 @@ Serves:
   GET  /stats  — query-free telemetry aggregates (`window=24h|7d|30d`)
 
 Configuration via environment:
-  SEARXNG_URL             default http://127.0.0.1:8888
   MCP_PORT                default 8889
   LOCAL_SEARCH_DATA_DIR   default repository data directory
   LOG_LEVEL               default INFO
@@ -28,7 +27,6 @@ from starlette.responses import PlainTextResponse
 
 from server import _get_telemetry, mcp
 
-SEARXNG_URL = os.environ.get("SEARXNG_URL", "http://127.0.0.1:8888").rstrip("/")
 MCP_BIND_HOST = "127.0.0.1"
 MCP_PORT = int(os.environ.get("MCP_PORT", "8889"))
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
@@ -38,7 +36,7 @@ logging.basicConfig(
     level=LOG_LEVEL,
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
-# httpx logs full GET URLs at INFO, including SearXNG's `q` query parameter.
+# httpx logs full GET URLs at INFO, including search query parameters.
 # Keep operational logs from retaining search text.
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)

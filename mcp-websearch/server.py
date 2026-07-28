@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Policy-aware MCP web search broker for Brave Search and local SearXNG.
+"""Policy-aware MCP web search broker for Brave Search.
 
 Tools:
   - web_search(query, num_results=8, intent="general")
   - batch_web_search(queries, num_results=8, intent="general")
-  - image_search(query, num_results=8)        Brave (default) or loopback SearXNG images
+  - image_search(query, num_results=8)
   - web_fetch(url, max_chars=20000)           direct fetch with SSRF guard
   - verify_url(url)                           direct-fetch verification
 
@@ -14,9 +14,8 @@ HTTP diagnostics:
   - GET /health  compatibility diagnostics (always HTTP 200)
   - GET /stats   query-free aggregate telemetry (24h, 7d, or 30d)
 
-Brave Search is the default raw-search provider (independent index, strong
-privacy posture, $0.005/query). SearXNG remains available as an optional
-loopback provider for image search and as an opt-in web-search stack.
+Brave Search is the sole raw-search provider (independent index, strong
+privacy posture, $0.005/query).
 
 Searches use one bounded 18-second-or-less budget, overfetch before URL dedupe,
 and return additive status/backend/fallback/timing metadata. Brave uses the
@@ -25,15 +24,12 @@ Broker Authorization credentials are intentionally separate and never treated
 as provider credentials.
 
 Key configuration:
-  SEARXNG_URL                         default http://127.0.0.1:8888
   WEBSEARCH_FETCH_MAX_BYTES           default 20 MiB
   WEBSEARCH_HTML_EXTRACT_TIMEOUT      default 8 seconds
   WEBSEARCH_PDF_MAX_PAGES             default 20
   WEBSEARCH_TOTAL_TIMEOUT             capped at 18 seconds
-  WEBSEARCH_SEARXNG_TIMEOUT           default 7 seconds
   WEBSEARCH_BRAVE_TIMEOUT             default 8 seconds
   WEBSEARCH_SEARCH_MAX_BYTES          default 2 MiB per provider response
-  WEBSEARCH_QUALITY_MIN_RESULTS       default 3
   LOCAL_SEARCH_DATA_DIR               default ../data beside this package
   LOCAL_SEARCH_TELEMETRY_ENABLED      default true
   BRAVE_API_KEY                       optional stdio/server fallback key
@@ -81,16 +77,13 @@ from telemetry import (
     InvalidWindow,
     ProviderEvent,
     SearchEvent,
-    ShadowParity,
     TelemetryStore,
     TelemetryUnavailable,
     classify_error,
-    normalize_engine_failures,
 )
 
 logger = logging.getLogger("websearch-mcp")
 
-SEARXNG_URL = os.environ.get("SEARXNG_URL", "http://127.0.0.1:8888").rstrip("/")
 BRAVE_BASE_URL = os.environ.get("BRAVE_BASE_URL", "https://api.search.brave.com").rstrip("/")
 # Brave Search API key. HTTP clients should forward it via X-Brave-Key; the
 # env var is a stdio/server-side fallback, then a mode-0600 secret file.
@@ -124,55 +117,25 @@ def _bounded_int(name: str, default: int, *, minimum: int, maximum: int) -> int:
 
 
 # Search policy and bounded latency budget. The broker stays below Pi's 20s
-# client deadline so fallback has time to complete and serialize a response.
+# client deadline and has one provider to call.
 SEARCH_TOTAL_TIMEOUT = _bounded_float("WEBSEARCH_TOTAL_TIMEOUT", 18.0, minimum=1.0, maximum=18.0)
-SEARCH_TIMEOUT = _bounded_float(
-    "WEBSEARCH_SEARXNG_TIMEOUT",
-    os.environ.get("WEBSEARCH_SEARCH_TIMEOUT", "7"),
-    minimum=0.25,
-    maximum=SEARCH_TOTAL_TIMEOUT,
-)
 BRAVE_TIMEOUT = _bounded_float(
     "WEBSEARCH_BRAVE_TIMEOUT", 8.0, minimum=0.25, maximum=SEARCH_TOTAL_TIMEOUT
 )
-# Default search routing mode (ADR 0002 Phase 5). Per-call overrides come via
-# the web_search `mode` argument. `sensitive` makes no external call (local KB
-# only or refuse; SearXNG is NOT no-egress). `maximum_recall` serially
-# escalates across all configured providers (opt-in; multiplies disclosure).
+# Default search routing mode. Per-call overrides come via the web_search
+# `mode` argument. Sensitive mode refuses because no local corpus is wired;
+# maximum_recall remains a compatible single-provider mode.
 _SEARCH_MODE = os.environ.get("WEBSEARCH_SEARCH_MODE", "normal").strip().lower()
 if _SEARCH_MODE not in {"normal", "sensitive", "maximum_recall"}:
     raise RuntimeError("WEBSEARCH_SEARCH_MODE must be normal, sensitive, or maximum_recall")
-# Provider stack selection (ADR 0002). Brave remains the default while the
-# SearXNG-first dual stack is measured in shadow mode.
-_PROVIDER_STACK = os.environ.get("WEBSEARCH_PROVIDER_STACK", "brave").strip().lower()
-if _PROVIDER_STACK not in {"brave", "searxng", "searxng+brave"}:
-    raise RuntimeError(
-        "WEBSEARCH_PROVIDER_STACK must be one of: brave, searxng, searxng+brave"
-    )
-# Quality gate (ADR 0002 Phase 3). When enabled, a nonempty primary result set
-# can still trigger fallback if it is thin, single-domain-dominated, or
-# duplicate/generic. Defaults are conservative starting points to be tuned
-# against the local smoke set.
-_QUALITY_GATE_MODE = os.environ.get("WEBSEARCH_QUALITY_GATE", "auto").strip().lower()
-if _QUALITY_GATE_MODE not in {"auto", "on", "off", "shadow"}:
-    raise RuntimeError("WEBSEARCH_QUALITY_GATE must be auto, on, off, or shadow")
-QUALITY_MIN_RESULTS = _bounded_int(
-    "WEBSEARCH_QUALITY_MIN_RESULTS", 3, minimum=1, maximum=10
-)
-QUALITY_MIN_DOMAINS = _bounded_int(
-    "WEBSEARCH_QUALITY_MIN_DOMAINS", 2, minimum=1, maximum=10
-)
-# Snippet near-duplicate threshold (Jaccard on whitespace token sets). A result
-# set is duplicate-dominated when the share of near-duplicate snippets exceeds
-# this fraction.
-QUALITY_DUPLICATE_FRACTION = _bounded_float(
-    "WEBSEARCH_QUALITY_DUPLICATE_FRACTION", 0.6, minimum=0.1, maximum=0.95
-)
+# Kept as a compatibility input for existing launchers; Brave is always used.
+if os.environ.get("WEBSEARCH_PROVIDER_STACK", "brave").strip().lower() not in {"", "brave"}:
+    logger.warning("WEBSEARCH_PROVIDER_STACK is ignored; Brave is the only provider")
+_PROVIDER_STACK = "brave"
 # Per-provider cost rates (USD per billable search request). Used for the
 # estimated_cost_usd field in search responses.
 _PROVIDER_COST_USD: dict[str, float] = {
     "brave": 0.005,
-    "searxng": 0.0,
     "none": 0.0,
 }
 MAX_NUM_RESULTS = 20
@@ -184,7 +147,6 @@ SearchIntent = Annotated[
     str,
     WithJsonSchema({"type": "string", "enum": list(SEARCH_INTENT_VALUES)}),
 ]
-_SEARXNG_TIME_RANGES = {"current": "month", "news": "day"}
 _BRAVE_FRESHNESS = {"current": "pm", "news": "pd"}
 SEARCH_RESPONSE_MAX_BYTES = _bounded_int(
     "WEBSEARCH_SEARCH_MAX_BYTES", 2 * 1024 * 1024, minimum=4096, maximum=10 * 1024 * 1024
@@ -242,11 +204,6 @@ PDFTOPPM = shutil.which("pdftoppm") or next(
 )
 SWIFT = "/usr/bin/swift" if Path("/usr/bin/swift").is_file() else None
 MACOS_VISION_OCR = Path(__file__).with_name("macos_vision_ocr.swift")
-SEARCH_MAX_RETRIES = _bounded_int("WEBSEARCH_SEARCH_MAX_RETRIES", 1, minimum=0, maximum=3)
-SEARCH_RETRY_BACKOFF = _bounded_float(
-    "WEBSEARCH_SEARCH_RETRY_BACKOFF", 0.5, minimum=0.0, maximum=5.0
-)
-
 # Circuit breaker: trip after this many consecutive failures, skip for cooldown.
 BREAKER_FAIL_THRESHOLD = _bounded_int(
     "WEBSEARCH_BREAKER_FAIL_THRESHOLD", 3, minimum=1, maximum=20
@@ -303,7 +260,7 @@ async def _public_fetch_client() -> httpx.AsyncClient:
 mcp = FastMCP(
     "websearch",
     instructions=(
-        "Web and image search plus page fetching via Brave Search (default) or an optional loopback SearXNG stack. "
+        "Web and image search plus page fetching via Brave Search. "
         "Use web_search for one focused query and batch_web_search for two or three independent query angles that can run together. "
         "Use image_search to find public image and source-page URLs without downloading image bytes. "
         "Use web_fetch to retrieve the main text and attachment links from a specific URL."
@@ -444,11 +401,8 @@ _brave_auth_state = _BraveAuthState()
 
 
 # --------------------------------------------------------------------------- #
-# Provider abstraction (ADR 0002). Raw ranked-search backends implement one
-# contract so the broker can route, gate, and fail over without naming each
-# provider inline. Module-level search functions remain the implementation
-# seam so existing tests that monkeypatch _searxng_search /
-# _searxng_request keep working unchanged.
+# Provider abstraction. The raw ranked-search contract remains small so the
+# broker and tests can use the same Brave implementation seam.
 # --------------------------------------------------------------------------- #
 
 
@@ -463,27 +417,6 @@ class SearchProvider(Protocol):
         self, query: str, num_results: int, intent: str = "general"
     ) -> Awaitable[_BackendOutcome]:
         ...
-
-
-class _SearXNGProvider:
-    """Loopback SearXNG raw-search provider."""
-
-    name = "searxng"
-    output = "raw"
-
-    @property
-    def timeout(self) -> float:
-        return SEARCH_TIMEOUT
-
-    @staticmethod
-    def search(
-        query: str, num_results: int, intent: str = "general"
-    ) -> Awaitable[_BackendOutcome]:
-        # Keep the default call shape compatible with existing integrations and
-        # test doubles while forwarding explicit freshness intent when present.
-        if intent == "general":
-            return _searxng_search(query, num_results)
-        return _searxng_search(query, num_results, intent=intent)
 
 
 class _BraveProvider:
@@ -511,14 +444,9 @@ class _BraveProvider:
         return "keyed" if _resolve_brave_key() else "none"
 
 
-# Ordered provider list for the default web-search path. The first entry is
-# the primary; the second (when present) is the policy-controlled fallback.
-# WEBSEARCH_PROVIDER_STACK selects the active stack.
+# Brave is the only active provider. The compatibility environment input above
+# is intentionally not allowed to alter this list.
 def _build_provider_stack() -> list[SearchProvider]:
-    if _PROVIDER_STACK == "searxng":
-        return [_SearXNGProvider()]
-    if _PROVIDER_STACK == "searxng+brave":
-        return [_SearXNGProvider(), _BraveProvider()]
     return [_BraveProvider()]
 
 
@@ -526,21 +454,13 @@ _PROVIDERS: list[SearchProvider] = _build_provider_stack()
 
 
 def _provider_credential_configured(name: str) -> bool:
-    """Return whether a provider's credential is resolvable (without leaking it)."""
-    if name == "searxng":
-        return True  # loopback SearXNG is keyless.
-    if name == "brave":
-        return bool(_resolve_brave_key())
-    return False
+    """Return whether a provider's credential is resolvable without leaking it."""
+    return name == "brave" and bool(_resolve_brave_key())
 
 
 def _provider_credential_usable(name: str) -> bool:
     """Return whether the current credential has no known authentication failure."""
-    if name == "searxng":
-        return True
-    if name == "brave":
-        return _brave_auth_state.usable(_resolve_brave_key())
-    return False
+    return name == "brave" and _brave_auth_state.usable(_resolve_brave_key())
 
 
 def _default_timings_ms() -> dict[str, float | None]:
@@ -549,15 +469,6 @@ def _default_timings_ms() -> dict[str, float | None]:
     for provider in _PROVIDERS:
         timings[provider.name] = None
     return timings
-
-
-@dataclass
-class _RequestOutcome:
-    data: dict[str, Any] | None
-    state: str
-    attempts: int
-    error: str | None = None
-    http_status: int | None = None
 
 
 @dataclass
@@ -783,27 +694,15 @@ def _record_search_telemetry(
     outcomes: list[_BackendOutcome | None] | None = None,
     mode: str | None = None,
     cache_hit: bool = False,
-    would_escalate: bool | None = None,
-    would_escalate_reason: str | None = None,
-    shadow_parity: ShadowParity | None = None,
 ) -> None:
     """Queue only explicitly allowlisted operational fields, never a search payload."""
     try:
         outcomes = [] if cache_hit else (outcomes or [])
         fallback_reason = None if cache_hit else fallback_reason
-        would_escalate = None if cache_hit else would_escalate
-        would_escalate_reason = None if cache_hit else would_escalate_reason
-        shadow_parity = None if cache_hit else shadow_parity
         providers = tuple(
             _provider_event(outcome)
             for outcome in outcomes
             if outcome is not None
-        )
-        searxng = next(
-            (o for o in outcomes if o is not None and o.backend == "searxng"), None
-        )
-        engine_failures = normalize_engine_failures(
-            searxng.unresponsive_engines if searxng is not None else []
         )
         _get_telemetry().record(
             SearchEvent(
@@ -815,11 +714,7 @@ def _record_search_telemetry(
                 fallback_reason=fallback_reason,
                 total_latency_ms=total_latency_ms,
                 providers=providers,
-                engine_failures=engine_failures,
                 cache_hit=cache_hit,
-                would_escalate=would_escalate,
-                would_escalate_reason=would_escalate_reason,
-                shadow_parity=shadow_parity,
             )
         )
     except Exception as exc:
@@ -851,12 +746,7 @@ def _search_cache_variant(
             "num_results": requested,
             "search_mode": mode,
             "intent": intent,
-            "provider_stack": _PROVIDER_STACK,
-            "providers": [provider.name for provider in _PROVIDERS],
-            "quality_gate": _QUALITY_GATE_MODE,
-            "quality_min_results": QUALITY_MIN_RESULTS,
-            "quality_min_domains": QUALITY_MIN_DOMAINS,
-            "quality_duplicate_fraction": QUALITY_DUPLICATE_FRACTION,
+            "provider": "brave",
         },
         sort_keys=True,
         separators=(",", ":"),
@@ -900,9 +790,6 @@ def _finish_search(
     cache_query: str | None = None,
     cache_variant: str | None = None,
     cache_news: bool = False,
-    would_escalate: bool | None = None,
-    would_escalate_reason: str | None = None,
-    shadow_parity: ShadowParity | None = None,
 ) -> str:
     total_latency_ms = float((timings_ms or {}).get("total") or 0.0)
     _record_search_telemetry(
@@ -915,9 +802,6 @@ def _finish_search(
         outcomes=outcomes,
         mode=mode,
         cache_hit=cache_hit,
-        would_escalate=would_escalate,
-        would_escalate_reason=would_escalate_reason,
-        shadow_parity=shadow_parity,
     )
     if (
         not cache_hit
@@ -978,21 +862,6 @@ def _fetch_error(message: str) -> str:
 # Result normalization + dedupe.
 # --------------------------------------------------------------------------- #
 
-def _normalize_searxng_result(r: dict) -> dict[str, Any] | None:
-    url = _public_http_url(r.get("url"))
-    if url is None:
-        return None
-    return {
-        "title": r.get("title", "Untitled"),
-        "url": url,
-        "domain": _domain(url),
-        "snippet": (r.get("content") or "").strip(),
-        "engine": r.get("engine") if isinstance(r.get("engine"), str) else "searxng",
-        "provider": "searxng",
-        "score": None,
-    }
-
-
 def _public_http_url(value: Any) -> str | None:
     """Return a syntactically public-looking HTTP(S) URL without resolving or fetching it."""
     if not isinstance(value, str):
@@ -1037,99 +906,6 @@ def _public_http_url(value: Any) -> str | None:
     except (TypeError, ValueError):
         return None
     return url
-
-
-def _first_public_http_url(r: dict[str, Any], *keys: str) -> str | None:
-    for key in keys:
-        if url := _public_http_url(r.get(key)):
-            return url
-    return None
-
-
-def _image_dimension(value: Any) -> int | None:
-    if isinstance(value, bool):
-        return None
-    try:
-        parsed = int(value)
-    except (TypeError, ValueError, OverflowError):
-        return None
-    return parsed if parsed > 0 and str(value).strip() in {str(parsed), f"{parsed}.0"} else None
-
-
-def _image_dimensions(r: dict[str, Any]) -> tuple[int | None, int | None]:
-    width = _image_dimension(r.get("width"))
-    height = _image_dimension(r.get("height"))
-    resolution = r.get("resolution")
-    if (width is None or height is None) and isinstance(resolution, str):
-        match = re.search(r"(\d+)\s*[x×]\s*(\d+)", resolution, flags=re.IGNORECASE)
-        if match:
-            width = width or _image_dimension(match.group(1))
-            height = height or _image_dimension(match.group(2))
-    return width, height
-
-
-def _image_mime_type(r: dict[str, Any]) -> str | None:
-    value = r.get("mime_type") or r.get("img_format")
-    if not isinstance(value, str):
-        return None
-    value = value.strip().lower()
-    if not value:
-        return None
-    if re.fullmatch(r"image/[a-z0-9.+-]+", value):
-        return value
-    subtype = {"jpg": "jpeg", "svg": "svg+xml", "tif": "tiff"}.get(value, value)
-    if re.fullmatch(r"[a-z0-9.+-]+", subtype):
-        return f"image/{subtype}"
-    return None
-
-
-def _image_text(r: dict[str, Any], *keys: str) -> str:
-    for key in keys:
-        value = r.get(key)
-        if isinstance(value, str) and value.strip():
-            return value.strip()
-        if key in {"license", "creator"} and isinstance(value, dict):
-            name = value.get("name")
-            if isinstance(name, str) and name.strip():
-                return name.strip()
-    return ""
-
-
-_MODERATE_SAFESEARCH_IMAGE_ENGINES = frozenset({"duckduckgo images", "google images"})
-
-
-def _normalize_searxng_image_result(r: dict[str, Any]) -> dict[str, Any] | None:
-    image_url = _first_public_http_url(r, "img_src", "image_url", "image")
-    if image_url is None:
-        return None
-    page_url = _first_public_http_url(r, "url", "page_url")
-    width, height = _image_dimensions(r)
-    engine = _image_text(r, "engine")
-    if not engine and isinstance(r.get("engines"), (list, tuple)):
-        engine = next(
-            (item.strip() for item in r["engines"] if isinstance(item, str) and item.strip()),
-            "",
-        )
-    engine = engine.lower()
-    if engine not in _MODERATE_SAFESEARCH_IMAGE_ENGINES:
-        return None
-    source = _image_text(r, "source") or (_domain(page_url) if page_url else "")
-    return {
-        "title": _image_text(r, "title") or "Untitled",
-        "image_url": image_url,
-        "thumbnail_url": _first_public_http_url(
-            r, "thumbnail_src", "thumbnail_url", "thumbnail"
-        ),
-        "page_url": page_url,
-        "source": source,
-        "engine": engine or "searxng",
-        "width": width,
-        "height": height,
-        "mime_type": _image_mime_type(r),
-        "creator": _image_text(r, "creator", "author"),
-        "license": _image_text(r, "license", "license_name"),
-        "license_url": _public_http_url(r.get("license_url")),
-    }
 
 
 def _normalize_brave_result(r: dict) -> dict[str, Any] | None:
@@ -1236,72 +1012,10 @@ def _dedupe_and_rank(results: list[dict[str, Any]], num_results: int) -> list[di
     return unique
 
 
-_SEARXNG_GENERAL_WEB_ENGINES = frozenset({"bing", "mwmbl"})
-
-
-def _compute_shadow_parity(
-    primary: _BackendOutcome,
-    reference: _BackendOutcome,
-    requested: int,
-) -> ShadowParity | None:
-    """Compare deduped top-k results without retaining any identifiers."""
-    if (
-        primary.backend != "searxng"
-        or reference.backend != "brave"
-        or not primary.ok
-        or not reference.ok
-    ):
-        return None
-    top_k = min(5, max(0, int(requested)))
-    primary_results = _dedupe_and_rank(primary.results, top_k) if top_k else []
-    reference_results = _dedupe_and_rank(reference.results, top_k) if top_k else []
-
-    primary_urls = {
-        _canonical_result_url(str(result.get("url") or ""))
-        for result in primary_results
-    }
-    reference_urls = {
-        _canonical_result_url(str(result.get("url") or ""))
-        for result in reference_results
-    }
-
-    def result_domain(result: dict[str, Any]) -> str:
-        return _domain(str(result.get("url") or ""))
-
-    primary_domain_list = [
-        domain for result in primary_results if (domain := result_domain(result))
-    ]
-    reference_domain_list = [
-        domain for result in reference_results if (domain := result_domain(result))
-    ]
-    primary_domains = set(primary_domain_list)
-    reference_domains = set(reference_domain_list)
-    reference_top_domain = reference_domain_list[0] if reference_domain_list else None
-    primary_general_web_count = sum(
-        1
-        for result in primary_results
-        if str(result.get("engine") or "").strip().lower()
-        in _SEARXNG_GENERAL_WEB_ENGINES
-    )
-    return ShadowParity(
-        top_k=top_k,
-        primary_result_count=len(primary_results),
-        reference_result_count=len(reference_results),
-        canonical_url_overlap_count=len(primary_urls & reference_urls),
-        primary_distinct_domain_count=len(primary_domains),
-        reference_distinct_domain_count=len(reference_domains),
-        domain_overlap_count=len(primary_domains & reference_domains),
-        reference_top_domain_in_primary=int(
-            reference_top_domain is not None and reference_top_domain in primary_domains
-        ),
-        primary_general_web_result_count=primary_general_web_count,
-    )
-
-
 def _dedupe_and_rank_images(
     results: list[dict[str, Any]], num_results: int
 ) -> list[dict[str, Any]]:
-    """Dedupe canonical image URLs before truncation while preserving SearXNG order."""
+    """Dedupe canonical image URLs before truncation while preserving provider order."""
     seen: set[str] = set()
     unique: list[dict[str, Any]] = []
     for result in results:
@@ -1315,31 +1029,6 @@ def _dedupe_and_rank_images(
     for index, result in enumerate(unique, 1):
         result["rank"] = index
     return unique
-
-
-def _merge_with_secondary_reserve(
-    primary: list[dict[str, Any]],
-    secondary: list[dict[str, Any]],
-    requested: int,
-) -> list[dict[str, Any]]:
-    """Keep primary ordering while reserving result slots for a fallback provider."""
-    primary_unique = _dedupe_and_rank(primary, MAX_NUM_RESULTS)
-    primary_keys = {_canonical_result_url(str(item.get("url") or "")) for item in primary_unique}
-    secondary_unique = [
-        item for item in _dedupe_and_rank(secondary, MAX_NUM_RESULTS)
-        if _canonical_result_url(str(item.get("url") or "")) not in primary_keys
-    ]
-    if not secondary_unique:
-        return _dedupe_and_rank(primary_unique, requested)
-    reserve = min(len(secondary_unique), max(1, requested // 3))
-    primary_limit = max(0, requested - reserve)
-    candidates = [
-        *primary_unique[:primary_limit],
-        *secondary_unique[:reserve],
-        *primary_unique[primary_limit:],
-        *secondary_unique[reserve:],
-    ]
-    return _dedupe_and_rank(candidates, requested)
 
 
 def _format_results(
@@ -1886,16 +1575,8 @@ def _resolve_brave_key() -> str:
 
 
 # --------------------------------------------------------------------------- #
-# Backend: SearXNG.
+# Backend: Brave Search. Independent index; raw ranked results.
 # --------------------------------------------------------------------------- #
-
-def _coerce_request_outcome(value: Any) -> _RequestOutcome:
-    """Accept legacy test doubles that return dict/None as well as new outcomes."""
-    if isinstance(value, _RequestOutcome):
-        return value
-    if isinstance(value, dict):
-        return _RequestOutcome(value, "ok", 1)
-    return _RequestOutcome(None, "error", 1, "request failed")
 
 
 async def _limited_json_object(response: httpx.Response, *, provider: str) -> dict[str, Any]:
@@ -1917,269 +1598,9 @@ async def _limited_json_object(response: httpx.Response, *, provider: str) -> di
     return data
 
 
-def _searxng_url_is_loopback() -> bool:
-    try:
-        parsed = urllib.parse.urlsplit(SEARXNG_URL)
-        host = parsed.hostname or ""
-        if parsed.scheme.lower() not in {"http", "https"} or not host:
-            return False
-        if parsed.username is not None or parsed.password is not None:
-            return False
-        _ = parsed.port
-        return host.lower().rstrip(".") == "localhost" or ipaddress.ip_address(host).is_loopback
-    except ValueError:
-        return False
-
-
-async def _searxng_request(
-    path: str, params: dict, timeout: float | None = None
-) -> _RequestOutcome:
-    """GET SearXNG within one stage deadline, retrying only transient failures."""
-    budget = SEARCH_TIMEOUT if timeout is None else max(0.05, timeout)
-    deadline = time.monotonic() + budget
-    qs = urllib.parse.urlencode(params)
-    url = f"{SEARXNG_URL}{path}?{qs}"
-    client = await _client()
-    last_state = "error"
-    last_error = "request failed"
-    last_http_status: int | None = None
-    attempts = 0
-
-    for attempt in range(SEARCH_MAX_RETRIES + 1):
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            return _RequestOutcome(None, "timeout", attempts, "stage deadline exceeded")
-        attempts = attempt + 1
-        retryable = True
-        try:
-            async with client.stream(
-                "GET",
-                url,
-                headers={"Accept": "application/json", "Accept-Encoding": "identity"},
-                timeout=remaining,
-            ) as response:
-                response.raise_for_status()
-                data = await _limited_json_object(response, provider="SearXNG")
-                return _RequestOutcome(data, "ok", attempts, http_status=response.status_code)
-        except httpx.TimeoutException:
-            last_state = "timeout"
-            last_error = "request timed out"
-            logger.warning("SearXNG timed out (attempt %d)", attempts)
-        except httpx.ConnectError:
-            last_state = "error"
-            last_error = "connection failed"
-            logger.warning("SearXNG connection failed (attempt %d)", attempts)
-        except httpx.HTTPStatusError as exc:
-            status_code = exc.response.status_code
-            last_http_status = status_code
-            retryable = status_code in {408, 425, 429} or status_code >= 500
-            last_state = "error"
-            last_error = f"HTTP {status_code}"
-            logger.warning("SearXNG HTTP %d (attempt %d)", status_code, attempts)
-        except Exception as exc:
-            last_state = "error"
-            last_error = type(exc).__name__
-            logger.warning("SearXNG request failed (attempt %d): %s", attempts, type(exc).__name__)
-
-        if attempt >= SEARCH_MAX_RETRIES or not retryable:
-            break
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            last_state = "timeout"
-            last_error = "stage deadline exceeded"
-            break
-        await asyncio.sleep(min(SEARCH_RETRY_BACKOFF, remaining))
-
-    return _RequestOutcome(None, last_state, attempts, last_error, last_http_status)
-
-
-async def _searxng_search(
-    query: str, num_results: int, intent: str = "general"
-) -> _BackendOutcome:
-    started = time.monotonic()
-    circuit_before = _breaker.snapshot("searxng")
-    if not _searxng_url_is_loopback():
-        return _BackendOutcome(
-            backend="searxng",
-            state="error",
-            elapsed_ms=round((time.monotonic() - started) * 1000, 1),
-            error="SearXNG URL is not loopback",
-            circuit_before=str(circuit_before["state"]),
-            circuit_after=str(circuit_before["state"]),
-            circuit_failures=int(circuit_before["consecutive_failures"]),
-        )
-    if not _breaker.allow("searxng"):
-        logger.info("SearXNG circuit open; skipping")
-        circuit_after = _breaker.snapshot("searxng")
-        return _BackendOutcome(
-            backend="searxng",
-            state="circuit_open",
-            elapsed_ms=round((time.monotonic() - started) * 1000, 1),
-            circuit_before=str(circuit_before["state"]),
-            circuit_after=str(circuit_after["state"]),
-            circuit_failures=int(circuit_after["consecutive_failures"]),
-        )
-
-    params = {"q": query, "format": "json", "categories": "general"}
-    if time_range := _SEARXNG_TIME_RANGES.get(intent):
-        params["time_range"] = time_range
-    try:
-        raw_outcome = await _searxng_request("/search", params)
-    except asyncio.CancelledError:
-        _breaker.record_aborted("searxng")
-        raise
-
-    request = _coerce_request_outcome(raw_outcome)
-    elapsed_ms = round((time.monotonic() - started) * 1000, 1)
-    if request.data is None:
-        circuit_transition = _breaker.record_failure("searxng")
-        circuit_after = _breaker.snapshot("searxng")
-        return _BackendOutcome(
-            backend="searxng",
-            state=request.state,
-            elapsed_ms=elapsed_ms,
-            attempts=request.attempts,
-            error=request.error,
-            http_status=request.http_status,
-            circuit_before=str(circuit_before["state"]),
-            circuit_after=str(circuit_after["state"]),
-            circuit_transition=circuit_transition,
-            circuit_failures=int(circuit_after["consecutive_failures"]),
-        )
-
-    circuit_transition = _breaker.record_success("searxng")
-    circuit_after = _breaker.snapshot("searxng")
-    raw_results = request.data.get("results", [])
-    if not isinstance(raw_results, list):
-        raw_results = []
-    results = [
-        normalized
-        for item in raw_results[:num_results]
-        if isinstance(item, dict)
-        and (normalized := _normalize_searxng_result(item)) is not None
-    ]
-    suggestions = request.data.get("suggestions", [])
-    if not isinstance(suggestions, list):
-        suggestions = []
-    unresponsive = request.data.get("unresponsive_engines", [])
-    if not isinstance(unresponsive, list):
-        unresponsive = []
-    # Empty takes precedence over engine degradation so routing reports the
-    # primary failure as searxng_empty rather than the less useful degraded.
-    state = "empty" if not results else ("degraded" if unresponsive else "ok")
-    return _BackendOutcome(
-        backend="searxng",
-        results=results,
-        suggestions=[str(item) for item in suggestions],
-        ok=True,
-        state=state,
-        elapsed_ms=elapsed_ms,
-        attempts=request.attempts,
-        unresponsive_engines=unresponsive,
-        http_status=request.http_status,
-        circuit_before=str(circuit_before["state"]),
-        circuit_after=str(circuit_after["state"]),
-        circuit_transition=circuit_transition,
-        circuit_failures=int(circuit_after["consecutive_failures"]),
-    )
-
-
-async def _searxng_image_search(query: str, num_results: int) -> _BackendOutcome:
-    """Search images through loopback SearXNG only and normalize URL metadata."""
-    started = time.monotonic()
-    circuit_before = _breaker.snapshot("searxng")
-    if not _searxng_url_is_loopback():
-        return _BackendOutcome(
-            backend="searxng",
-            state="error",
-            elapsed_ms=round((time.monotonic() - started) * 1000, 1),
-            error="SearXNG URL is not loopback",
-            circuit_before=str(circuit_before["state"]),
-            circuit_after=str(circuit_before["state"]),
-            circuit_failures=int(circuit_before["consecutive_failures"]),
-        )
-    if not _breaker.allow("searxng"):
-        logger.info("SearXNG circuit open; skipping image search")
-        circuit_after = _breaker.snapshot("searxng")
-        return _BackendOutcome(
-            backend="searxng",
-            state="circuit_open",
-            elapsed_ms=round((time.monotonic() - started) * 1000, 1),
-            circuit_before=str(circuit_before["state"]),
-            circuit_after=str(circuit_after["state"]),
-            circuit_failures=int(circuit_after["consecutive_failures"]),
-        )
-
-    try:
-        raw_outcome = await _searxng_request(
-            "/search",
-            {"q": query, "format": "json", "categories": "images", "safesearch": 1},
-        )
-    except asyncio.CancelledError:
-        _breaker.record_aborted("searxng")
-        raise
-
-    request = _coerce_request_outcome(raw_outcome)
-    elapsed_ms = round((time.monotonic() - started) * 1000, 1)
-    if request.data is None:
-        circuit_transition = _breaker.record_failure("searxng")
-        circuit_after = _breaker.snapshot("searxng")
-        return _BackendOutcome(
-            backend="searxng",
-            state=request.state,
-            elapsed_ms=elapsed_ms,
-            attempts=request.attempts,
-            error=request.error,
-            http_status=request.http_status,
-            circuit_before=str(circuit_before["state"]),
-            circuit_after=str(circuit_after["state"]),
-            circuit_transition=circuit_transition,
-            circuit_failures=int(circuit_after["consecutive_failures"]),
-        )
-
-    circuit_transition = _breaker.record_success("searxng")
-    circuit_after = _breaker.snapshot("searxng")
-    raw_results = request.data.get("results", [])
-    if not isinstance(raw_results, list):
-        raw_results = []
-    results = [
-        normalized
-        for item in raw_results[:num_results]
-        if isinstance(item, dict)
-        and (normalized := _normalize_searxng_image_result(item)) is not None
-    ]
-    suggestions = request.data.get("suggestions", [])
-    if not isinstance(suggestions, list):
-        suggestions = []
-    unresponsive = request.data.get("unresponsive_engines", [])
-    if not isinstance(unresponsive, list):
-        unresponsive = []
-    state = "degraded" if unresponsive else ("ok" if results else "empty")
-    return _BackendOutcome(
-        backend="searxng",
-        results=results,
-        suggestions=[str(item) for item in suggestions],
-        ok=True,
-        state=state,
-        elapsed_ms=elapsed_ms,
-        attempts=request.attempts,
-        unresponsive_engines=unresponsive,
-        http_status=request.http_status,
-        circuit_before=str(circuit_before["state"]),
-        circuit_after=str(circuit_after["state"]),
-        circuit_transition=circuit_transition,
-        circuit_failures=int(circuit_after["consecutive_failures"]),
-    )
-
-
-# --------------------------------------------------------------------------- #
-# Backend: Brave Search (ADR 0002). Independent index; raw ranked results.
-# --------------------------------------------------------------------------- #
-
-
 def _brave_search_url() -> str:
     """Return the configured Brave search endpoint only when credentials can
-    be sent safely. Mirrors the SearXNG credential-free-origin guard.
+    be sent safely.
     """
     parsed = urllib.parse.urlsplit(BRAVE_BASE_URL)
     try:
@@ -2471,64 +1892,14 @@ async def _brave_image_search(query: str, num_results: int, api_key: str) -> _Ba
     )
 # --------------------------------------------------------------------------- #
 
-async def _probe_searxng() -> dict[str, Any]:
-    started = time.monotonic()
-    if not _searxng_url_is_loopback():
-        return {
-            "reachable": False,
-            "error": "SearXNG URL is not loopback",
-            "latency_ms": round((time.monotonic() - started) * 1000, 1),
-        }
-    try:
-        client = await _client()
-        resp = await client.get(f"{SEARXNG_URL}/healthz", timeout=3.0)
-        return {
-            "reachable": resp.status_code == 200,
-            "status_code": resp.status_code,
-            "latency_ms": round((time.monotonic() - started) * 1000, 1),
-        }
-    except Exception as e:
-        return {
-            "reachable": False,
-            "error": str(e),
-            "latency_ms": round((time.monotonic() - started) * 1000, 1),
-        }
-
-
 async def _health_payload() -> dict[str, Any]:
-    searxng = await _probe_searxng()
-    searxng_breaker = _breaker.snapshot("searxng")
     last_search = _last_search or {}
     provider_states = last_search.get("provider_states", {})
-    searxng_available = (
-        bool(searxng.get("reachable"))
-        and searxng_breaker["state"] != "open"
+    brave_breaker = _breaker.snapshot("brave")
+    ready = (
+        brave_breaker["state"] != "open"
+        and _provider_credential_usable("brave")
     )
-    # Shadow evaluates SearXNG against Brave on every uncached search, so both
-    # legs must be usable for the active policy to be ready. Other modes remain
-    # provider-neutral: any usable provider in the active stack is sufficient.
-    if _PROVIDER_STACK == "searxng+brave" and _QUALITY_GATE_MODE == "shadow":
-        stack_available = (
-            searxng_available
-            and _breaker.snapshot("brave")["state"] != "open"
-            and _provider_credential_usable("brave")
-        )
-    else:
-        stack_available = False
-        for p in _PROVIDERS:
-            breaker = _breaker.snapshot(p.name)
-            if breaker["state"] == "open":
-                continue
-            if p.name == "searxng":
-                if searxng_available:
-                    stack_available = True
-                    break
-            elif _provider_credential_usable(p.name):
-                stack_available = True
-                break
-    # A healthy diagnostic SearXNG instance must not make an unrelated active
-    # stack ready. Only providers selected by WEBSEARCH_PROVIDER_STACK count.
-    ready = stack_available
     last_status = last_search.get("status")
     if ready and last_status not in {"degraded", "error"}:
         status = "ok"
@@ -2542,27 +1913,18 @@ async def _health_payload() -> dict[str, Any]:
         "service": "mcp-websearch",
         "policy": {
             "total_timeout_s": SEARCH_TOTAL_TIMEOUT,
-            "searxng_timeout_s": SEARCH_TIMEOUT,
-            "quality_min_results": QUALITY_MIN_RESULTS,
+            "brave_timeout_s": BRAVE_TIMEOUT,
         },
-        "searxng_url": SEARXNG_URL,
-        "searxng": {
-            **searxng,
-            "available": searxng_available,
-            "last_state": provider_states.get("searxng"),
-            "circuit": searxng_breaker,
-        },
-        "provider_stack": _PROVIDER_STACK,
+        "provider_stack": "brave",
         "providers": [
             {
-                "name": p.name,
-                "output": p.output,
-                "timeout_s": p.timeout,
-                "credential_configured": _provider_credential_configured(p.name),
-                "circuit": _breaker.snapshot(p.name),
-                "last_state": (_last_search or {}).get("provider_states", {}).get(p.name),
+                "name": "brave",
+                "output": "raw",
+                "timeout_s": BRAVE_TIMEOUT,
+                "credential_configured": _provider_credential_configured("brave"),
+                "circuit": brave_breaker,
+                "last_state": provider_states.get("brave"),
             }
-            for p in _PROVIDERS
         ],
         "telemetry": _get_telemetry().status(),
         "last_search": _last_search,
@@ -2618,20 +1980,9 @@ async def stats(request: Request) -> JSONResponse:
 # --------------------------------------------------------------------------- #
 
 def _coerce_backend_outcome(value: Any, backend: str, elapsed_ms: float) -> _BackendOutcome:
-    """Accept legacy tuple-shaped test doubles during the contract transition."""
+    """Normalize a provider result and preserve the backend timing."""
     if isinstance(value, _BackendOutcome):
         return value
-    if backend == "searxng" and isinstance(value, tuple) and len(value) == 4:
-        results, suggestions, ok, unresponsive = value
-        return _BackendOutcome(
-            backend=backend,
-            results=results,
-            suggestions=suggestions,
-            ok=bool(ok),
-            state="ok" if results else ("empty" if ok else "error"),
-            elapsed_ms=elapsed_ms,
-            unresponsive_engines=unresponsive,
-        )
     return _BackendOutcome(backend=backend, state="error", elapsed_ms=elapsed_ms)
 
 
@@ -2675,68 +2026,6 @@ async def _run_backend(backend: str, awaitable: Any, timeout: float) -> _Backend
         backend,
         round((time.monotonic() - started) * 1000, 1),
     )
-
-
-def _snippet_jaccard(a: str, b: str) -> float:
-    """Whitespace-token Jaccard similarity; transient, never persisted."""
-    ta = set(a.lower().split())
-    tb = set(b.lower().split())
-    if not ta and not tb:
-        return 1.0
-    if not ta or not tb:
-        return 0.0
-    return len(ta & tb) / len(ta | tb)
-
-
-def _quality_gate(
-    candidates: list[dict[str, Any]],
-    *,
-    unresponsive_engines: list[Any] | None = None,
-) -> tuple[bool, str | None]:
-    """Evaluate the primary provider's deduped candidates in memory.
-
-    Returns (passed, reason). A None reason means the gate passed. The reason
-    is a query-free label safe for telemetry. No snippet/title text is ever
-    persisted; only transient similarity counts are computed here.
-    """
-    if not candidates:
-        return True, None  # emptiness is handled by the existing fallback rules.
-
-    # Bing is the broker-critical general-web index. Normalize untrusted engine
-    # failure data before checking it so no raw error or query text is retained.
-    failed_engines = {
-        engine for engine, _reason in normalize_engine_failures(unresponsive_engines or [])
-    }
-    if "bing" in failed_engines:
-        return False, "quality_critical_engine_unavailable"
-
-    if len(candidates) < QUALITY_MIN_RESULTS:
-        return False, "quality_below_min_results"
-
-    domains = {item.get("domain") for item in candidates if item.get("domain")}
-    if len(domains) < QUALITY_MIN_DOMAINS:
-        return False, "quality_low_domain_diversity"
-
-    # Duplicate/generic detection: near-identical snippets dominating the set.
-    snippets = [(item.get("snippet") or "").strip() for item in candidates]
-    snippets = [s for s in snippets if s]
-    if len(snippets) >= 2:
-        near_dup_pairs = 0
-        total_pairs = 0
-        for i in range(len(snippets)):
-            for j in range(i + 1, len(snippets)):
-                total_pairs += 1
-                if _snippet_jaccard(snippets[i], snippets[j]) >= 0.8:
-                    near_dup_pairs += 1
-        if total_pairs and near_dup_pairs / total_pairs >= QUALITY_DUPLICATE_FRACTION:
-            return False, "quality_duplicate_dominated"
-
-    return True, None
-
-
-def _quality_gate_enabled() -> bool:
-    """Enable quality fallback only when the active stack has a secondary."""
-    return len(_PROVIDERS) > 1 and _QUALITY_GATE_MODE in {"auto", "on"}
 
 
 def _fallback_reason(outcome: _BackendOutcome) -> str:
@@ -2856,10 +2145,9 @@ async def _web_search_impl(
             mode=effective_mode,
         )
 
-    # Sensitive / no-egress mode (ADR 0002 Phase 5): make no external call.
-    # SearXNG is not no-egress (upstream engines see the household IP), so it is
-    # not used here. A local KB/corpus index is not yet wired, so we refuse with
-    # a structured error rather than leak the query to any provider.
+    # Sensitive / no-egress mode makes no external call. A local KB/corpus
+    # index is not yet wired, so refuse with a structured error rather than
+    # leak the query to any provider.
     if effective_mode == "sensitive":
         timings_ms = _default_timings_ms()
         timings_ms["total"] = round((time.monotonic() - started) * 1000, 1)
@@ -2947,333 +2235,12 @@ async def _web_search_impl(
             )
 
     candidate_limit = min(MAX_NUM_RESULTS, requested * RESULT_OVERFETCH_FACTOR)
-
-    # Maximum-recall mode (ADR 0002 Phase 5): opt-in serial escalation across
-    # every configured provider. Multiplies disclosure, so it is never the
-    # default. Results are merged and deduped; a generated answer is surfaced
-    # separately. This path bypasses the quality gate by design.
-    if effective_mode == "maximum_recall" and len(_PROVIDERS) >= 1:
-        outcomes: list[_BackendOutcome] = []
-        merged: list[dict[str, Any]] = []
-        answer_mr: str | None = None
-        citations_mr: list[str] = []
-        provider_states_mr: dict[str, str] = {}
-        for provider in _PROVIDERS:
-            remaining = SEARCH_TOTAL_TIMEOUT - (time.monotonic() - started)
-            if remaining <= 0:
-                circuit = _breaker.snapshot(provider.name)
-                outcomes.append(_BackendOutcome(
-                    backend=provider.name, state="timeout",
-                    error="total deadline exceeded",
-                    circuit_before=str(circuit["state"]),
-                    circuit_after=str(circuit["state"]),
-                    circuit_failures=int(circuit["consecutive_failures"]),
-                ))
-            else:
-                outcome = await _run_backend(
-                    provider.name,
-                    _provider_search(
-                        provider, query, candidate_limit, effective_intent
-                    ),
-                    min(provider.timeout, remaining),
-                )
-                outcomes.append(outcome)
-            last = outcomes[-1]
-            provider_states_mr[last.backend] = last.state
-            merged.extend(last.results)
-            if last.answer and not answer_mr:
-                answer_mr = last.answer
-            if last.citations and not citations_mr:
-                citations_mr = last.citations
-        results = _dedupe_and_rank(merged, requested)
-        attempted_mr = _attempted_providers(outcomes)
-        timings_ms = _timings(started, outcomes)
-        backend = _result_backend(results)
-        fallback_reason_mr: str | None = None
-        if results or answer_mr:
-            status = "ok" if any(o.ok for o in outcomes) else "degraded"
-            rendered = _format_results(
-                query, results, [],
-                status=status, backend=backend, attempted=attempted_mr,
-                timings_ms=timings_ms, provider_states=provider_states_mr,
-                answer=answer_mr, citations=citations_mr or None,
-                mode=effective_mode, search_mode=effective_mode,
-            )
-        elif any(o.ok for o in outcomes):
-            status = "empty"
-            backend = "none"
-            rendered = _format_results(
-                query, [], [], status=status, backend=backend, attempted=attempted_mr,
-                timings_ms=timings_ms, provider_states=provider_states_mr,
-                mode=effective_mode, search_mode=effective_mode,
-            )
-        else:
-            status = "error"
-            backend = "none"
-            failed = next(
-                (outcome for outcome in reversed(outcomes) if not outcome.ok),
-                outcomes[-1],
-            )
-            fallback_reason_mr = _fallback_reason(failed)
-            rendered = _search_error_payload(
-                query,
-                "Search error: all configured providers failed.",
-                attempted=attempted_mr,
-                fallback_reason=fallback_reason_mr,
-                timings_ms=timings_ms,
-                provider_states=provider_states_mr,
-                mode=effective_mode,
-                search_mode=effective_mode,
-            )
-        return _finish_search(
-            rendered, status=status, backend=backend, requested_count=requested,
-            result_count=len(results), fallback_reason=fallback_reason_mr,
-            timings_ms=timings_ms, outcomes=outcomes, mode=effective_mode,
-            cache_query=query, cache_variant=cache_variant,
-            cache_news=effective_intent in {"current", "news"},
-        )
-
-    primary = _PROVIDERS[0]
-    fallback = _PROVIDERS[1] if len(_PROVIDERS) > 1 else None
-    primary_outcome = await _run_backend(
-        primary.name,
-        _provider_search(primary, query, candidate_limit, effective_intent),
-        min(primary.timeout, SEARCH_TOTAL_TIMEOUT),
-    )
-    attempted = _attempted_providers([primary_outcome])
-    primary_candidates = _dedupe_and_rank(primary_outcome.results, candidate_limit)
-    provider_states = {primary.name: primary_outcome.state}
-    shadow_mode = fallback is not None and _QUALITY_GATE_MODE == "shadow"
-    policy_triggers_fallback = fallback is not None and (
-        not primary_outcome.ok or not primary_candidates
-    )
-    # Quality gate (ADR 0002 Phase 3): only evaluated when the policy rules did
-    # not already trigger fallback, and only on a nonempty, reachable primary.
-    # The gate is transient and query-free; it never persists snippets/titles.
-    quality_reason: str | None = None
-    if not policy_triggers_fallback and fallback is not None and primary_outcome.ok:
-        if _quality_gate_enabled() or shadow_mode:
-            passed, quality_reason = _quality_gate(
-                primary_candidates,
-                unresponsive_engines=primary_outcome.unresponsive_engines,
-            )
-            if passed:
-                quality_reason = None
-    should_use_fallback = policy_triggers_fallback or quality_reason is not None
-
-    if shadow_mode:
-        shadow_reason = quality_reason if quality_reason is not None else (
-            _fallback_reason(primary_outcome)
-            if policy_triggers_fallback else None
-        )
-        logger.info(
-            "Quality shadow primary_state=%s result_count=%d "
-            "would_escalate=%s reason=%s",
-            primary_outcome.state,
-            len(primary_candidates),
-            should_use_fallback,
-            shadow_reason or "none",
-        )
-        remaining = SEARCH_TOTAL_TIMEOUT - (time.monotonic() - started)
-        if remaining <= 0:
-            circuit = _breaker.snapshot(fallback.name)
-            shadow_outcome = _BackendOutcome(
-                backend=fallback.name,
-                state="timeout",
-                error="total deadline exceeded",
-                circuit_before=str(circuit["state"]),
-                circuit_after=str(circuit["state"]),
-                circuit_failures=int(circuit["consecutive_failures"]),
-            )
-        else:
-            shadow_outcome = await _run_backend(
-                fallback.name,
-                _provider_search(
-                    fallback, query, candidate_limit, effective_intent
-                ),
-                min(fallback.timeout, remaining),
-            )
-        provider_states[fallback.name] = shadow_outcome.state
-        outcomes_shadow = [primary_outcome, shadow_outcome]
-        shadow_parity = _compute_shadow_parity(
-            primary_outcome, shadow_outcome, requested
-        )
-        attempted = _attempted_providers(outcomes_shadow)
-        results = _dedupe_and_rank(shadow_outcome.results, requested)
-        backend = _result_backend(results)
-        timings_ms = _timings(started, outcomes_shadow)
-        serving_fallback_reason: str | None = None
-        reference_usable = bool(results or shadow_outcome.answer)
-        if reference_usable:
-            status = "degraded" if shadow_outcome.state == "degraded" else "ok"
-            rendered = _format_results(
-                query,
-                results,
-                shadow_outcome.suggestions,
-                status=status,
-                backend=backend,
-                attempted=attempted,
-                timings_ms=timings_ms,
-                unresponsive_engines=primary_outcome.unresponsive_engines,
-                provider_states=provider_states,
-                answer=shadow_outcome.answer or None,
-                citations=shadow_outcome.citations or None,
-                mode=effective_mode,
-                search_mode=effective_mode,
-            )
-        elif primary_candidates:
-            # Brave is the serving provider in shadow mode, but SearXNG is a
-            # safe degraded fallback when Brave is unusable for this request.
-            serving_fallback_reason = _fallback_reason(shadow_outcome)
-            results = _dedupe_and_rank(primary_candidates, requested)
-            backend = _result_backend(results)
-            status = "degraded"
-            rendered = _format_results(
-                query,
-                results,
-                primary_outcome.suggestions,
-                status=status,
-                backend=backend,
-                attempted=attempted,
-                fallback_reason=serving_fallback_reason,
-                timings_ms=timings_ms,
-                unresponsive_engines=primary_outcome.unresponsive_engines,
-                provider_states=provider_states,
-                mode=effective_mode,
-                search_mode=effective_mode,
-            )
-        elif shadow_outcome.ok:
-            serving_fallback_reason = _fallback_reason(shadow_outcome)
-            status = "degraded" if shadow_outcome.state == "degraded" else "empty"
-            backend = "none"
-            rendered = _format_results(
-                query,
-                [],
-                shadow_outcome.suggestions,
-                status=status,
-                backend=backend,
-                attempted=attempted,
-                fallback_reason=serving_fallback_reason,
-                timings_ms=timings_ms,
-                unresponsive_engines=primary_outcome.unresponsive_engines,
-                provider_states=provider_states,
-                mode=effective_mode,
-                search_mode=effective_mode,
-            )
-        else:
-            serving_fallback_reason = _fallback_reason(shadow_outcome)
-            status = "error"
-            backend = "none"
-            rendered = _search_error_payload(
-                query,
-                f"Search error: {fallback.name} search failed in shadow mode.",
-                shadow_outcome.suggestions,
-                attempted=attempted,
-                fallback_reason=serving_fallback_reason,
-                timings_ms=timings_ms,
-                unresponsive_engines=primary_outcome.unresponsive_engines,
-                provider_states=provider_states,
-                mode=effective_mode,
-                search_mode=effective_mode,
-            )
-        return _finish_search(
-            rendered,
-            status=status,
-            backend=backend,
-            requested_count=requested,
-            result_count=len(results),
-            fallback_reason=serving_fallback_reason,
-            timings_ms=timings_ms,
-            outcomes=outcomes_shadow,
-            mode=effective_mode,
-            # Emergency SearXNG serving must not mask Brave recovery on a
-            # later call. Ordinary usable Brave shadow responses remain cached.
-            cache_query=query if reference_usable else None,
-            cache_variant=cache_variant,
-            cache_news=effective_intent in {"current", "news"},
-            would_escalate=should_use_fallback,
-            would_escalate_reason=shadow_reason,
-            shadow_parity=shadow_parity,
-        )
-
-    if not should_use_fallback:
-        results = _dedupe_and_rank(primary_candidates, requested)
-        timings_ms = _timings(started, [primary_outcome])
-        fallback_reason: str | None = None
-        backend = "none"
-        if results:
-            status = "degraded" if primary_outcome.state == "degraded" else "ok"
-            backend = primary.name
-            rendered = _format_results(
-                query,
-                results,
-                primary_outcome.suggestions,
-                status=status,
-                backend=backend,
-                attempted=attempted,
-                timings_ms=timings_ms,
-                unresponsive_engines=primary_outcome.unresponsive_engines,
-                provider_states=provider_states,
-                mode=effective_mode,
-                search_mode=effective_mode,
-            )
-        elif primary_outcome.ok:
-            degraded = primary_outcome.state == "degraded"
-            status = "degraded" if degraded else "empty"
-            fallback_reason = f"{primary.name}_degraded" if degraded else None
-            rendered = _format_results(
-                query,
-                [],
-                primary_outcome.suggestions,
-                status=status,
-                backend=backend,
-                attempted=attempted,
-                fallback_reason=fallback_reason,
-                timings_ms=timings_ms,
-                unresponsive_engines=primary_outcome.unresponsive_engines,
-                provider_states=provider_states,
-                mode=effective_mode,
-                search_mode=effective_mode,
-            )
-        else:
-            status = "error"
-            fallback_reason = _fallback_reason(primary_outcome)
-            message = f"Search error: {primary.name} search failed and no fallback provider is configured."
-            rendered = _search_error_payload(
-                query,
-                message,
-                primary_outcome.suggestions,
-                attempted=attempted,
-                fallback_reason=fallback_reason,
-                timings_ms=timings_ms,
-                unresponsive_engines=primary_outcome.unresponsive_engines,
-                provider_states=provider_states,
-                mode=effective_mode,
-                search_mode=effective_mode,
-            )
-        return _finish_search(
-            rendered,
-            status=status,
-            backend=backend,
-            requested_count=requested,
-            result_count=len(results),
-            fallback_reason=fallback_reason,
-            timings_ms=timings_ms,
-            outcomes=[primary_outcome],
-            mode=effective_mode,
-            cache_query=query,
-            cache_variant=cache_variant,
-            cache_news=effective_intent in {"current", "news"},
-        )
-
-    reason = quality_reason if quality_reason is not None else _fallback_reason(
-        primary_outcome
-    )
+    provider = _PROVIDERS[0]
     remaining = SEARCH_TOTAL_TIMEOUT - (time.monotonic() - started)
     if remaining <= 0:
-        circuit = _breaker.snapshot(fallback.name)
-        fallback_outcome = _BackendOutcome(
-            backend=fallback.name,
+        circuit = _breaker.snapshot(provider.name)
+        outcome = _BackendOutcome(
+            backend=provider.name,
             state="timeout",
             error="total deadline exceeded",
             circuit_before=str(circuit["state"]),
@@ -3281,72 +2248,69 @@ async def _web_search_impl(
             circuit_failures=int(circuit["consecutive_failures"]),
         )
     else:
-        # Credentials are resolved only when policy permits external egress.
-        fallback_outcome = await _run_backend(
-            fallback.name,
-            _provider_search(fallback, query, candidate_limit, effective_intent),
-            min(fallback.timeout, remaining),
+        outcome = await _run_backend(
+            provider.name,
+            _provider_search(provider, query, candidate_limit, effective_intent),
+            min(provider.timeout, remaining),
         )
-    provider_states[fallback.name] = fallback_outcome.state
-    attempted = _attempted_providers([primary_outcome, fallback_outcome])
 
-    if primary_candidates:
-        results = _merge_with_secondary_reserve(primary_candidates, fallback_outcome.results, requested)
-    else:
-        results = _dedupe_and_rank(fallback_outcome.results, requested)
-    backend = _result_backend(results)
-    timings_ms = _timings(started, [primary_outcome, fallback_outcome])
-    answer = fallback_outcome.answer or None
-    citations = fallback_outcome.citations or None
+    results = _dedupe_and_rank(outcome.results, requested)
+    attempted = _attempted_providers([outcome])
+    provider_states = {outcome.backend: outcome.state}
+    timings_ms = _timings(started, [outcome])
+    backend = outcome.backend if results else "none"
+    fallback_reason: str | None = None
     if results:
-        status = "degraded"
+        status = "degraded" if outcome.state == "degraded" else "ok"
         rendered = _format_results(
             query,
             results,
-            primary_outcome.suggestions,
+            outcome.suggestions,
             status=status,
             backend=backend,
             attempted=attempted,
-            fallback_reason=reason,
             timings_ms=timings_ms,
-            unresponsive_engines=primary_outcome.unresponsive_engines,
+            unresponsive_engines=outcome.unresponsive_engines,
             provider_states=provider_states,
-            answer=answer,
-            citations=citations,
+            answer=outcome.answer or None,
+            citations=outcome.citations or None,
             mode=effective_mode,
             search_mode=effective_mode,
         )
-    elif not primary_outcome.ok and not fallback_outcome.ok:
-        status = "error"
-        both_failed_msg = f"Search error: {primary.name} and {fallback.name} both failed."
-        rendered = _search_error_payload(
+    elif outcome.ok:
+        status = "degraded" if outcome.state == "degraded" else "empty"
+        fallback_reason = f"{outcome.backend}_degraded" if status == "degraded" else None
+        rendered = _format_results(
             query,
-            both_failed_msg,
-            primary_outcome.suggestions,
+            [],
+            outcome.suggestions,
+            status=status,
+            backend="none",
             attempted=attempted,
-            fallback_reason=reason,
+            fallback_reason=fallback_reason,
             timings_ms=timings_ms,
-            unresponsive_engines=primary_outcome.unresponsive_engines,
+            unresponsive_engines=outcome.unresponsive_engines,
             provider_states=provider_states,
             mode=effective_mode,
             search_mode=effective_mode,
         )
     else:
-        status = "empty" if primary_outcome.ok and fallback_outcome.ok else "degraded"
-        backend = "none"
-        rendered = _format_results(
+        status = "error"
+        fallback_reason = _fallback_reason(outcome)
+        error_message = (
+            "Search error: all configured providers failed."
+            if effective_mode == "maximum_recall"
+            else "Search error: Brave search failed and no fallback provider is configured."
+        )
+        rendered = _search_error_payload(
             query,
-            [],
-            primary_outcome.suggestions,
-            status=status,
-            backend=backend,
+            error_message,
+            outcome.suggestions,
             attempted=attempted,
-            fallback_reason=reason,
+            fallback_reason=fallback_reason,
             timings_ms=timings_ms,
-            unresponsive_engines=primary_outcome.unresponsive_engines,
+            unresponsive_engines=outcome.unresponsive_engines,
             provider_states=provider_states,
-            answer=answer,
-            citations=citations,
             mode=effective_mode,
             search_mode=effective_mode,
         )
@@ -3356,9 +2320,9 @@ async def _web_search_impl(
         backend=backend,
         requested_count=requested,
         result_count=len(results),
-        fallback_reason=reason,
+        fallback_reason=fallback_reason,
         timings_ms=timings_ms,
-        outcomes=[primary_outcome, fallback_outcome],
+        outcomes=[outcome],
         mode=effective_mode,
         cache_query=query,
         cache_variant=cache_variant,
@@ -3373,7 +2337,7 @@ async def web_search(
     mode: str | None = None,
     intent: SearchIntent = "general",
 ) -> str:
-    """Search the configured Brave, SearXNG, or SearXNG-first dual stack.
+    """Search the Brave web index.
 
     Optional `mode` selects the ADR 0002 routing mode: `normal` (default),
     `sensitive` (no external egress; refuses without a local corpus), or
@@ -3577,9 +2541,9 @@ async def batch_web_search(
 
 @mcp.tool()
 async def image_search(query: str, num_results: int = 8) -> str:
-    """Search public image metadata via Brave (default) or loopback SearXNG."""
+    """Search public image metadata through Brave with strict SafeSearch."""
     started = time.monotonic()
-    safe_search = "moderate" if _PROVIDER_STACK == "searxng" else "strict"
+    safe_search = "strict"
     query = query.strip()
     requested = min(MAX_NUM_RESULTS, max(1, int(num_results)))
     if not query:
@@ -3623,19 +2587,11 @@ async def image_search(query: str, num_results: int = 8) -> str:
         MAX_NUM_RESULTS * RESULT_OVERFETCH_FACTOR,
         requested * RESULT_OVERFETCH_FACTOR,
     )
-    # Use the active provider stack: Brave for "brave", SearXNG for "searxng".
-    if _PROVIDER_STACK == "searxng":
-        outcome = await _run_backend(
-            "searxng",
-            _searxng_image_search(query, candidate_limit),
-            min(SEARCH_TIMEOUT, SEARCH_TOTAL_TIMEOUT),
-        )
-    else:
-        outcome = await _run_backend(
-            "brave",
-            _brave_image_search(query, candidate_limit, _resolve_brave_key()),
-            min(BRAVE_TIMEOUT, SEARCH_TOTAL_TIMEOUT),
-        )
+    outcome = await _run_backend(
+        "brave",
+        _brave_image_search(query, candidate_limit, _resolve_brave_key()),
+        min(BRAVE_TIMEOUT, SEARCH_TOTAL_TIMEOUT),
+    )
     results = _dedupe_and_rank_images(outcome.results, requested)
     timings_ms = _timings(started, [outcome])
     provider_states = {outcome.backend: outcome.state}
@@ -3679,14 +2635,7 @@ async def image_search(query: str, num_results: int = 8) -> str:
         status = "error"
         backend = "none"
         fallback_reason = _fallback_reason(outcome)
-        if outcome.backend == "searxng":
-            message = (
-                "Image search error: loopback SearXNG is required."
-                if outcome.error == "SearXNG URL is not loopback"
-                else "Image search error: loopback SearXNG failed."
-            )
-        else:
-            message = f"Image search error: {outcome.backend} search failed."
+        message = f"Image search error: {outcome.backend} search failed."
         rendered = _search_error_payload(
             query,
             message,

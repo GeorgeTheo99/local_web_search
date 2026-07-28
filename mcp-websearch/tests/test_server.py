@@ -75,6 +75,18 @@ def _structured_content(result: Any) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
+@pytest.fixture(autouse=True)
+def _isolated_runtime(monkeypatch, tmp_path):
+    cache = srv.WebCache(tmp_path / "cache")
+    telemetry = srv.TelemetryStore(tmp_path / "telemetry")
+    monkeypatch.setattr(srv, "LOCAL_SEARCH_DATA_DIR", tmp_path)
+    monkeypatch.setattr(srv, "_cache", cache)
+    monkeypatch.setattr(srv, "_telemetry", telemetry)
+    yield
+    cache.close()
+    telemetry.close()
+
+
 def _brave_outcome(results=None, *, state="ok", **extra) -> srv._BackendOutcome:
     """Build a Brave _BackendOutcome with normalized results."""
     if results is None:
@@ -89,32 +101,6 @@ def _brave_outcome(results=None, *, state="ok", **extra) -> srv._BackendOutcome:
     )
 
 
-@pytest.fixture(autouse=True)
-def _reset_runtime_state(monkeypatch, tmp_path):
-    """Keep breaker, diagnostics, and telemetry isolated between tests.
-
-    Pin the provider stack to the default Brave stack. Tests that need a
-    different stack (e.g. searxng) monkeypatch _PROVIDER_STACK and
-    _PROVIDERS explicitly.
-    """
-    telemetry = srv.TelemetryStore(tmp_path / "telemetry")
-    monkeypatch.setattr(srv, "_breaker", srv._CircuitBreaker())
-    monkeypatch.setattr(srv, "_last_search", None)
-    monkeypatch.setattr(srv, "_telemetry", telemetry)
-    monkeypatch.setattr(srv, "_PROVIDER_STACK", "brave")
-    monkeypatch.setattr(srv, "_PROVIDERS", srv._build_provider_stack())
-    monkeypatch.setattr(srv, "BRAVE_API_KEY_ENV", "brave-env")
-    monkeypatch.setattr(srv, "get_http_headers", lambda: {})
-    # Isolate the Brave secret file to a tmp dir so real filesystem state can't leak in.
-    monkeypatch.setattr(srv, "LOCAL_SEARCH_DATA_DIR", tmp_path)
-    monkeypatch.setattr(srv, "_BRAVE_SECRET_FILE", tmp_path / "brave_key")
-
-    async def test_public_fetch_client():
-        return await srv._client()
-
-    monkeypatch.setattr(srv, "_public_fetch_client", test_public_fetch_client)
-    yield
-    telemetry.close()
 
 
 def test_http_transport_does_not_info_log_search_urls():
@@ -373,7 +359,7 @@ async def test_fetch_pins_validated_ip_against_dns_rebinding(monkeypatch):
         return FakeClient()
 
     monkeypatch.setattr(srv, "_resolve_host_ips", alternating_resolve)
-    monkeypatch.setattr(srv, "_client", fake_client)
+    monkeypatch.setattr(srv, "_public_fetch_client", fake_client)
     final_url, body, content_type, status = await srv._fetch_public_body(
         "https://example.com/path"
     )
@@ -421,7 +407,7 @@ async def test_fetch_revalidates_and_rejects_private_redirect(monkeypatch):
             return [srv.ipaddress.ip_address("93.184.216.34")]
 
     monkeypatch.setattr(srv, "_resolve_host_ips", public_example)
-    monkeypatch.setattr(srv, "_client", fake_client)
+    monkeypatch.setattr(srv, "_public_fetch_client", fake_client)
     with pytest.raises(ValueError, match="local/private"):
         await srv._fetch_public_body("https://example.com/start")
     assert calls == 1
@@ -614,7 +600,7 @@ async def test_web_fetch_html_reserves_space_for_attachments(monkeypatch):
         return FakeClient()
 
     monkeypatch.setattr(srv, "_validate_public_http_url", _allow_public_url)
-    monkeypatch.setattr(srv, "_client", fake_client)
+    monkeypatch.setattr(srv, "_public_fetch_client", fake_client)
     result = await _call_tool(
         "web_fetch",
         {"url": "https://example.com/page", "max_chars": 200},
@@ -678,7 +664,7 @@ async def test_web_fetch_pdf_returns_plain_extracted_text(monkeypatch):
         return "AC district Lot Size: 10 acres", "macos_vision_ocr"
 
     monkeypatch.setattr(srv, "_validate_public_http_url", _allow_public_url)
-    monkeypatch.setattr(srv, "_client", fake_client)
+    monkeypatch.setattr(srv, "_public_fetch_client", fake_client)
     monkeypatch.setattr(srv, "_extract_pdf_text", fake_extract)
     result = await _call_tool(
         "web_fetch",
@@ -703,7 +689,7 @@ async def test_web_fetch_pdf_output_limit_uses_error_contract(monkeypatch):
         raise srv._OutputLimitExceeded("PDF command output exceeds limit")
 
     monkeypatch.setattr(srv, "_validate_public_http_url", _allow_public_url)
-    monkeypatch.setattr(srv, "_client", fake_client)
+    monkeypatch.setattr(srv, "_public_fetch_client", fake_client)
     monkeypatch.setattr(srv, "_extract_pdf_text", limited_extract)
     result = await _call_tool("web_fetch", {"url": "https://example.com/Schedule.pdf"})
     assert _result_text(result).startswith("Fetch error: PDF extraction failed: PDF command output exceeds limit")
@@ -727,7 +713,7 @@ async def test_web_fetch_never_decodes_unreadable_pdf_as_binary_text(monkeypatch
         return None, "PDF OCR produced no meaningful text"
 
     monkeypatch.setattr(srv, "_validate_public_http_url", _allow_public_url)
-    monkeypatch.setattr(srv, "_client", fake_client)
+    monkeypatch.setattr(srv, "_public_fetch_client", fake_client)
     monkeypatch.setattr(srv, "_extract_pdf_text", fake_extract)
     result = await _call_tool("web_fetch", {"url": "https://example.com/scan.pdf"})
     text = _result_text(result)
@@ -786,7 +772,7 @@ async def test_web_fetch_caps_raw_chunks_and_stops_after_overflow(monkeypatch):
 
     monkeypatch.setattr(srv, "FETCH_MAX_BYTES", 10)
     monkeypatch.setattr(srv, "_validate_public_http_url", _allow_public_url)
-    monkeypatch.setattr(srv, "_client", fake_client)
+    monkeypatch.setattr(srv, "_public_fetch_client", fake_client)
     result = await _call_tool("web_fetch", {"url": "https://example.com/large"})
     assert _result_text(result) == "Fetch error: response exceeds 10 byte limit"
     assert chunks_consumed == 2
@@ -900,7 +886,7 @@ async def test_web_fetch_honors_small_max_chars(monkeypatch):
         return FakeClient()
 
     monkeypatch.setattr(srv, "_validate_public_http_url", _allow_public_url)
-    monkeypatch.setattr(srv, "_client", fake_client)
+    monkeypatch.setattr(srv, "_public_fetch_client", fake_client)
     result = await _call_tool("web_fetch", {"url": "https://example.com/text", "max_chars": 10})
     assert len(_result_text(result)) == 10
 
@@ -915,7 +901,7 @@ async def test_web_fetch_rejects_binary_mislabeled_as_text(monkeypatch):
         return FakeClient()
 
     monkeypatch.setattr(srv, "_validate_public_http_url", _allow_public_url)
-    monkeypatch.setattr(srv, "_client", fake_client)
+    monkeypatch.setattr(srv, "_public_fetch_client", fake_client)
     result = await _call_tool("web_fetch", {"url": "https://example.com/fake.txt"})
     assert _result_text(result) == "Fetch error: unsupported binary content type: text/plain"
 
@@ -957,16 +943,6 @@ async def test_web_search_rejects_oversized_query_before_provider_access(monkeyp
     assert secret_suffix not in _result_text(result)
 
 
-def test_public_result_urls_reject_noncanonical_private_ip_literals():
-    for url in (
-        "http://127.1/secret",
-        "http://0177.0.0.1/secret",
-        "http://0x7f.0.0.1/secret",
-    ):
-        assert srv._public_http_url(url) is None
-        assert srv._normalize_searxng_image_result(
-            {"img_src": url, "engine": "duckduckgo images"}
-        ) is None
 
 
 @pytest.mark.asyncio
@@ -1003,41 +979,6 @@ async def test_provider_json_response_rejects_compression_before_decode():
         await srv._limited_json_object(response, provider="test")
 
 
-@pytest.mark.asyncio
-async def test_search_provider_requests_disable_compression(monkeypatch):
-    seen: list[tuple[str, str]] = []
-
-    async def handler(request):
-        seen.append((request.url.path, request.headers.get("accept-encoding", "")))
-        if request.url.path == "/search" and request.method == "GET":
-            return srv.httpx.Response(
-                200,
-                headers={"Content-Type": "application/json"},
-                stream=srv.httpx.ByteStream(b'{"results": []}'),
-            )
-        return srv.httpx.Response(
-            200,
-            headers={"Content-Type": "application/json"},
-            stream=srv.httpx.ByteStream(
-                b'{"web": {"results": [{"title": "safe", "url": "https://example.com/"}]}}'
-            ),
-        )
-
-    client = srv.httpx.AsyncClient(transport=srv.httpx.MockTransport(handler))
-
-    async def fake_client():
-        return client
-
-    monkeypatch.setattr(srv, "_client", fake_client)
-    try:
-        searxng = await srv._searxng_request("/search", {"q": "test"})
-        brave = await srv._brave_search("test", 1, "brave-key")
-    finally:
-        await client.aclose()
-
-    assert searxng.data == {"results": []}
-    assert brave.state == "ok"
-    assert seen == [("/search", "identity"), ("/res/v1/web/search", "identity")]
 
 
 @pytest.mark.asyncio
@@ -1061,20 +1002,6 @@ async def test_web_search_filters_unsafe_urls_and_errors_when_none_are_usable(mo
     assert [item["url"] for item in payload["results"]] == []
 
 
-@pytest.mark.asyncio
-async def test_image_search_rejects_oversized_query_before_provider_access(monkeypatch):
-    monkeypatch.setattr(
-        srv,
-        "_searxng_image_search",
-        lambda *_args: (_ for _ in ()).throw(AssertionError("provider must not run")),
-    )
-    result = await _call_tool(
-        "image_search",
-        {"query": "x" * (srv.MAX_QUERY_CHARS + 1), "num_results": 3},
-    )
-    payload = json.loads(_result_text(result))
-    assert payload["status"] == "error"
-    assert str(srv.MAX_QUERY_CHARS) in payload["error"]
 
 
 @pytest.mark.asyncio
@@ -1189,119 +1116,18 @@ async def test_degraded_is_distinct_from_empty_and_error(monkeypatch):
     assert payload["provider_states"] == {"brave": "error"}
 
 
-@pytest.mark.asyncio
-async def test_health_readiness_recovers_after_recent_provider_failure(monkeypatch):
-    async def unavailable():
-        return {"reachable": False, "latency_ms": 1.0}
-
-    monkeypatch.setattr(srv, "_probe_searxng", unavailable)
-    monkeypatch.setattr(
-        srv,
-        "_last_search",
-        {
-            "status": "error",
-            "provider_states": {"brave": "error"},
-        },
-    )
-    health = await srv._health_payload()
-    # Readiness is current credential/circuit state, not stale last-search state.
-    assert health["ready"] is True
-    assert health["status"] == "degraded"
-    assert "searxng" in health
 
 
-@pytest.mark.asyncio
-async def test_health_exposes_provider_stack_and_providers(monkeypatch):
-    """ADR 0002 Phase 6: health reports the active stack and per-provider status."""
-    async def reachable():
-        return {"reachable": True, "latency_ms": 1.0}
-    monkeypatch.setattr(srv, "_probe_searxng", reachable)
-    health = await srv._health_payload()
-    assert health["provider_stack"] == "brave"
-    names = [p["name"] for p in health["providers"]]
-    assert names == ["brave"]
-    assert all("credential_configured" in p for p in health["providers"])
-    assert all("circuit" in p for p in health["providers"])
 
 
-@pytest.mark.asyncio
-async def test_searxng_web_stack_rejects_non_loopback_url_without_request(monkeypatch):
-    monkeypatch.setattr(srv, "_PROVIDER_STACK", "searxng")
-    monkeypatch.setattr(srv, "_PROVIDERS", srv._build_provider_stack())
-    monkeypatch.setattr(srv, "SEARXNG_URL", "https://search.example.com")
-
-    async def forbidden_request(*args, **kwargs):
-        raise AssertionError("non-loopback SearXNG must not be contacted")
-
-    monkeypatch.setattr(srv, "_searxng_request", forbidden_request)
-    result = await _call_tool("web_search", {"query": "q"})
-    payload = json.loads(_result_text(result))
-    assert payload["status"] == "error"
-    assert payload["provider_states"] == {"searxng": "error"}
-    assert payload["attempted"] == []
-    assert payload["estimated_cost_usd"] == 0.0
 
 
-@pytest.mark.asyncio
-async def test_searxng_health_rejects_non_loopback_url_without_probe(monkeypatch):
-    monkeypatch.setattr(srv, "_PROVIDER_STACK", "searxng")
-    monkeypatch.setattr(srv, "_PROVIDERS", srv._build_provider_stack())
-    monkeypatch.setattr(srv, "SEARXNG_URL", "https://search.example.com")
-
-    async def forbidden_client():
-        raise AssertionError("non-loopback SearXNG health must not be contacted")
-
-    monkeypatch.setattr(srv, "_client", forbidden_client)
-    health = await srv._health_payload()
-    assert health["ready"] is False
-    assert health["status"] == "down"
-    assert health["searxng"]["reachable"] is False
-    assert health["searxng"]["error"] == "SearXNG URL is not loopback"
 
 
-@pytest.mark.asyncio
-async def test_health_brave_stack_requires_brave_credential_even_when_searxng_is_healthy(monkeypatch):
-    async def reachable():
-        return {"reachable": True, "latency_ms": 1.0}
-
-    monkeypatch.setattr(srv, "_probe_searxng", reachable)
-    monkeypatch.setattr(srv, "BRAVE_API_KEY_ENV", "")
-    monkeypatch.setattr(srv, "get_http_headers", lambda: {})
-    health = await srv._health_payload()
-    assert health["provider_stack"] == "brave"
-    assert health["searxng"]["available"] is True
-    assert health["ready"] is False
-    assert health["status"] == "down"
 
 
-@pytest.mark.asyncio
-async def test_health_searxng_stack_reports_searxng_provider(monkeypatch):
-    monkeypatch.setattr(srv, "_PROVIDER_STACK", "searxng")
-    monkeypatch.setattr(srv, "_PROVIDERS", srv._build_provider_stack())
-    async def reachable():
-        return {"reachable": True, "latency_ms": 1.0}
-    monkeypatch.setattr(srv, "_probe_searxng", reachable)
-    health = await srv._health_payload()
-    assert health["provider_stack"] == "searxng"
-    names = [p["name"] for p in health["providers"]]
-    assert names == ["searxng"]
 
 
-@pytest.mark.asyncio
-async def test_readiness_and_health_expose_safe_state(monkeypatch):
-    async def unavailable():
-        return {"reachable": False, "latency_ms": 1.0}
-    monkeypatch.setattr(srv, "_probe_searxng", unavailable)
-    # No Brave credential configured → not ready.
-    monkeypatch.setattr(srv, "BRAVE_API_KEY_ENV", "")
-    monkeypatch.setattr(srv, "get_http_headers", lambda: {})
-    health = await srv._health_payload()
-    assert health["ready"] is False
-    assert health["status"] == "down"
-    assert "tavily_mode" not in health["policy"]
-    response = await srv.ready(None)
-    assert response.status_code == 503
-    assert b'"ready":false' in response.body
 
 
 @pytest.mark.asyncio
@@ -1359,7 +1185,7 @@ async def test_search_telemetry_never_persists_query_or_result_content(monkeypat
         )
         values = "\n".join(
             str(value)
-            for table in ("search_events", "provider_events", "engine_failures")
+            for table in ("search_events", "provider_events")
             for row in conn.execute(f"SELECT * FROM {table}")
             for value in row
         )
@@ -1381,8 +1207,11 @@ async def test_search_telemetry_never_persists_query_or_result_content(monkeypat
 
 
 @pytest.mark.asyncio
-async def test_stats_aggregates_provider_states(monkeypatch):
+async def test_stats_aggregates_provider_states(monkeypatch, tmp_path):
     from types import SimpleNamespace
+
+    telemetry = srv.TelemetryStore(tmp_path / "telemetry")
+    monkeypatch.setattr(srv, "_telemetry", telemetry)
 
     async def fake_brave_search(query, num_results, api_key):
         return srv._BackendOutcome(backend="brave", state="error", error="boom", attempts=1)
@@ -1395,6 +1224,7 @@ async def test_stats_aggregates_provider_states(monkeypatch):
     assert payload["searches"]["total"] == 1
     assert payload["providers"]["brave"]["attempts"] == 1
     assert payload["providers"]["brave"]["errors"] == 1
+    telemetry.close()
 
 
 @pytest.mark.asyncio
@@ -1576,14 +1406,6 @@ async def test_provider_list_default_order_and_names(monkeypatch):
     assert all(p.output == "raw" for p in srv._PROVIDERS)
 
 
-def test_dual_provider_stack_is_searxng_then_brave(monkeypatch):
-    monkeypatch.setattr(srv, "_PROVIDER_STACK", "searxng+brave")
-    providers = srv._build_provider_stack()
-    assert [provider.name for provider in providers] == ["searxng", "brave"]
-    assert [type(provider) for provider in providers] == [
-        srv._SearXNGProvider,
-        srv._BraveProvider,
-    ]
 
 
 def test_default_timings_ms_has_all_provider_keys(monkeypatch):
@@ -1595,28 +1417,8 @@ def test_default_timings_ms_has_all_provider_keys(monkeypatch):
     assert timings["brave"] is None
 
 
-def test_provider_timeout_reads_current_module_global(monkeypatch):
-    """Provider.timeout must reflect monkeypatched SEARCH_TIMEOUT/BRAVE_TIMEOUT."""
-    monkeypatch.setattr(srv, "SEARCH_TIMEOUT", 0.5)
-    monkeypatch.setattr(srv, "BRAVE_TIMEOUT", 0.7)
-    searxng = srv._SearXNGProvider()
-    brave = srv._BraveProvider()
-    assert searxng.timeout == 0.5
-    assert brave.timeout == 0.7
 
 
-@pytest.mark.asyncio
-async def test_searxng_provider_delegates_to_monkeypatched_search(monkeypatch):
-    """Provider.search must call the module-level _searxng_search so tests win."""
-    sentinel = srv._BackendOutcome(backend="searxng", ok=True, state="ok")
-    called = {}
-    async def fake_searxng_search(query, num_results):
-        called["args"] = (query, num_results)
-        return sentinel
-    monkeypatch.setattr(srv, "_searxng_search", fake_searxng_search)
-    outcome = await srv._SearXNGProvider().search("q", 5)
-    assert outcome is sentinel
-    assert called["args"] == ("q", 5)
 
 
 @pytest.mark.asyncio

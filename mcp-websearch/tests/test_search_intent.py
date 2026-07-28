@@ -37,24 +37,6 @@ def _reset_runtime(monkeypatch, tmp_path):
     telemetry.close()
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("intent", "expected_time_range"),
-    [("general", None), ("current", "month"), ("news", "day")],
-)
-async def test_searxng_intent_sets_only_explicit_time_range(
-    monkeypatch, intent, expected_time_range
-):
-    seen_params: dict[str, Any] = {}
-
-    async def fake_request(path, params, timeout=None):
-        seen_params.update(params)
-        return {"results": [], "suggestions": []}
-
-    monkeypatch.setattr(srv, "_searxng_request", fake_request)
-    await srv._searxng_search("latest breaking news", 3, intent=intent)
-
-    assert seen_params.get("time_range") == expected_time_range
 
 
 class _IdentityResponse:

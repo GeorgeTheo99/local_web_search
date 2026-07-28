@@ -1,7 +1,7 @@
 [project]
 name = "local-mcp-websearch"
 version = "0.1.0"
-description = "Local FastMCP websearch wrapper around SearXNG"
+description = "Local FastMCP websearch broker backed by Brave Search"
 requires-python = ">=3.12"
 dependencies = [
   "fastmcp>=2.0",

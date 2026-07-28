@@ -147,7 +147,7 @@ def test_tunnel_uninstall_preserves_logs(tmp_path):
 
 def test_server_launchagent_plists_set_private_umask(tmp_path):
     env = {**os.environ, "HOME": str(tmp_path / "home")}
-    for function in ("searxng_plist", "mcp_plist"):
+    for function in ("mcp_plist",):
         result = subprocess.run(
             ["bash", "-c", 'source "$1"; "$2"', "test", str(SERVER_CLI), function],
             check=True,
