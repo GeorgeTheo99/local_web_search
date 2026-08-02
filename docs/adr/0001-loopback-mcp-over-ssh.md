@@ -6,9 +6,10 @@
 ## Context
 
 The MCP broker has no native client authentication and provides search plus a
-public-web fetch tool. It is intentionally bound to `127.0.0.1:8889`; SearXNG is
-bound to `127.0.0.1:8888`. Remote Pi and other MCP clients need reliable access
-without turning either service into an unauthenticated network endpoint.
+public-web fetch tool. It is intentionally bound to `127.0.0.1:8889`. Remote Pi
+and other MCP clients need reliable access without turning it into an
+unauthenticated network endpoint. SearXNG was retired after this ADR was
+accepted; that does not change the tunnel decision.
 
 Generic transport and local-search security belong in this repository because
 they must evolve with the broker endpoint and its operating model. Pi-specific
@@ -26,8 +27,8 @@ client 127.0.0.1:8889
   -> server 127.0.0.1:8889
 ```
 
-The client endpoint remains `http://127.0.0.1:8889/mcp`. The broker and SearXNG
-retain loopback-only binds. `scripts/local-search-tunnel` generates and manages
+The client endpoint remains `http://127.0.0.1:8889/mcp`. The broker retains its
+loopback-only bind. `scripts/local-search-tunnel` generates and manages
 the secret-free client LaunchAgent; SSH host, user, key, host-key policy, and
 network route stay in the client's SSH configuration.
 
@@ -48,7 +49,7 @@ No MCP route is added to Caddy, the LAN, or a Tailscale listener.
 ### Protected assets
 
 - Search terms, fetched URLs, and returned content.
-- Availability of the configured Brave or local SearXNG provider and the broker host.
+- Availability of Brave Search, configured fetch fallbacks, and the broker host.
 - The client's dedicated SSH private key.
 
 ### Trust boundaries and controls
@@ -78,14 +79,9 @@ No MCP route is added to Caddy, the LAN, or a Tailscale listener.
   loopback scope limits callers, while backend deadlines, result caps, response
   byte limits, PDF bounds, and a two-job PDF semaphore limit individual work.
   Add authenticated quotas before any direct network exposure.
-- `web_fetch` validates DNS answers before asking HTTPX to connect, so DNS can
-  change between validation and connection. Fixing this TOCTOU gap requires a
-  resolver/transport that pins a validated address while preserving TLS SNI and
-  certificate verification for every redirect. This is deferred, not considered
-  safe for direct exposure, and is tracked as a hardening prerequisite.
-- Existing Caddy `:80`/`:8080` SearXNG routes are separate from MCP and may be
-  reachable directly on local/tailnet interfaces. This ADR does not endorse or
-  change those routes; they require review in the Caddy-owning project.
+- `web_fetch` validates and pins each public destination address while
+  preserving the original Host/SNI, and revalidates redirects. Direct external
+  providers still receive the requested public URL when their fallback is used.
 
 ## Consequences
 

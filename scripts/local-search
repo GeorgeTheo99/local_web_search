@@ -1,41 +1,24 @@
 #!/usr/bin/env bash
-# local-search — operator CLI for the shared local search stack.
-#
-# Manages SearXNG + the FastMCP websearch wrapper as launchd services on this
-# machine. Self-contained: only depends on bash, uv, python3, git, curl, and
-# macOS launchd. Safe to run repeatedly (idempotent).
+# local-search — operator CLI for the Brave-only local web-search broker.
 #
 # Usage:
-#   local-search install [--no-start]   bootstrap venvs + plists + start + verify
-#   local-search uninstall             stop services, remove plists (keeps src/venvs)
+#   local-search install [--no-start]   sync venv + plist + start + verify
+#   local-search uninstall             stop service and remove plist
 #   local-search start | stop | restart
-#   local-search status                launchd state + /health probes
+#   local-search status                launchd state + /health probe
 #   local-search stats [24h|7d|30d]    query-free aggregate telemetry
 #   local-search telemetry-reset --yes explicitly erase telemetry events
 #   local-search verify                health + tools/list smoke
-#   local-search logs [searxng|mcp] [-f]
+#   local-search logs [mcp] [lines]
 #   local-search rotate-logs --yes     privately archive operational logs
-#   local-search update                git pull + rebuild + restart
-#   local-search update-searxng-ref <sha>
-#   local-search mcp-stdio             run MCP in stdio mode (for client config)
-#   local-search env                   print resolved config
+#   local-search update                git pull + dependency sync + restart
+#   local-search mcp-stdio             run MCP in stdio mode
+#   local-search env                   print resolved non-secret config
 set -euo pipefail
 
-# --------------------------------------------------------------------------- #
-# Config resolution.
-# --------------------------------------------------------------------------- #
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-
-SEARXNG_SRC_DIR="$ROOT_DIR/searxng/src"
-SEARXNG_SETTINGS="$ROOT_DIR/searxng/settings.yml"
-SEARXNG_RUNNER="$ROOT_DIR/searxng/run.py"
-SEARXNG_REF_FILE="$ROOT_DIR/searxng/SEARXNG_REF"
-SEARXNG_REPO="https://github.com/searxng/searxng.git"
-
 MCP_DIR="$ROOT_DIR/mcp-websearch"
-
-SEARXNG_LABEL="com.local.searxng"
 MCP_LABEL="com.local.mcp-websearch"
 PLIST_DIR="$HOME/Library/LaunchAgents"
 MCP_PLIST="$PLIST_DIR/$MCP_LABEL.plist"
@@ -52,38 +35,32 @@ installed_mcp_env() {
   /usr/libexec/PlistBuddy -c "Print :EnvironmentVariables:$1" "$MCP_PLIST" 2>/dev/null || true
 }
 
-SEARXNG_URL="${SEARXNG_URL:-http://127.0.0.1:8888}"
 MCP_PORT="${MCP_PORT:-8889}"
-WEBSEARCH_PROVIDER_STACK="${WEBSEARCH_PROVIDER_STACK:-$(installed_config_value WEBSEARCH_PROVIDER_STACK)}"
-WEBSEARCH_PROVIDER_STACK="${WEBSEARCH_PROVIDER_STACK:-$(installed_mcp_env WEBSEARCH_PROVIDER_STACK)}"
-WEBSEARCH_PROVIDER_STACK="${WEBSEARCH_PROVIDER_STACK:-brave}"
+WEBSEARCH_PROVIDER_STACK="brave"
 WEBSEARCH_SEARCH_MODE="${WEBSEARCH_SEARCH_MODE:-$(installed_config_value WEBSEARCH_SEARCH_MODE)}"
 WEBSEARCH_SEARCH_MODE="${WEBSEARCH_SEARCH_MODE:-$(installed_mcp_env WEBSEARCH_SEARCH_MODE)}"
 WEBSEARCH_SEARCH_MODE="${WEBSEARCH_SEARCH_MODE:-normal}"
 WEBSEARCH_TOTAL_TIMEOUT="${WEBSEARCH_TOTAL_TIMEOUT:-$(installed_config_value WEBSEARCH_TOTAL_TIMEOUT)}"
 WEBSEARCH_TOTAL_TIMEOUT="${WEBSEARCH_TOTAL_TIMEOUT:-$(installed_mcp_env WEBSEARCH_TOTAL_TIMEOUT)}"
 WEBSEARCH_TOTAL_TIMEOUT="${WEBSEARCH_TOTAL_TIMEOUT:-18}"
-WEBSEARCH_SEARXNG_TIMEOUT="${WEBSEARCH_SEARXNG_TIMEOUT:-$(installed_config_value WEBSEARCH_SEARXNG_TIMEOUT)}"
-WEBSEARCH_SEARXNG_TIMEOUT="${WEBSEARCH_SEARXNG_TIMEOUT:-$(installed_mcp_env WEBSEARCH_SEARXNG_TIMEOUT)}"
-WEBSEARCH_SEARXNG_TIMEOUT="${WEBSEARCH_SEARXNG_TIMEOUT:-7}"
 WEBSEARCH_BRAVE_TIMEOUT="${WEBSEARCH_BRAVE_TIMEOUT:-$(installed_config_value WEBSEARCH_BRAVE_TIMEOUT)}"
 WEBSEARCH_BRAVE_TIMEOUT="${WEBSEARCH_BRAVE_TIMEOUT:-$(installed_mcp_env WEBSEARCH_BRAVE_TIMEOUT)}"
 WEBSEARCH_BRAVE_TIMEOUT="${WEBSEARCH_BRAVE_TIMEOUT:-8}"
-WEBSEARCH_QUALITY_GATE="${WEBSEARCH_QUALITY_GATE:-$(installed_config_value WEBSEARCH_QUALITY_GATE)}"
-WEBSEARCH_QUALITY_GATE="${WEBSEARCH_QUALITY_GATE:-$(installed_mcp_env WEBSEARCH_QUALITY_GATE)}"
-WEBSEARCH_QUALITY_GATE="${WEBSEARCH_QUALITY_GATE:-auto}"
-WEBSEARCH_QUALITY_MIN_RESULTS="${WEBSEARCH_QUALITY_MIN_RESULTS:-$(installed_config_value WEBSEARCH_QUALITY_MIN_RESULTS)}"
-WEBSEARCH_QUALITY_MIN_RESULTS="${WEBSEARCH_QUALITY_MIN_RESULTS:-$(installed_mcp_env WEBSEARCH_QUALITY_MIN_RESULTS)}"
-WEBSEARCH_QUALITY_MIN_RESULTS="${WEBSEARCH_QUALITY_MIN_RESULTS:-3}"
-WEBSEARCH_QUALITY_MIN_DOMAINS="${WEBSEARCH_QUALITY_MIN_DOMAINS:-$(installed_config_value WEBSEARCH_QUALITY_MIN_DOMAINS)}"
-WEBSEARCH_QUALITY_MIN_DOMAINS="${WEBSEARCH_QUALITY_MIN_DOMAINS:-$(installed_mcp_env WEBSEARCH_QUALITY_MIN_DOMAINS)}"
-WEBSEARCH_QUALITY_MIN_DOMAINS="${WEBSEARCH_QUALITY_MIN_DOMAINS:-2}"
-WEBSEARCH_QUALITY_DUPLICATE_FRACTION="${WEBSEARCH_QUALITY_DUPLICATE_FRACTION:-$(installed_config_value WEBSEARCH_QUALITY_DUPLICATE_FRACTION)}"
-WEBSEARCH_QUALITY_DUPLICATE_FRACTION="${WEBSEARCH_QUALITY_DUPLICATE_FRACTION:-$(installed_mcp_env WEBSEARCH_QUALITY_DUPLICATE_FRACTION)}"
-WEBSEARCH_QUALITY_DUPLICATE_FRACTION="${WEBSEARCH_QUALITY_DUPLICATE_FRACTION:-0.6}"
 LOCAL_SEARCH_TELEMETRY_ENABLED="${LOCAL_SEARCH_TELEMETRY_ENABLED:-$(installed_config_value LOCAL_SEARCH_TELEMETRY_ENABLED)}"
 LOCAL_SEARCH_TELEMETRY_ENABLED="${LOCAL_SEARCH_TELEMETRY_ENABLED:-$(installed_mcp_env LOCAL_SEARCH_TELEMETRY_ENABLED)}"
 LOCAL_SEARCH_TELEMETRY_ENABLED="${LOCAL_SEARCH_TELEMETRY_ENABLED:-true}"
+DECODO_FALLBACK_ENABLED="${DECODO_FALLBACK_ENABLED:-$(installed_config_value DECODO_FALLBACK_ENABLED)}"
+DECODO_FALLBACK_ENABLED="${DECODO_FALLBACK_ENABLED:-$(installed_mcp_env DECODO_FALLBACK_ENABLED)}"
+DECODO_FALLBACK_ENABLED="${DECODO_FALLBACK_ENABLED:-true}"
+DECODO_TIMEOUT="${DECODO_TIMEOUT:-$(installed_config_value DECODO_TIMEOUT)}"
+DECODO_TIMEOUT="${DECODO_TIMEOUT:-$(installed_mcp_env DECODO_TIMEOUT)}"
+DECODO_TIMEOUT="${DECODO_TIMEOUT:-30}"
+DECODO_RESPONSE_MAX_BYTES="${DECODO_RESPONSE_MAX_BYTES:-$(installed_config_value DECODO_RESPONSE_MAX_BYTES)}"
+DECODO_RESPONSE_MAX_BYTES="${DECODO_RESPONSE_MAX_BYTES:-$(installed_mcp_env DECODO_RESPONSE_MAX_BYTES)}"
+DECODO_RESPONSE_MAX_BYTES="${DECODO_RESPONSE_MAX_BYTES:-5242880}"
+WEBSEARCH_FETCH_OPERATION_TIMEOUT="${WEBSEARCH_FETCH_OPERATION_TIMEOUT:-$(installed_config_value WEBSEARCH_FETCH_OPERATION_TIMEOUT)}"
+WEBSEARCH_FETCH_OPERATION_TIMEOUT="${WEBSEARCH_FETCH_OPERATION_TIMEOUT:-$(installed_mcp_env WEBSEARCH_FETCH_OPERATION_TIMEOUT)}"
+WEBSEARCH_FETCH_OPERATION_TIMEOUT="${WEBSEARCH_FETCH_OPERATION_TIMEOUT:-60}"
 
 LOG_DIR="${LOCAL_SEARCH_LOG_DIR:-$HOME/Library/Logs/local-search}"
 LOCAL_SEARCH_DATA_DIR_EXPLICIT=0
@@ -95,8 +72,6 @@ case "$LOCAL_SEARCH_DATA_DIR" in
   /*) ;;
   *) LOCAL_SEARCH_DATA_DIR="$ROOT_DIR/$LOCAL_SEARCH_DATA_DIR" ;;
 esac
-# One-time repository rename migration: a persisted default may still point at
-# the exact removed sibling checkout. Explicit overrides and other custom paths win.
 LEGACY_REPO_DATA_DIR="${ROOT_DIR%/*}/local-search/data"
 legacy_root="${LEGACY_REPO_DATA_DIR%/data}"
 if [ "$LOCAL_SEARCH_DATA_DIR_EXPLICIT" -eq 0 ] \
@@ -105,38 +80,57 @@ if [ "$LOCAL_SEARCH_DATA_DIR_EXPLICIT" -eq 0 ] \
   printf '! migrating stale repository-local data path to %s/data\n' "$ROOT_DIR" >&2
   LOCAL_SEARCH_DATA_DIR="$ROOT_DIR/data"
 fi
-case "$(printf '%s' "$LOCAL_SEARCH_TELEMETRY_ENABLED" | tr '[:upper:]' '[:lower:]' | xargs)" in
-  0|false|no|off) LOCAL_SEARCH_TELEMETRY_ENABLED=false ;;
-  *) LOCAL_SEARCH_TELEMETRY_ENABLED=true ;;
-esac
-SEARXNG_SECRET_FILE="$LOCAL_SEARCH_DATA_DIR/searxng_secret_key"
 
-SEARXNG_VENV="$SEARXNG_SRC_DIR/.venv"
+normalize_bool() {
+  case "$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | xargs)" in
+    0|false|no|off) printf false ;;
+    *) printf true ;;
+  esac
+}
+LOCAL_SEARCH_TELEMETRY_ENABLED="$(normalize_bool "$LOCAL_SEARCH_TELEMETRY_ENABLED")"
+DECODO_FALLBACK_ENABLED="$(normalize_bool "$DECODO_FALLBACK_ENABLED")"
+DECODO_SECRET_FILE="$LOCAL_SEARCH_DATA_DIR/decodo_key"
 MCP_VENV="$MCP_DIR/.venv"
 
-# Colors (disabled when not a TTY).
 if [ -t 1 ]; then
-  C_RESET=$'\033[0m'; C_BOLD=$'\033[1m'; C_GREEN=$'\033[32m'; C_YELLOW=$'\033[33m'; C_RED=$'\033[31m'; C_DIM=$'\033[2m'
+  C_RESET=$'\033[0m'; C_BOLD=$'\033[1m'; C_GREEN=$'\033[32m'; C_YELLOW=$'\033[33m'; C_RED=$'\033[31m'
 else
-  C_RESET=""; C_BOLD=""; C_GREEN=""; C_YELLOW=""; C_RED=""; C_DIM=""
+  C_RESET=""; C_BOLD=""; C_GREEN=""; C_YELLOW=""; C_RED=""
 fi
-
 log()  { printf '%s▶%s %s\n' "$C_BOLD" "$C_RESET" "$*"; }
 ok()   { printf '%s✓%s %s\n' "$C_GREEN" "$C_RESET" "$*"; }
 warn() { printf '%s!%s %s\n' "$C_YELLOW" "$C_RESET" "$*" >&2; }
 die()  { printf '%s✗%s %s\n' "$C_RED" "$C_RESET" "$*" >&2; exit 1; }
-
-require_cmd() { command -v "$1" >/dev/null 2>&1 || die "required command not found: $1 (install it and retry)"; }
+require_cmd() { command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"; }
 
 validate_search_configuration() {
-  case "$WEBSEARCH_PROVIDER_STACK" in
-    brave|searxng|searxng+brave) ;;
-    *) die "WEBSEARCH_PROVIDER_STACK must be one of: brave, searxng, searxng+brave" ;;
+  case "$WEBSEARCH_SEARCH_MODE" in
+    normal|sensitive|maximum_recall) ;;
+    *) die "WEBSEARCH_SEARCH_MODE must be normal, sensitive, or maximum_recall" ;;
   esac
-  case "$WEBSEARCH_QUALITY_GATE" in
-    auto|on|off|shadow) ;;
-    *) die "WEBSEARCH_QUALITY_GATE must be one of: auto, on, off, shadow" ;;
-  esac
+  python3 - "$WEBSEARCH_TOTAL_TIMEOUT" "$WEBSEARCH_BRAVE_TIMEOUT" \
+    "$DECODO_TIMEOUT" "$DECODO_RESPONSE_MAX_BYTES" \
+    "$WEBSEARCH_FETCH_OPERATION_TIMEOUT" <<'PY' || exit 1
+import sys
+try:
+    total = float(sys.argv[1])
+    brave = float(sys.argv[2])
+    decodo = float(sys.argv[3])
+    max_bytes = int(sys.argv[4])
+    operation = float(sys.argv[5])
+except ValueError:
+    raise SystemExit("timeouts must be numeric and DECODO_RESPONSE_MAX_BYTES must be an integer")
+if not 1 <= total <= 18:
+    raise SystemExit("WEBSEARCH_TOTAL_TIMEOUT must be between 1 and 18")
+if not 0.25 <= brave <= total:
+    raise SystemExit("WEBSEARCH_BRAVE_TIMEOUT must be between 0.25 and WEBSEARCH_TOTAL_TIMEOUT")
+if not 1 <= decodo <= 60:
+    raise SystemExit("DECODO_TIMEOUT must be between 1 and 60")
+if not 4096 <= max_bytes <= 20 * 1024 * 1024:
+    raise SystemExit("DECODO_RESPONSE_MAX_BYTES must be between 4096 and 20971520")
+if not 1 <= operation <= 120:
+    raise SystemExit("WEBSEARCH_FETCH_OPERATION_TIMEOUT must be between 1 and 120")
+PY
 }
 
 ensure_data_dir() {
@@ -144,201 +138,88 @@ ensure_data_dir() {
   chmod 700 "$LOCAL_SEARCH_DATA_DIR" "$LOCAL_SEARCH_DATA_DIR/cache"
 }
 
-ensure_searxng_secret() {
-  ensure_data_dir
-  require_cmd openssl
-  if [ -L "$SEARXNG_SECRET_FILE" ]; then
-    die "refusing symlinked SearXNG secret file: $SEARXNG_SECRET_FILE"
-  fi
-  if [ -e "$SEARXNG_SECRET_FILE" ] && [ ! -f "$SEARXNG_SECRET_FILE" ]; then
-    die "SearXNG secret path is not a regular file: $SEARXNG_SECRET_FILE"
-  fi
-  if [ ! -e "$SEARXNG_SECRET_FILE" ]; then
-    (umask 077; openssl rand -hex 32 >"$SEARXNG_SECRET_FILE")
-  fi
-  chmod 600 "$SEARXNG_SECRET_FILE"
-  if ! grep -Eq '^[0-9a-fA-F]{64}$' "$SEARXNG_SECRET_FILE" \
-    || [ "$(wc -l <"$SEARXNG_SECRET_FILE" | tr -d ' ')" -ne 1 ]; then
-    die "SearXNG secret file must contain exactly one 64-character hex key: $SEARXNG_SECRET_FILE"
-  fi
-}
-
-searxng_secret() {
-  ensure_searxng_secret
-  tr -d '\r\n' <"$SEARXNG_SECRET_FILE"
-}
-
 persist_install_config() {
-  mkdir -p "$(dirname "$INSTALL_CONFIG")"
-  chmod 700 "$(dirname "$INSTALL_CONFIG")"
+  ensure_data_dir
   (umask 077; printf '%s\n' \
     "LOCAL_SEARCH_DATA_DIR=$LOCAL_SEARCH_DATA_DIR" \
     "LOCAL_SEARCH_TELEMETRY_ENABLED=$LOCAL_SEARCH_TELEMETRY_ENABLED" \
-    "WEBSEARCH_PROVIDER_STACK=$WEBSEARCH_PROVIDER_STACK" \
+    "WEBSEARCH_PROVIDER_STACK=brave" \
     "WEBSEARCH_SEARCH_MODE=$WEBSEARCH_SEARCH_MODE" \
     "WEBSEARCH_TOTAL_TIMEOUT=$WEBSEARCH_TOTAL_TIMEOUT" \
-    "WEBSEARCH_SEARXNG_TIMEOUT=$WEBSEARCH_SEARXNG_TIMEOUT" \
     "WEBSEARCH_BRAVE_TIMEOUT=$WEBSEARCH_BRAVE_TIMEOUT" \
-    "WEBSEARCH_QUALITY_GATE=$WEBSEARCH_QUALITY_GATE" \
-    "WEBSEARCH_QUALITY_MIN_RESULTS=$WEBSEARCH_QUALITY_MIN_RESULTS" \
-    "WEBSEARCH_QUALITY_MIN_DOMAINS=$WEBSEARCH_QUALITY_MIN_DOMAINS" \
-    "WEBSEARCH_QUALITY_DUPLICATE_FRACTION=$WEBSEARCH_QUALITY_DUPLICATE_FRACTION" \
+    "DECODO_FALLBACK_ENABLED=$DECODO_FALLBACK_ENABLED" \
+    "DECODO_TIMEOUT=$DECODO_TIMEOUT" \
+    "DECODO_RESPONSE_MAX_BYTES=$DECODO_RESPONSE_MAX_BYTES" \
+    "WEBSEARCH_FETCH_OPERATION_TIMEOUT=$WEBSEARCH_FETCH_OPERATION_TIMEOUT" \
     >"$INSTALL_CONFIG")
   chmod 600 "$INSTALL_CONFIG"
 }
 
-telemetry_enabled() {
-  [ "$LOCAL_SEARCH_TELEMETRY_ENABLED" = "true" ]
-}
+telemetry_enabled() { [ "$LOCAL_SEARCH_TELEMETRY_ENABLED" = "true" ]; }
 
-# --------------------------------------------------------------------------- #
-# Prerequisites.
-# --------------------------------------------------------------------------- #
 check_prereqs() {
-  require_cmd git
   require_cmd curl
+  require_cmd git
+  require_cmd launchctl
+  require_cmd lsof
   require_cmd python3
   require_cmd uv
-  require_cmd launchctl
 }
 
 check_provider_credentials() {
   validate_search_configuration
-  case "$WEBSEARCH_PROVIDER_STACK" in
-    brave|searxng+brave) ;;
-    *) return 0 ;;
-  esac
-  local key_file="$LOCAL_SEARCH_DATA_DIR/brave_key"
-  if ! python3 - "$key_file" <<'PY'
-import os
+  local brave_key="$LOCAL_SEARCH_DATA_DIR/brave_key"
+  python3 - "$brave_key" "$DECODO_SECRET_FILE" <<'PY' || exit 1
 import stat
 import sys
 from pathlib import Path
 
-path = Path(sys.argv[1])
-try:
-    info = path.stat()
-    configured = (
+brave, decodo = map(Path, sys.argv[1:])
+def token(path: Path, *, required: bool) -> bool:
+    if not path.exists():
+        return not required
+    try:
+        info = path.lstat()
+        value = path.read_text(encoding="utf-8").strip()
+    except (OSError, UnicodeError):
+        return False
+    return (
         stat.S_ISREG(info.st_mode)
         and info.st_mode & 0o077 == 0
-        and any(line.strip() for line in path.read_text(encoding="utf-8").splitlines())
+        and bool(value)
+        and all(33 <= ord(char) <= 126 and not char.isspace() for char in value)
     )
-except (OSError, UnicodeError):
-    configured = False
-raise SystemExit(0 if configured else 1)
+if not token(brave, required=True):
+    print(f"Brave stack requires an owner-only nonempty key at {brave} (mode 600)", file=sys.stderr)
+    raise SystemExit(1)
+if not token(decodo, required=False):
+    print(f"Decodo key must be a regular, owner-only, single-token file at {decodo} (mode 600)", file=sys.stderr)
+    raise SystemExit(1)
 PY
-  then
-    die "Brave stack requires an owner-only nonempty key at $key_file; create it with mode 600 or install with WEBSEARCH_PROVIDER_STACK=searxng"
-  fi
-}
-
-searxng_ref() {
-  [ -f "$SEARXNG_REF_FILE" ] || die "missing $SEARXNG_REF_FILE"
-  grep -E '^[0-9a-f]{7,40}' "$SEARXNG_REF_FILE" | head -1 | awk '{print $1}'
-}
-
-# --------------------------------------------------------------------------- #
-# SearXNG source bootstrap.
-# --------------------------------------------------------------------------- #
-ensure_searxng_src() {
-  local ref
-  ref="$(searxng_ref)"
-  log "Ensuring SearXNG source at ref ${ref}"
-
-  if [ -d "$SEARXNG_SRC_DIR/.git" ]; then
-    log "SearXNG checkout exists; fetching ${ref}"
-    git -C "$SEARXNG_SRC_DIR" fetch --quiet origin
-    git -C "$SEARXNG_SRC_DIR" checkout -q "$ref" \
-      || die "could not check out ref $ref (update searxng/SEARXNG_REF)"
-    git -C "$SEARXNG_SRC_DIR" submodule update --init --quiet || true
-  elif [ -d "$SEARXNG_SRC_DIR" ]; then
-    # Source present but no .git (legacy unpacked checkout). Re-clone over it.
-    warn "searxng/src exists without .git; re-cloning to enable updates"
-    rm -rf "$SEARXNG_SRC_DIR"
-    git clone --quiet --no-checkout "$SEARXNG_REPO" "$SEARXNG_SRC_DIR"
-    git -C "$SEARXNG_SRC_DIR" checkout -q "$ref" \
-      || die "could not check out ref $ref"
-    git -C "$SEARXNG_SRC_DIR" submodule update --init --quiet || true
-  else
-    log "Cloning SearXNG at ${ref}"
-    git clone --quiet --no-checkout "$SEARXNG_REPO" "$SEARXNG_SRC_DIR"
-    git -C "$SEARXNG_SRC_DIR" checkout -q "$ref" \
-      || die "could not check out ref $ref"
-    git -C "$SEARXNG_SRC_DIR" submodule update --init --quiet || true
-  fi
-  ok "SearXNG source at $(git -C "$SEARXNG_SRC_DIR" rev-parse --short HEAD)"
-}
-
-ensure_searxng_venv() {
-  if [ -x "$SEARXNG_VENV/bin/python" ] && [ "${FORCE_REBUILD:-0}" != "1" ] \
-     && "$SEARXNG_VENV/bin/python" -c 'import searx' 2>/dev/null; then
-    log "SearXNG venv exists and imports searx"
-  else
-    log "Building SearXNG venv"
-    rm -rf "$SEARXNG_VENV"
-    uv venv --python 3.12 "$SEARXNG_VENV" >/dev/null
-    # SearXNG's setup.py reads requirements.txt into install_requires, but its
-    # package __init__ imports msgspec at build time. Install requirements first,
-    # then do a non-isolated editable install so the build sees those deps.
-    uv pip install --python "$SEARXNG_VENV/bin/python" \
-      -r "$SEARXNG_SRC_DIR/requirements.txt" >/dev/null
-    # Non-isolated editable build needs setuptools/wheel present in the venv.
-    uv pip install --python "$SEARXNG_VENV/bin/python" setuptools wheel >/dev/null
-    SEARXNG_SETTINGS_PATH="$SEARXNG_SETTINGS" \
-      uv pip install --python "$SEARXNG_VENV/bin/python" \
-      --no-build-isolation -e "$SEARXNG_SRC_DIR" >/dev/null
-  fi
-  ok "SearXNG venv ready"
 }
 
 ensure_mcp_venv() {
-  if [ -x "$MCP_VENV/bin/python" ] && [ "${FORCE_REBUILD:-0}" != "1" ]; then
-    log "MCP venv exists"
-  else
-    log "Building MCP websearch venv"
-    uv sync --project "$MCP_DIR" >/dev/null
-  fi
+  log "Synchronizing MCP websearch environment"
+  uv sync --project "$MCP_DIR" >/dev/null
+  [ -x "$MCP_VENV/bin/python" ] || die "MCP venv was not created"
   ok "MCP venv ready"
 }
 
-# --------------------------------------------------------------------------- #
-# Launchd plist management.
-# --------------------------------------------------------------------------- #
 write_plist() {
-  local label="$1" plist="$2" target tmp
+  local label="${1:-$MCP_LABEL}" plist="${2:-}" target tmp
   target="$PLIST_DIR/$label.plist"
   mkdir -p "$PLIST_DIR"
   tmp="$(mktemp "$PLIST_DIR/.${label}.XXXXXX")"
-  (umask 077; printf '%s' "$plist" >"$tmp")
+  if [ -n "$plist" ]; then
+    (umask 077; printf '%s' "$plist" >"$tmp")
+  else
+    (umask 077; mcp_plist >"$tmp")
+  fi
   chmod 600 "$tmp"
   /usr/bin/plutil -lint "$tmp" >/dev/null || { rm -f "$tmp"; die "invalid plist for $label"; }
   mv -f "$tmp" "$target"
   chmod 600 "$target"
   ok "Wrote $target"
-}
-
-searxng_plist() {
-  cat <<EOF
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0"><dict>
-<key>Label</key><string>${SEARXNG_LABEL}</string>
-<key>ProgramArguments</key><array>
-  <string>${SEARXNG_VENV}/bin/python</string><string>${SEARXNG_RUNNER}</string>
-</array>
-<key>WorkingDirectory</key><string>${SEARXNG_SRC_DIR}</string>
-<key>EnvironmentVariables</key><dict>
-  <key>SEARXNG_SETTINGS_PATH</key><string>${SEARXNG_SETTINGS}</string>
-  <key>SEARXNG_SECRET</key><string>$(searxng_secret)</string>
-</dict>
-<key>StandardOutPath</key><string>${LOG_DIR}/searxng.log</string>
-<key>StandardErrorPath</key><string>${LOG_DIR}/searxng.log</string>
-<key>KeepAlive</key><true/>
-<key>RunAtLoad</key><true/>
-<key>ThrottleInterval</key><integer>5</integer>
-<key>Umask</key><integer>63</integer>
-</dict></plist>
-EOF
 }
 
 mcp_plist() {
@@ -353,19 +234,17 @@ mcp_plist() {
 </array>
 <key>WorkingDirectory</key><string>${MCP_DIR}</string>
 <key>EnvironmentVariables</key><dict>
-  <key>SEARXNG_URL</key><string>${SEARXNG_URL}</string>
   <key>MCP_PORT</key><string>${MCP_PORT}</string>
-  <key>WEBSEARCH_PROVIDER_STACK</key><string>${WEBSEARCH_PROVIDER_STACK}</string>
+  <key>WEBSEARCH_PROVIDER_STACK</key><string>brave</string>
   <key>WEBSEARCH_SEARCH_MODE</key><string>${WEBSEARCH_SEARCH_MODE}</string>
   <key>WEBSEARCH_TOTAL_TIMEOUT</key><string>${WEBSEARCH_TOTAL_TIMEOUT}</string>
-  <key>WEBSEARCH_SEARXNG_TIMEOUT</key><string>${WEBSEARCH_SEARXNG_TIMEOUT}</string>
   <key>WEBSEARCH_BRAVE_TIMEOUT</key><string>${WEBSEARCH_BRAVE_TIMEOUT}</string>
-  <key>WEBSEARCH_QUALITY_GATE</key><string>${WEBSEARCH_QUALITY_GATE}</string>
-  <key>WEBSEARCH_QUALITY_MIN_RESULTS</key><string>${WEBSEARCH_QUALITY_MIN_RESULTS}</string>
-  <key>WEBSEARCH_QUALITY_MIN_DOMAINS</key><string>${WEBSEARCH_QUALITY_MIN_DOMAINS}</string>
-  <key>WEBSEARCH_QUALITY_DUPLICATE_FRACTION</key><string>${WEBSEARCH_QUALITY_DUPLICATE_FRACTION}</string>
   <key>LOCAL_SEARCH_DATA_DIR</key><string>${LOCAL_SEARCH_DATA_DIR}</string>
   <key>LOCAL_SEARCH_TELEMETRY_ENABLED</key><string>${LOCAL_SEARCH_TELEMETRY_ENABLED}</string>
+  <key>DECODO_FALLBACK_ENABLED</key><string>${DECODO_FALLBACK_ENABLED}</string>
+  <key>DECODO_TIMEOUT</key><string>${DECODO_TIMEOUT}</string>
+  <key>DECODO_RESPONSE_MAX_BYTES</key><string>${DECODO_RESPONSE_MAX_BYTES}</string>
+  <key>WEBSEARCH_FETCH_OPERATION_TIMEOUT</key><string>${WEBSEARCH_FETCH_OPERATION_TIMEOUT}</string>
   <key>FASTMCP_SHOW_SERVER_BANNER</key><string>false</string>
 </dict>
 <key>StandardOutPath</key><string>${LOG_DIR}/mcp-websearch.log</string>
@@ -381,95 +260,72 @@ EOF
 ensure_private_logs() {
   mkdir -p "$LOG_DIR"
   chmod 700 "$LOG_DIR"
-  (umask 077; touch "$LOG_DIR/searxng.log" "$LOG_DIR/mcp-websearch.log")
-  chmod 600 "$LOG_DIR/searxng.log" "$LOG_DIR/mcp-websearch.log"
+  (umask 077; touch "$LOG_DIR/mcp-websearch.log")
+  chmod 600 "$LOG_DIR/mcp-websearch.log"
 }
 
-install_plists() {
+install_plist() {
   ensure_private_logs
   ensure_data_dir
   persist_install_config
-  write_plist "$SEARXNG_LABEL" "$(searxng_plist)"
-  write_plist "$MCP_LABEL" "$(mcp_plist)"
+  write_plist
 }
 
-remove_plists() {
-  launchctl bootout "gui/$(id -u)/$SEARXNG_LABEL" >/dev/null 2>&1 || true
-  launchctl bootout "gui/$(id -u)/$MCP_LABEL" >/dev/null 2>&1 || true
-  rm -f "$PLIST_DIR/$SEARXNG_LABEL.plist" "$PLIST_DIR/$MCP_LABEL.plist"
-  ok "Removed launchd plists"
+retire_legacy_searxng() {
+  launchctl bootout "gui/$(id -u)/com.local.searxng" >/dev/null 2>&1 || true
+  rm -f "$PLIST_DIR/com.local.searxng.plist"
 }
 
-# --------------------------------------------------------------------------- #
-# Service control.
-# --------------------------------------------------------------------------- #
-# bootout blocks until the process has actually terminated, which avoids the
-# EADDRINUSE race where a new spawn tries to bind before the old socket closes.
-bootout_service() { launchctl bootout "gui/$(id -u)/$1" >/dev/null 2>&1 || true; }
+bootout_service() { launchctl bootout "gui/$(id -u)/$MCP_LABEL" >/dev/null 2>&1 || true; }
+
 bootstrap_service() {
-  local label="$1" target="gui/$(id -u)/$1" attempt
+  local target="gui/$(id -u)/$MCP_LABEL" attempt
+  [ -f "$MCP_PLIST" ] || die "missing $MCP_PLIST; run install first"
+  launchctl enable "$target" 2>/dev/null || true
   if launchctl print "$target" >/dev/null 2>&1; then
-    if launchctl kickstart -k "$target" >/dev/null 2>&1; then
-      return
-    fi
-    # A stale registration can survive briefly after bootout.
-    bootout_service "$label"
+    launchctl kickstart -k "$target" >/dev/null 2>&1 && return
+    bootout_service
     sleep 1
   fi
-  # launchd may briefly reject a bootstrap immediately after bootout; retry
-  # instead of swallowing the failure and reporting a later health timeout.
   for attempt in 1 2 3; do
-    launchctl bootstrap "gui/$(id -u)" "$PLIST_DIR/$label.plist" >/dev/null 2>&1 && return
+    launchctl bootstrap "gui/$(id -u)" "$MCP_PLIST" >/dev/null 2>&1 && return
     sleep 1
   done
-  warn "could not bootstrap $label"
-  return 1
+  die "could not bootstrap $MCP_LABEL"
+}
+
+_wait_port_free() {
+  local port="$1" timeout="${2:-15}" i=0
+  while [ "$i" -lt "$timeout" ]; do
+    lsof -nP -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1 || return 0
+    sleep 1; i=$((i+1))
+  done
+  die "port $port still bound after ${timeout}s"
 }
 
 start_services() {
   check_provider_credentials
-  ensure_searxng_secret
-  bootstrap_service "$SEARXNG_LABEL"
-  bootstrap_service "$MCP_LABEL"
-  launchctl enable "gui/$(id -u)/$SEARXNG_LABEL" 2>/dev/null || true
-  launchctl enable "gui/$(id -u)/$MCP_LABEL" 2>/dev/null || true
+  bootstrap_service
 }
 
-stop_services() {
-  bootout_service "$MCP_LABEL"
-  bootout_service "$SEARXNG_LABEL"
-}
+stop_services() { bootout_service; }
 
 restart_services() {
   check_provider_credentials
-  # Stop mcp first (depends on searxng), wait for ports to free, then start
-  # searxng first and wait for it before starting mcp.
   stop_services
   _wait_port_free "$MCP_PORT"
-  bootstrap_service "$SEARXNG_LABEL"
-  wait_http "$SEARXNG_URL/healthz" "OK" 30 || warn "searxng did not come up"
-  bootstrap_service "$MCP_LABEL"
+  bootstrap_service
   wait_http "http://127.0.0.1:${MCP_PORT}/live" '"status":"ok"' 30
 }
 
-_wait_port_free() { # port [timeout]
-  local port="$1" t="${2:-15}" i=0
-  while [ $i -lt $t ]; do
-    lsof -nP -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1 || return 0
-    sleep 1; i=$((i+1))
-  done
-  warn "port $port still bound after ${t}s"
-  return 1
-}
-
-# --------------------------------------------------------------------------- #
-# Health / verification.
-# --------------------------------------------------------------------------- #
-wait_http() { # url expected_substr timeout
-  local url="$1" want="$2" t="${3:-20}" i=0 body
-  while [ $i -lt $t ]; do
+wait_http() {
+  local url="$1" want="$2" timeout="${3:-20}" i=0 body
+  while [ "$i" -lt "$timeout" ]; do
     body="$(curl -fsS --max-time 3 "$url" 2>/dev/null || true)"
-    if [ -n "$body" ] && echo "$body" | grep -q "$want"; then ok "$url → $want"; return 0; fi
+    if [ -n "$body" ] && printf '%s' "$body" | grep -q "$want"; then
+      ok "$url → $want"
+      return 0
+    fi
     sleep 1; i=$((i+1))
   done
   warn "timeout waiting for $url (wanted '$want')"
@@ -477,223 +333,155 @@ wait_http() { # url expected_substr timeout
 }
 
 verify() {
-  local rc=0
-  wait_http "$SEARXNG_URL/healthz" "OK" 30 || rc=1
-  sleep 2
+  local rc=0 tools
   wait_http "http://127.0.0.1:${MCP_PORT}/live" '"status":"ok"' 30 || rc=1
   wait_http "http://127.0.0.1:${MCP_PORT}/ready" '"ready":true' 30 || rc=1
   if telemetry_enabled; then
     wait_http "http://127.0.0.1:${MCP_PORT}/stats?window=24h" '"available":true' 30 || rc=1
   fi
   log "MCP tools/list"
-  local tools
   tools="$(curl -fsS --max-time 5 -X POST "http://127.0.0.1:${MCP_PORT}/mcp" \
     -H 'content-type: application/json' -H 'accept: application/json' \
     -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' 2>/dev/null \
     | python3 -c 'import sys,json;d=json.load(sys.stdin);print(",".join(sorted(t["name"] for t in d.get("result",{}).get("tools",[]))))' 2>/dev/null || true)"
-  if [ "$tools" = "batch_web_search,image_search,verify_url,web_fetch,web_search" ]; then ok "MCP tools: $tools"; else warn "MCP tools/list unexpected: '$tools'"; rc=1; fi
-  return $rc
+  if [ "$tools" = "batch_web_search,image_search,verify_url,web_fetch,web_search" ]; then
+    ok "MCP tools: $tools"
+  else
+    warn "MCP tools/list unexpected: '$tools'"
+    rc=1
+  fi
+  return "$rc"
 }
 
 status() {
-  local s_state m_state
-  s_state="$(launchctl print "gui/$(id -u)/$SEARXNG_LABEL" 2>/dev/null | awk -F' = ' '/^[[:space:]]*state/ {print $2; exit}' || echo 'not-loaded')"
-  m_state="$(launchctl print "gui/$(id -u)/$MCP_LABEL" 2>/dev/null | awk -F' = ' '/^[[:space:]]*state/ {print $2; exit}' || echo 'not-loaded')"
-  printf '%-22s %s\n' "searxng launchd:" "${s_state:-unknown}"
-  printf '%-22s %s\n' "mcp-websearch launchd:" "${m_state:-unknown}"
-  printf '%-22s %s\n' "searxng health:" "$(curl -fsS --max-time 3 "$SEARXNG_URL/healthz" 2>/dev/null || echo 'DOWN')"
-  local h
-  h="$(curl -fsS --max-time 3 "http://127.0.0.1:${MCP_PORT}/health" 2>/dev/null || echo 'DOWN')"
-  printf '%-22s %s\n' "mcp /health:" "$(echo "$h" | python3 -c 'import sys,json;d=json.load(sys.stdin);last=d.get("last_search") or {};telemetry=d.get("telemetry") or {};print(d.get("status","?"),"ready="+str(d.get("ready","?")),"stack="+str(d.get("provider_stack","?")),"telemetry="+str(telemetry.get("available","?")),"last_backend="+str(last.get("backend","none")))' 2>/dev/null || echo "$h")"
+  local state health
+  state="$(launchctl print "gui/$(id -u)/$MCP_LABEL" 2>/dev/null | awk -F' = ' '/^[[:space:]]*state/ {print $2; exit}' || echo 'not-loaded')"
+  printf '%-22s %s\n' "mcp-websearch launchd:" "${state:-unknown}"
+  health="$(curl -fsS --max-time 3 "http://127.0.0.1:${MCP_PORT}/health" 2>/dev/null || echo 'DOWN')"
+  printf '%-22s %s\n' "mcp /health:" "$(printf '%s' "$health" | python3 -c 'import sys,json;d=json.load(sys.stdin);t=d.get("telemetry") or {};f=(d.get("policy") or {}).get("fetch_fallbacks") or {};dc=f.get("decodo") or {};print(d.get("status","?"),"ready="+str(d.get("ready","?")),"stack="+str(d.get("provider_stack","?")),"telemetry="+str(t.get("available","?")),"decodo="+str(dc.get("credential_configured","?")))' 2>/dev/null || echo "$health")"
 }
 
-# --------------------------------------------------------------------------- #
-# Subcommands.
-# --------------------------------------------------------------------------- #
 cmd_install() {
   local start=1
   [ "${1:-}" = "--no-start" ] && start=0
   check_prereqs
-  [ $start -eq 0 ] || check_provider_credentials
+  [ "$start" -eq 0 ] || check_provider_credentials
   log "Installing local-search into $ROOT_DIR"
-  ensure_searxng_src
-  ensure_searxng_venv
   ensure_mcp_venv
-  install_plists
-  if [ $start -eq 1 ]; then
-    # Pick up (possibly rewritten) plists: stop any old registration, then
-    # bootstrap fresh. Ordering: searxng up first, then mcp.
+  install_plist
+  if [ "$start" -eq 1 ]; then
     stop_services
     _wait_port_free "$MCP_PORT"
     start_services
-    log "Waiting for services to come up..."
-    wait_http "$SEARXNG_URL/healthz" "OK" 30 || true
-    sleep 2
-    verify || die "verification failed; check 'local-search logs'"
+    verify || die "verification failed; check 'local-search logs mcp'"
+    retire_legacy_searxng
   fi
   ok "local-search installed"
 }
 
 cmd_uninstall() {
-  log "Uninstalling local-search services"
   stop_services
-  remove_plists
-  ok "Uninstalled (src, venvs, and telemetry retained; rerun 'install' to restore)"
+  rm -f "$MCP_PLIST"
+  retire_legacy_searxng
+  ok "Uninstalled (venv, telemetry, cache, and keys retained)"
+}
+
+cmd_update_after_pull() {
+  check_prereqs
+  check_provider_credentials
+  ensure_mcp_venv
+  install_plist
+  restart_services
+  verify || die "verification failed after update"
+  retire_legacy_searxng
+  ok "local-search updated"
 }
 
 cmd_update() {
   check_prereqs
-  log "Pulling local-search repo"
+  check_provider_credentials
   git -C "$ROOT_DIR" pull --ff-only
-  FORCE_REBUILD=1 ensure_searxng_src
-  FORCE_REBUILD=1 ensure_searxng_venv
-  FORCE_REBUILD=1 ensure_mcp_venv
-  install_plists
-  restart_services
-  sleep 3
-  verify || die "verification failed after update"
-  ok "local-search updated"
-}
-
-cmd_update_ref() {
-  local sha="${1:-}"
-  [ -n "$sha" ] || die "usage: local-search update-searxng-ref <commit-sha>"
-  local date subj
-  date="$(curl -fsS "https://api.github.com/repos/searxng/searxng/commits/$sha" \
-    | python3 -c 'import sys,json;d=json.load(sys.stdin);print(d["commit"]["author"]["date"][:10])' 2>/dev/null || echo 'unknown-date')"
-  subj="$(curl -fsS "https://api.github.com/repos/searxng/searxng/commits/$sha" \
-    | python3 -c 'import sys,json;d=json.load(sys.stdin);print(d["commit"]["message"].splitlines()[0][:40])' 2>/dev/null || echo 'updated')"
-  printf '%s  # %s %s\n' "$sha" "$date" "$subj" > "$SEARXNG_REF_FILE"
-  ok "Pinned searxng/SEARXNG_REF → $sha"
+  exec "$ROOT_DIR/scripts/local-search" _update-after-pull
 }
 
 cmd_env() {
   cat <<EOF
 ROOT_DIR=$ROOT_DIR
-SEARXNG_SRC_DIR=$SEARXNG_SRC_DIR
-SEARXNG_SETTINGS=$SEARXNG_SETTINGS
-SEARXNG_RUNNER=$SEARXNG_RUNNER
-SEARXNG_REF=$(searxng_ref)
-SEARXNG_SECRET_FILE=$SEARXNG_SECRET_FILE
-SEARXNG_URL=$SEARXNG_URL
-SEARXNG_LABEL=$SEARXNG_LABEL
 MCP_DIR=$MCP_DIR
 MCP_VENV=$MCP_VENV
 MCP_PORT=$MCP_PORT
 MCP_LABEL=$MCP_LABEL
-WEBSEARCH_PROVIDER_STACK=$WEBSEARCH_PROVIDER_STACK
+WEBSEARCH_PROVIDER_STACK=brave
 WEBSEARCH_SEARCH_MODE=$WEBSEARCH_SEARCH_MODE
 WEBSEARCH_TOTAL_TIMEOUT=$WEBSEARCH_TOTAL_TIMEOUT
-WEBSEARCH_SEARXNG_TIMEOUT=$WEBSEARCH_SEARXNG_TIMEOUT
 WEBSEARCH_BRAVE_TIMEOUT=$WEBSEARCH_BRAVE_TIMEOUT
-WEBSEARCH_QUALITY_GATE=$WEBSEARCH_QUALITY_GATE
-WEBSEARCH_QUALITY_MIN_RESULTS=$WEBSEARCH_QUALITY_MIN_RESULTS
-WEBSEARCH_QUALITY_MIN_DOMAINS=$WEBSEARCH_QUALITY_MIN_DOMAINS
-WEBSEARCH_QUALITY_DUPLICATE_FRACTION=$WEBSEARCH_QUALITY_DUPLICATE_FRACTION
 LOCAL_SEARCH_DATA_DIR=$LOCAL_SEARCH_DATA_DIR
 LOCAL_SEARCH_TELEMETRY_ENABLED=$LOCAL_SEARCH_TELEMETRY_ENABLED
+DECODO_FALLBACK_ENABLED=$DECODO_FALLBACK_ENABLED
+DECODO_TIMEOUT=$DECODO_TIMEOUT
+DECODO_RESPONSE_MAX_BYTES=$DECODO_RESPONSE_MAX_BYTES
+WEBSEARCH_FETCH_OPERATION_TIMEOUT=$WEBSEARCH_FETCH_OPERATION_TIMEOUT
+DECODO_SECRET_FILE=$DECODO_SECRET_FILE
 LOG_DIR=$LOG_DIR
 EOF
 }
 
 cmd_stats() {
   local window="${1:-24h}"
-  case "$window" in
-    24h|7d|30d) ;;
-    *) die "usage: local-search stats [24h|7d|30d]" ;;
-  esac
+  case "$window" in 24h|7d|30d) ;; *) die "usage: local-search stats [24h|7d|30d]" ;; esac
   curl -fsS --max-time 10 "http://127.0.0.1:${MCP_PORT}/stats?window=${window}" \
     | python3 -m json.tool
 }
 
 cmd_telemetry_reset() {
   [ "${1:-}" = "--yes" ] || die "usage: local-search telemetry-reset --yes"
-  [ -x "$MCP_VENV/bin/python" ] || die "MCP venv missing; run 'local-search install' first"
+  [ -x "$MCP_VENV/bin/python" ] || die "MCP venv missing; run install first"
   ensure_data_dir
-
-  # The running process owns an asynchronous writer queue. Stop it cleanly so
-  # a pre-reset event cannot be written back after the database is cleared.
   local was_loaded=0 rc=0
-  if [ -f "$MCP_PLIST" ] && launchctl print "gui/$(id -u)/$MCP_LABEL" >/dev/null 2>&1; then
+  if launchctl print "gui/$(id -u)/$MCP_LABEL" >/dev/null 2>&1; then
     was_loaded=1
-    bootout_service "$MCP_LABEL"
-    if launchctl print "gui/$(id -u)/$MCP_LABEL" >/dev/null 2>&1; then
-      die "could not stop $MCP_LABEL; telemetry was not reset"
-    fi
-    _wait_port_free "$MCP_PORT" || die "MCP port still active; telemetry was not reset"
+    bootout_service
+    _wait_port_free "$MCP_PORT"
   fi
-
   "$MCP_VENV/bin/python" "$MCP_DIR/telemetry.py" reset \
     --data-dir "$LOCAL_SEARCH_DATA_DIR" || rc=$?
-
   if [ "$was_loaded" -eq 1 ]; then
-    bootstrap_service "$MCP_LABEL"
-    wait_http "http://127.0.0.1:${MCP_PORT}/live" '"status":"ok"' 30 \
-      || rc=1
+    bootstrap_service
+    wait_http "http://127.0.0.1:${MCP_PORT}/live" '"status":"ok"' 30 || rc=1
   fi
   return "$rc"
 }
 
 cmd_logs() {
-  local which="${1:-all}"
+  local which="${1:-mcp}" lines="${2:--50}"
   ensure_private_logs
   case "$which" in
-    searxng) tail "${2:--50}" "$LOG_DIR/searxng.log" 2>/dev/null || warn "no searxng log yet" ;;
-    mcp|mcp-websearch) tail "${2:--50}" "$LOG_DIR/mcp-websearch.log" 2>/dev/null || warn "no mcp log yet" ;;
-    all|"") tail "${2:--50}" "$LOG_DIR/searxng.log" "$LOG_DIR/mcp-websearch.log" 2>/dev/null || warn "no logs yet" ;;
-    *) die "usage: local-search logs [searxng|mcp] [lines]" ;;
+    mcp|mcp-websearch|all|"") tail "$lines" "$LOG_DIR/mcp-websearch.log" 2>/dev/null || warn "no mcp log yet" ;;
+    *) die "usage: local-search logs [mcp] [lines]" ;;
   esac
 }
 
 cmd_rotate_logs() {
   [ "${1:-}" = "--yes" ] || die "usage: local-search rotate-logs --yes"
-  local searxng_loaded=0 mcp_loaded=0 stamp archive file target archived n rc=0
-  launchctl print "gui/$(id -u)/$SEARXNG_LABEL" >/dev/null 2>&1 && searxng_loaded=1
-  launchctl print "gui/$(id -u)/$MCP_LABEL" >/dev/null 2>&1 && mcp_loaded=1
-
-  # Stop first so launchd releases its file descriptors. Existing logs are moved,
-  # never truncated or deleted, and remain available only to the current user.
+  local loaded=0 stamp archive target archived n=0 rc=0
+  launchctl print "gui/$(id -u)/$MCP_LABEL" >/dev/null 2>&1 && loaded=1
   stop_services
-  _wait_port_free "$MCP_PORT" || die "MCP port still active; logs were not rotated"
+  _wait_port_free "$MCP_PORT"
   ensure_private_logs
   stamp="$(date -u +%Y%m%dT%H%M%SZ)"
   archive="$LOG_DIR/archive"
-  mkdir -p "$archive"
-  chmod 700 "$archive"
-  for file in searxng.log mcp-websearch.log; do
-    target="$LOG_DIR/$file"
-    if [ -s "$target" ]; then
-      n=0
-      archived="$archive/${file%.log}.${stamp}.log"
-      while [ -e "$archived" ]; do
-        n=$((n+1))
-        archived="$archive/${file%.log}.${stamp}.${n}.log"
-      done
-      mv "$target" "$archived"
-      chmod 600 "$archived"
-      ok "Archived without deleting: $archived"
-    fi
-    (umask 077; : >"$target")
-    chmod 600 "$target"
-  done
-
-  if [ "$searxng_loaded" -eq 1 ]; then
-    if ! bootstrap_service "$SEARXNG_LABEL"; then
-      warn "searxng could not be restarted after log rotation"
-      rc=1
-    elif ! wait_http "$SEARXNG_URL/healthz" "OK" 30; then
-      warn "searxng did not become healthy after log rotation"
-      rc=1
-    fi
+  target="$LOG_DIR/mcp-websearch.log"
+  mkdir -p "$archive"; chmod 700 "$archive"
+  if [ -s "$target" ]; then
+    archived="$archive/mcp-websearch.${stamp}.log"
+    while [ -e "$archived" ]; do n=$((n+1)); archived="$archive/mcp-websearch.${stamp}.${n}.log"; done
+    mv "$target" "$archived"; chmod 600 "$archived"
+    ok "Archived without deleting: $archived"
   fi
-  if [ "$mcp_loaded" -eq 1 ]; then
-    if ! bootstrap_service "$MCP_LABEL"; then
-      warn "mcp-websearch could not be restarted after log rotation"
-      rc=1
-    elif ! wait_http "http://127.0.0.1:${MCP_PORT}/live" '"status":"ok"' 30; then
-      warn "mcp-websearch did not become live after log rotation"
-      rc=1
-    fi
+  (umask 077; : >"$target"); chmod 600 "$target"
+  if [ "$loaded" -eq 1 ]; then
+    bootstrap_service || rc=1
+    wait_http "http://127.0.0.1:${MCP_PORT}/live" '"status":"ok"' 30 || rc=1
   fi
   return "$rc"
 }
@@ -702,9 +490,9 @@ cmd_mcp_stdio() {
   validate_search_configuration
   export LOCAL_SEARCH_DATA_DIR LOCAL_SEARCH_TELEMETRY_ENABLED
   export WEBSEARCH_PROVIDER_STACK WEBSEARCH_SEARCH_MODE WEBSEARCH_TOTAL_TIMEOUT
-  export WEBSEARCH_SEARXNG_TIMEOUT WEBSEARCH_BRAVE_TIMEOUT
-  export WEBSEARCH_QUALITY_GATE WEBSEARCH_QUALITY_MIN_RESULTS WEBSEARCH_QUALITY_MIN_DOMAINS
-  export WEBSEARCH_QUALITY_DUPLICATE_FRACTION
+  export WEBSEARCH_BRAVE_TIMEOUT
+  export DECODO_FALLBACK_ENABLED DECODO_TIMEOUT DECODO_RESPONSE_MAX_BYTES
+  export WEBSEARCH_FETCH_OPERATION_TIMEOUT
   exec "$MCP_VENV/bin/python" "$MCP_DIR/server.py"
 }
 
@@ -713,11 +501,8 @@ usage() {
   exit 1
 }
 
-# --------------------------------------------------------------------------- #
-# Dispatch.
-# --------------------------------------------------------------------------- #
 main() {
-  [ $# -ge 1 ] || usage
+  [ "$#" -ge 1 ] || usage
   case "$1" in
     install|bootstrap) shift; cmd_install "$@" ;;
     uninstall) cmd_uninstall ;;
@@ -731,11 +516,11 @@ main() {
     logs) shift; cmd_logs "$@" ;;
     rotate-logs) shift; cmd_rotate_logs "$@" ;;
     update) cmd_update ;;
-    update-searxng-ref) shift; cmd_update_ref "$@" ;;
+    _update-after-pull) cmd_update_after_pull ;;
     mcp-stdio) cmd_mcp_stdio ;;
     env) cmd_env ;;
     -h|--help|help) usage ;;
-    *) die "unknown command: $1"; usage ;;
+    *) die "unknown command: $1" ;;
   esac
 }
 

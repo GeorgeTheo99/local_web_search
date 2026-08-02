@@ -13,6 +13,7 @@ import pytest
 from telemetry import (
     DB_FILENAME,
     FetchEvent,
+    FetchOperation,
     InvalidWindow,
     ProviderEvent,
     SearchEvent,
@@ -76,6 +77,60 @@ def test_persists_across_reopen_and_uses_private_permissions(tmp_path):
         reopened.close()
 
 
+def test_v6_database_migrates_fetch_provider_columns_before_index_creation(tmp_path):
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    db_path = data_dir / DB_FILENAME
+    with sqlite3.connect(db_path) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE fetch_events (
+                id INTEGER PRIMARY KEY,
+                created_at INTEGER NOT NULL,
+                url_host TEXT NOT NULL,
+                http_status INTEGER,
+                outcome TEXT NOT NULL,
+                tier_used TEXT NOT NULL,
+                bytes INTEGER,
+                latency_ms REAL NOT NULL,
+                cache_hit INTEGER NOT NULL DEFAULT 0
+            );
+            INSERT INTO fetch_events(
+                created_at, url_host, http_status, outcome, tier_used,
+                bytes, latency_ms, cache_hit
+            ) VALUES
+                (1, 'direct.example', 200, 'success', 'direct', 10, 1.0, 0),
+                (2, 'jina.example', 200, 'proxy_success', 'proxy', 20, 2.0, 0),
+                (3, 'cache.example', NULL, 'success', 'direct', 30, 0.1, 1);
+            PRAGMA user_version = 6;
+            """
+        )
+
+    store = TelemetryStore(data_dir)
+    try:
+        assert store.available is True
+        with sqlite3.connect(store.db_path) as conn:
+            columns = {
+                row[1] for row in conn.execute("PRAGMA table_info(fetch_events)")
+            }
+            providers = conn.execute(
+                "SELECT provider, trigger FROM fetch_events ORDER BY id"
+            ).fetchall()
+            operation_table = conn.execute(
+                "SELECT name FROM sqlite_master "
+                "WHERE type = 'table' AND name = 'fetch_operations'"
+            ).fetchone()
+        assert {"provider", "trigger"} <= columns
+        assert providers == [
+            ("direct", "none"),
+            ("jina", "none"),
+            ("cache", "none"),
+        ]
+        assert operation_table == ("fetch_operations",)
+    finally:
+        store.close()
+
+
 def test_fetch_events_persist_only_normalized_hosts_and_bounded_outcomes(tmp_path):
     store = TelemetryStore(tmp_path / "data")
     try:
@@ -113,6 +168,40 @@ def test_fetch_events_persist_only_normalized_hosts_and_bounded_outcomes(tmp_pat
         ]
         assert "private" not in repr(rows)
         assert "secret" not in repr(rows)
+    finally:
+        store.close()
+
+
+def test_fetch_operations_report_terminal_provider_success_rates(tmp_path):
+    now = 2_000_000_000
+    store = TelemetryStore(tmp_path / "data")
+    try:
+        store.record_fetch_operation(FetchOperation(
+            "example.com", "success", "direct", "none", 200, 100, 10.0,
+            created_at=now - 3,
+        ))
+        store.record_fetch_operation(FetchOperation(
+            "blocked.example", "success", "decodo", "http_403", 200, 200, 40.0,
+            created_at=now - 2,
+        ))
+        store.record_fetch_operation(FetchOperation(
+            "failed.example", "error", "none", "http_429", 429, None, 50.0,
+            created_at=now - 1,
+        ))
+        assert store.flush()
+
+        stats = store.stats("24h", now=now)
+
+        assert stats["fetches"]["total"] == 3
+        assert stats["fetches"]["successes"] == 2
+        assert stats["fetches"]["errors"] == 1
+        assert stats["fetches"]["success_rate"] == 0.6667
+        assert stats["fetches"]["providers"]["decodo"] == {
+            "operations": 1,
+            "successes": 1,
+            "success_rate": 1.0,
+            "average_latency_ms": 40.0,
+        }
     finally:
         store.close()
 
@@ -176,6 +265,14 @@ def test_cache_hit_fields_aggregate_without_provider_or_fallback_inflation(tmp_p
         ))
         store.record_fetch(FetchEvent(
             "example.com", None, "success", "direct", 10, 0.1,
+            cache_hit=True, created_at=now - 1, provider="cache",
+        ))
+        store.record_fetch_operation(FetchOperation(
+            "example.com", "success", "direct", "none", 200, 10, 1.0,
+            cache_hit=False, created_at=now - 2,
+        ))
+        store.record_fetch_operation(FetchOperation(
+            "example.com", "success", "cache", "none", None, 10, 0.1,
             cache_hit=True, created_at=now - 1,
         ))
         assert store.flush()
@@ -272,6 +369,7 @@ def test_explicit_reset_clears_events_but_keeps_database(tmp_path):
         assert store.stats("30d", now=2_000_000_100)["searches"]["total"] == 0
         with sqlite3.connect(store.db_path) as conn:
             assert conn.execute("SELECT COUNT(*) FROM fetch_events").fetchone()[0] == 0
+            assert conn.execute("SELECT COUNT(*) FROM fetch_operations").fetchone()[0] == 0
     finally:
         store.close()
 

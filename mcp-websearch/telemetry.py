@@ -28,7 +28,7 @@ from typing import Any
 logger = logging.getLogger("websearch-mcp.telemetry")
 
 DB_FILENAME = "telemetry.sqlite3"
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 VALID_WINDOWS = {"24h": 24 * 60 * 60, "7d": 7 * 24 * 60 * 60, "30d": 30 * 24 * 60 * 60}
 
 _SEARCH_STATUSES = {"ok", "empty", "degraded", "error", "timeout"}
@@ -52,10 +52,15 @@ _FETCH_OUTCOMES = {
     "http_error",
     "connection_error",
     "timeout",
+    "challenge",
+    "extraction_error",
     "proxy_success",
     "proxy_error",
 }
 _FETCH_TIERS = {"direct", "proxy", "browser"}
+_FETCH_PROVIDERS = {"cache", "direct", "jina", "decodo", "none"}
+_FETCH_TRIGGERS = {"none", "http_403", "http_429", "empty", "antibot"}
+_FETCH_OPERATION_OUTCOMES = {"success", "error"}
 
 
 class InvalidWindow(ValueError):
@@ -103,6 +108,24 @@ class FetchEvent:
     http_status: int | None
     outcome: str
     tier_used: str
+    bytes: int | None
+    latency_ms: float
+    created_at: int = field(default_factory=lambda: int(time.time()))
+    created_at_ns: int = field(default_factory=time.time_ns)
+    cache_hit: bool = False
+    provider: str = "direct"
+    trigger: str = "none"
+
+
+@dataclass(frozen=True)
+class FetchOperation:
+    """One terminal, host-only outcome for an entire web_fetch operation."""
+
+    url_host: str
+    outcome: str
+    provider: str
+    trigger: str
+    http_status: int | None
     bytes: int | None
     latency_ms: float
     created_at: int = field(default_factory=lambda: int(time.time()))
@@ -178,7 +201,9 @@ class TelemetryStore:
         self.enabled = enabled
         self.available = False
         self._reason = "disabled" if not enabled else "unavailable"
-        self._queue: queue.Queue[SearchEvent | FetchEvent | _FlushMarker | None] = queue.Queue(
+        self._queue: queue.Queue[
+            SearchEvent | FetchEvent | FetchOperation | _FlushMarker | None
+        ] = queue.Queue(
             maxsize=queue_size
         )
         self._operation_lock = threading.Lock()
@@ -267,12 +292,31 @@ class TelemetryStore:
                     tier_used TEXT NOT NULL,
                     bytes INTEGER,
                     latency_ms REAL NOT NULL,
-                    cache_hit INTEGER NOT NULL DEFAULT 0
+                    cache_hit INTEGER NOT NULL DEFAULT 0,
+                    provider TEXT NOT NULL DEFAULT 'direct',
+                    trigger TEXT NOT NULL DEFAULT 'none'
                 );
                 CREATE INDEX IF NOT EXISTS idx_fetch_events_created_at
                     ON fetch_events(created_at);
                 CREATE INDEX IF NOT EXISTS idx_fetch_events_host
                     ON fetch_events(url_host);
+
+                CREATE TABLE IF NOT EXISTS fetch_operations (
+                    id INTEGER PRIMARY KEY,
+                    created_at INTEGER NOT NULL,
+                    url_host TEXT NOT NULL,
+                    outcome TEXT NOT NULL,
+                    provider TEXT NOT NULL,
+                    trigger TEXT NOT NULL,
+                    http_status INTEGER,
+                    bytes INTEGER,
+                    latency_ms REAL NOT NULL,
+                    cache_hit INTEGER NOT NULL DEFAULT 0
+                );
+                CREATE INDEX IF NOT EXISTS idx_fetch_operations_created_at
+                    ON fetch_operations(created_at);
+                CREATE INDEX IF NOT EXISTS idx_fetch_operations_provider
+                    ON fetch_operations(provider, created_at);
 
                 CREATE TABLE IF NOT EXISTS telemetry_health_events (
                     id INTEGER PRIMARY KEY,
@@ -310,6 +354,31 @@ class TelemetryStore:
                         "ALTER TABLE fetch_events "
                         "ADD COLUMN cache_hit INTEGER NOT NULL DEFAULT 0"
                     )
+
+            if current_version < 7:
+                fetch_columns = {
+                    str(row[1]) for row in conn.execute("PRAGMA table_info(fetch_events)")
+                }
+                if "provider" not in fetch_columns:
+                    conn.execute(
+                        "ALTER TABLE fetch_events "
+                        "ADD COLUMN provider TEXT NOT NULL DEFAULT 'direct'"
+                    )
+                    conn.execute(
+                        "UPDATE fetch_events SET provider = CASE "
+                        "WHEN cache_hit = 1 THEN 'cache' "
+                        "WHEN tier_used = 'proxy' THEN 'jina' "
+                        "ELSE 'direct' END"
+                    )
+                if "trigger" not in fetch_columns:
+                    conn.execute(
+                        "ALTER TABLE fetch_events "
+                        "ADD COLUMN trigger TEXT NOT NULL DEFAULT 'none'"
+                    )
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_fetch_events_provider "
+                    "ON fetch_events(provider, created_at)"
+                )
 
             conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         self._secure_files()
@@ -351,11 +420,23 @@ class TelemetryStore:
             return False
 
     def record_fetch(self, event: FetchEvent) -> bool:
-        """Queue a host-only fetch outcome without delaying the fetch response."""
+        """Queue a host-only fetch attempt without delaying the fetch response."""
         if not self.available:
             return False
         try:
             self._queue.put_nowait(event)
+            return True
+        except queue.Full:
+            self._note_drop()
+            logger.warning("Telemetry queue full; dropping operational event")
+            return False
+
+    def record_fetch_operation(self, operation: FetchOperation) -> bool:
+        """Queue one terminal host-only outcome for an entire fetch operation."""
+        if not self.available:
+            return False
+        try:
+            self._queue.put_nowait(operation)
             return True
         except queue.Full:
             self._note_drop()
@@ -375,6 +456,8 @@ class TelemetryStore:
                     with self._operation_lock:
                         if isinstance(item, FetchEvent):
                             self._write_fetch_event(item)
+                        elif isinstance(item, FetchOperation):
+                            self._write_fetch_operation(item)
                         else:
                             self._write_event(item)
                 except Exception as exc:
@@ -508,8 +591,8 @@ class TelemetryStore:
                     """
                     INSERT INTO fetch_events(
                         created_at, url_host, http_status, outcome, tier_used,
-                        bytes, latency_ms, cache_hit
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        bytes, latency_ms, cache_hit, provider, trigger
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         max(0, int(event.created_at)),
@@ -520,6 +603,45 @@ class TelemetryStore:
                         body_bytes,
                         max(0.0, float(event.latency_ms)),
                         int(bool(event.cache_hit)),
+                        _enum(event.provider, _FETCH_PROVIDERS, "none"),
+                        _enum(event.trigger, _FETCH_TRIGGERS, "none"),
+                    ),
+                )
+        self._mark_drops_persisted(len(pending_drops))
+        self._secure_files()
+
+    def _write_fetch_operation(self, operation: FetchOperation) -> None:
+        http_status = operation.http_status
+        if http_status is not None and not 100 <= int(http_status) <= 599:
+            http_status = None
+        body_bytes = None if operation.bytes is None else max(0, int(operation.bytes))
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            reset_before_ns = int(
+                conn.execute(
+                    "SELECT reset_before_ns FROM telemetry_meta WHERE singleton = 1"
+                ).fetchone()[0]
+            )
+            pending_drops = self._pending_drops()
+            self._persist_drop_batch(conn, pending_drops, reset_before_ns)
+            if int(operation.created_at_ns) > reset_before_ns:
+                conn.execute(
+                    """
+                    INSERT INTO fetch_operations(
+                        created_at, url_host, outcome, provider, trigger,
+                        http_status, bytes, latency_ms, cache_hit
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        max(0, int(operation.created_at)),
+                        _url_host(operation.url_host),
+                        _enum(operation.outcome, _FETCH_OPERATION_OUTCOMES, "error"),
+                        _enum(operation.provider, _FETCH_PROVIDERS, "none"),
+                        _enum(operation.trigger, _FETCH_TRIGGERS, "none"),
+                        http_status,
+                        body_bytes,
+                        max(0.0, float(operation.latency_ms)),
+                        int(bool(operation.cache_hit)),
                     ),
                 )
         self._mark_drops_persisted(len(pending_drops))
@@ -649,10 +771,46 @@ class TelemetryStore:
                 """
                 SELECT COUNT(*) AS total,
                        COALESCE(SUM(cache_hit), 0) AS hits
-                FROM fetch_events WHERE created_at >= ? AND created_at <= ?
+                FROM fetch_operations WHERE created_at >= ? AND created_at <= ?
                 """,
                 (since, until),
             ).fetchone()
+            fetch_operation_row = conn.execute(
+                """
+                SELECT COUNT(*) AS total,
+                       COALESCE(SUM(outcome = 'success'), 0) AS successes,
+                       AVG(latency_ms) AS avg_latency,
+                       MIN(latency_ms) AS min_latency,
+                       MAX(latency_ms) AS max_latency
+                FROM fetch_operations WHERE created_at >= ? AND created_at <= ?
+                """,
+                (since, until),
+            ).fetchone()
+            fetch_provider_rows = conn.execute(
+                """
+                SELECT provider,
+                       COUNT(*) AS operations,
+                       COALESCE(SUM(outcome = 'success'), 0) AS successes,
+                       AVG(latency_ms) AS avg_latency
+                FROM fetch_operations
+                WHERE created_at >= ? AND created_at <= ?
+                GROUP BY provider ORDER BY provider
+                """,
+                (since, until),
+            ).fetchall()
+            fetch_attempt_rows = conn.execute(
+                """
+                SELECT provider,
+                       COUNT(*) AS attempts,
+                       COALESCE(SUM(outcome IN ('success', 'proxy_success')), 0) AS successes,
+                       AVG(latency_ms) AS avg_latency
+                FROM fetch_events
+                WHERE created_at >= ? AND created_at <= ?
+                  AND provider IN ('direct', 'decodo', 'jina')
+                GROUP BY provider ORDER BY provider
+                """,
+                (since, until),
+            ).fetchall()
             health_row = conn.execute(
                 """
                 SELECT COALESCE(SUM(dropped_events), 0) AS dropped_events
@@ -670,6 +828,30 @@ class TelemetryStore:
         search_cache_hits = int(search_cache_row["hits"] or 0)
         fetch_cache_total = int(fetch_cache_row["total"] or 0)
         fetch_cache_hits = int(fetch_cache_row["hits"] or 0)
+        fetch_total = int(fetch_operation_row["total"] or 0)
+        fetch_successes = int(fetch_operation_row["successes"] or 0)
+        fetch_attempts = {
+            str(row["provider"]): {
+                "attempts": int(row["attempts"] or 0),
+                "successes": int(row["successes"] or 0),
+                "success_rate": round(
+                    int(row["successes"] or 0) / int(row["attempts"] or 1), 4
+                ),
+                "average_latency_ms": round(float(row["avg_latency"] or 0.0), 1),
+            }
+            for row in fetch_attempt_rows
+        }
+        fetch_providers = {
+            str(row["provider"]): {
+                "operations": int(row["operations"] or 0),
+                "successes": int(row["successes"] or 0),
+                "success_rate": round(
+                    int(row["successes"] or 0) / int(row["operations"] or 1), 4
+                ),
+                "average_latency_ms": round(float(row["avg_latency"] or 0.0), 1),
+            }
+            for row in fetch_provider_rows
+        }
         provider_states: dict[str, dict[str, int]] = {}
         for row in provider_state_rows:
             provider_states.setdefault(str(row["provider"]), {})[str(row["state"])] = int(row["count"])
@@ -719,6 +901,19 @@ class TelemetryStore:
                 "rate": round(fallback_count / total, 4) if total else 0.0,
                 "reasons": _count_map(fallback_rows),
             },
+            "fetches": {
+                "total": fetch_total,
+                "successes": fetch_successes,
+                "errors": fetch_total - fetch_successes,
+                "success_rate": round(fetch_successes / fetch_total, 4) if fetch_total else 0.0,
+                "latency_ms": {
+                    "average": round(float(fetch_operation_row["avg_latency"] or 0.0), 1),
+                    "minimum": round(float(fetch_operation_row["min_latency"] or 0.0), 1),
+                    "maximum": round(float(fetch_operation_row["max_latency"] or 0.0), 1),
+                },
+                "providers": fetch_providers,
+                "attempts": fetch_attempts,
+            },
             "cache": {
                 "search": {
                     "hits": search_cache_hits,
@@ -767,6 +962,7 @@ class TelemetryStore:
             )
             conn.execute("DELETE FROM search_events")
             conn.execute("DELETE FROM fetch_events")
+            conn.execute("DELETE FROM fetch_operations")
             conn.execute("DELETE FROM telemetry_health_events")
             conn.commit()
             conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")

@@ -34,6 +34,9 @@ Key configuration:
   LOCAL_SEARCH_TELEMETRY_ENABLED      default true
   BRAVE_API_KEY                       optional stdio/server fallback key
   BRAVE_BASE_URL                      default https://api.search.brave.com
+  DECODO_FALLBACK_ENABLED             default true; requires data/decodo_key
+  DECODO_TIMEOUT                      default 30 seconds
+  WEBSEARCH_FETCH_OPERATION_TIMEOUT   default 60 seconds
   MCP_PORT                            default 8889 (HTTP transport only)
 """
 
@@ -74,6 +77,7 @@ import html_extraction as htmlx
 from cache import WebCache, canonicalize_url
 from telemetry import (
     FetchEvent,
+    FetchOperation,
     InvalidWindow,
     ProviderEvent,
     SearchEvent,
@@ -172,6 +176,24 @@ BatchQueries = Annotated[
 
 # Other tunables.
 FETCH_TIMEOUT = _bounded_float("WEBSEARCH_FETCH_TIMEOUT", 30.0, minimum=1.0, maximum=60.0)
+DECODO_FALLBACK_ENABLED = os.environ.get("DECODO_FALLBACK_ENABLED", "1").strip().lower() not in {
+    "0",
+    "false",
+    "no",
+    "off",
+}
+DECODO_TIMEOUT = _bounded_float("DECODO_TIMEOUT", 30.0, minimum=1.0, maximum=60.0)
+DECODO_RESPONSE_MAX_BYTES = _bounded_int(
+    "DECODO_RESPONSE_MAX_BYTES", 5 * 1024 * 1024, minimum=4096, maximum=20 * 1024 * 1024
+)
+DECODO_API_URL = "https://scraper-api.decodo.com/v2/scrape"
+JINA_TIMEOUT = _bounded_float("JINA_TIMEOUT", 30.0, minimum=1.0, maximum=60.0)
+JINA_RESPONSE_MAX_BYTES = _bounded_int(
+    "JINA_RESPONSE_MAX_BYTES", 5 * 1024 * 1024, minimum=4096, maximum=20 * 1024 * 1024
+)
+FETCH_OPERATION_TIMEOUT = _bounded_float(
+    "WEBSEARCH_FETCH_OPERATION_TIMEOUT", 60.0, minimum=1.0, maximum=120.0
+)
 JINA_FALLBACK_ENABLED = os.environ.get("JINA_FALLBACK_ENABLED", "1").strip().lower() not in {
     "0",
     "false",
@@ -479,6 +501,7 @@ class _FetchResult:
     cache_age_seconds: float
     url: str
     content_type: str
+    provider: str = "direct"
 
 
 @dataclass
@@ -663,8 +686,10 @@ def _record_fetch_telemetry(
     body_bytes: int | None = None,
     tier_used: str = "direct",
     cache_hit: bool = False,
+    provider: str = "direct",
+    trigger: str = "none",
 ) -> None:
-    """Queue a host-only fetch outcome; never retain a full URL or path."""
+    """Queue a host-only fetch attempt; never retain a full URL or path."""
     try:
         url_host = urllib.parse.urlsplit(url).hostname or "unknown"
         _get_telemetry().record_fetch(
@@ -676,11 +701,41 @@ def _record_fetch_telemetry(
                 bytes=body_bytes,
                 latency_ms=(time.monotonic() - started) * 1000,
                 cache_hit=cache_hit,
+                provider=provider,
+                trigger=trigger,
             )
         )
     except Exception as exc:
         # Monitoring must never break or delay fetch behavior.
         logger.warning("Fetch telemetry event dropped (%s)", type(exc).__name__)
+
+
+def _record_fetch_operation(
+    *,
+    url: str,
+    result: _FetchResult,
+    started: float,
+    trigger: str = "none",
+    http_status: int | None = None,
+    body_bytes: int | None = None,
+) -> None:
+    """Queue exactly one terminal, host-only outcome for a fetch operation."""
+    try:
+        url_host = urllib.parse.urlsplit(url).hostname or "unknown"
+        _get_telemetry().record_fetch_operation(
+            FetchOperation(
+                url_host=url_host,
+                outcome="success" if result.error is None else "error",
+                provider=result.provider,
+                trigger=trigger,
+                http_status=http_status,
+                bytes=body_bytes,
+                latency_ms=(time.monotonic() - started) * 1000,
+                cache_hit=result.cache_hit,
+            )
+        )
+    except Exception as exc:
+        logger.warning("Fetch operation telemetry dropped (%s)", type(exc).__name__)
 
 
 def _record_search_telemetry(
@@ -1574,6 +1629,18 @@ def _resolve_brave_key() -> str:
     return BRAVE_API_KEY_ENV or _read_secret_file(_BRAVE_SECRET_FILE)
 
 
+def _resolve_decodo_key() -> str:
+    """Return the owner-only Decodo token, or empty when not configured.
+
+    Decodo credentials are intentionally file-only so they never enter launchd
+    plists, process arguments, MCP request headers, or operator output.
+    """
+    token = _read_secret_file(LOCAL_SEARCH_DATA_DIR / "decodo_key")
+    if not token or any(char.isspace() or ord(char) < 33 or ord(char) > 126 for char in token):
+        return ""
+    return token
+
+
 # --------------------------------------------------------------------------- #
 # Backend: Brave Search. Independent index; raw ranked results.
 # --------------------------------------------------------------------------- #
@@ -1914,6 +1981,18 @@ async def _health_payload() -> dict[str, Any]:
         "policy": {
             "total_timeout_s": SEARCH_TOTAL_TIMEOUT,
             "brave_timeout_s": BRAVE_TIMEOUT,
+            "fetch_fallbacks": {
+                "decodo": {
+                    "enabled": DECODO_FALLBACK_ENABLED,
+                    "credential_configured": bool(_resolve_decodo_key()),
+                    "timeout_s": DECODO_TIMEOUT,
+                },
+                "jina": {
+                    "enabled": JINA_FALLBACK_ENABLED,
+                    "timeout_s": JINA_TIMEOUT,
+                },
+                "operation_timeout_s": FETCH_OPERATION_TIMEOUT,
+            },
         },
         "provider_stack": "brave",
         "providers": [
@@ -2781,67 +2860,303 @@ def _looks_like_antibot_page(html: str) -> bool:
     )
 
 
-async def _jina_reader_fetch(url: str, max_chars: int) -> _FetchResult:
+async def _read_identity_provider_body(
+    response: httpx.Response, *, provider: str, max_bytes: int
+) -> bytes:
+    """Read one provider response as bounded raw identity bytes."""
+    content_encoding = response.headers.get("content-encoding", "identity").strip().lower()
+    if content_encoding not in {"", "identity"}:
+        raise ValueError(f"{provider} returned unsupported content encoding")
+    content_length = response.headers.get("content-length")
+    if content_length and content_length.isdigit() and int(content_length) > max_bytes:
+        raise ValueError(f"{provider} response exceeds {max_bytes} byte limit")
+    body = bytearray()
+    async for chunk in response.aiter_raw():
+        if len(body) + len(chunk) > max_bytes:
+            raise ValueError(f"{provider} response exceeds {max_bytes} byte limit")
+        body.extend(chunk)
+    return bytes(body)
+
+
+async def _decodo_scraper_fetch(
+    url: str, max_chars: int, trigger: str = "none"
+) -> _FetchResult:
+    """Fetch one validated public page through Decodo's universal scraper.
+
+    The fallback uses the premium proxy pool, browser rendering, and Markdown
+    output because it is reached only after a direct anti-bot failure. The
+    destination URL is never accompanied by caller headers, cookies, or auth.
+    """
+    started = time.monotonic()
+    token = _resolve_decodo_key()
+
+    def failure(
+        message: str,
+        *,
+        status: int | None = None,
+        outcome: str = "proxy_error",
+    ) -> _FetchResult:
+        text = _fetch_error(message)
+        _record_fetch_telemetry(
+            url=url,
+            outcome=outcome,
+            started=started,
+            http_status=status,
+            tier_used="proxy",
+            provider="decodo",
+            trigger=trigger,
+        )
+        return _FetchResult(text, text, False, 0.0, url, "", "decodo")
+
+    if not token:
+        return failure("Decodo credential is not configured")
+
+    headers = {
+        "Accept": "application/json",
+        "Accept-Encoding": "identity",
+        "Authorization": f"Basic {token}",
+        "Content-Type": "application/json",
+    }
+    request_payload = {
+        "url": url,
+        "proxy_pool": "premium",
+        "headless": "html",
+        "markdown": True,
+        "geo": "United States",
+        "locale": "en-us",
+        "device_type": "desktop",
+    }
+    response_status: int | None = None
+    response_bytes = 0
+    try:
+        async with asyncio.timeout(DECODO_TIMEOUT):
+            async with httpx.AsyncClient(
+                timeout=DECODO_TIMEOUT,
+                trust_env=False,
+                follow_redirects=False,
+            ) as client:
+                async with client.stream(
+                    "POST", DECODO_API_URL, headers=headers, json=request_payload
+                ) as response:
+                    response_status = response.status_code
+                    body = await _read_identity_provider_body(
+                        response,
+                        provider="Decodo",
+                        max_bytes=DECODO_RESPONSE_MAX_BYTES,
+                    )
+                    response_bytes = len(body)
+        payload = json.loads(body)
+        results = payload.get("results") if isinstance(payload, dict) else None
+        if (
+            response_status is not None
+            and response_status < 500
+            and isinstance(results, list)
+            and results
+            and isinstance(results[0], dict)
+        ):
+            item = results[0]
+        else:
+            if response_status is not None and response_status >= 400:
+                return failure(f"Decodo HTTP {response_status}", status=response_status)
+            return failure("Decodo returned an invalid response", status=response_status)
+        target_status = item.get("status_code")
+        if not isinstance(target_status, int) or not 200 <= target_status < 300:
+            return failure(
+                "Decodo could not retrieve the target page",
+                status=target_status if isinstance(target_status, int) else response_status,
+            )
+        content = item.get("content")
+        if not isinstance(content, str):
+            return failure("Decodo returned invalid content", status=target_status)
+        content = content.replace("\x00", "").strip()
+        if len(content) < 100 or _looks_like_antibot_page(content):
+            return failure("Decodo returned unusable content", status=target_status)
+        extracted = _bound_fetch_text(content, max_chars)
+        _record_fetch_telemetry(
+            url=url,
+            outcome="proxy_success",
+            started=started,
+            http_status=target_status,
+            body_bytes=response_bytes,
+            tier_used="proxy",
+            provider="decodo",
+            trigger=trigger,
+        )
+        return _FetchResult(
+            extracted, None, False, 0.0, url, "text/markdown", "decodo"
+        )
+    except (asyncio.TimeoutError, httpx.TimeoutException) as exc:
+        return failure(f"Decodo request failed: {type(exc).__name__}", outcome="timeout")
+    except httpx.RequestError as exc:
+        return failure(f"Decodo request failed: {type(exc).__name__}")
+    except (UnicodeError, json.JSONDecodeError, ValueError, TypeError):
+        return failure("Decodo returned an invalid response", status=response_status)
+    except Exception as exc:
+        logger.warning("Decodo fallback failed (%s)", type(exc).__name__)
+        return failure("Decodo request failed")
+
+
+async def _jina_reader_fetch(
+    url: str, max_chars: int, trigger: str = "none"
+) -> _FetchResult:
     """Fetch a public page through Jina Reader as a server-side fallback.
 
     Jina receives the public URL being fetched; this is intentionally only used
     after direct public-URL validation, never for authenticated/private traffic.
     """
     started = time.monotonic()
-    headers = {"Accept": "text/plain"}
+    headers = {"Accept": "text/plain", "Accept-Encoding": "identity"}
     api_key = os.environ.get("JINA_API_KEY", "").strip()
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
 
-    def failure(message: str, *, status: int | None = None) -> _FetchResult:
+    def failure(
+        message: str,
+        *,
+        status: int | None = None,
+        outcome: str = "proxy_error",
+    ) -> _FetchResult:
         text = _fetch_error(message)
         _record_fetch_telemetry(
             url=url,
-            outcome="proxy_error",
+            outcome=outcome,
             started=started,
             http_status=status,
             tier_used="proxy",
+            provider="jina",
+            trigger=trigger,
         )
-        return _FetchResult(text, text, False, 0.0, url, "")
+        return _FetchResult(text, text, False, 0.0, url, "", "jina")
 
     try:
-        async with httpx.AsyncClient(timeout=30.0, trust_env=False) as client:
-            response = await client.get(f"https://r.jina.ai/{url}", headers=headers)
-        response.raise_for_status()
+        async with asyncio.timeout(JINA_TIMEOUT):
+            async with httpx.AsyncClient(
+                timeout=JINA_TIMEOUT, trust_env=False, follow_redirects=False
+            ) as client:
+                async with client.stream(
+                    "GET", f"https://r.jina.ai/{url}", headers=headers
+                ) as response:
+                    response_status = response.status_code
+                    body = await _read_identity_provider_body(
+                        response,
+                        provider="Jina Reader",
+                        max_bytes=JINA_RESPONSE_MAX_BYTES,
+                    )
+        if response_status >= 400:
+            return failure(f"Jina Reader HTTP {response_status}", status=response_status)
+        decoded = body.decode("utf-8")
         marker = "Markdown Content:"
-        if marker not in response.text:
-            return failure("Jina Reader returned an invalid response", status=response.status_code)
-        content = response.text.split(marker, 1)[1].strip()
+        if marker not in decoded:
+            return failure("Jina Reader returned an invalid response", status=response_status)
+        content = decoded.split(marker, 1)[1].strip()
         if len(content) < 100 or _looks_like_antibot_page(content):
-            return failure("Jina Reader returned unusable content", status=response.status_code)
+            return failure("Jina Reader returned unusable content", status=response_status)
         extracted = _bound_fetch_text(content, max_chars)
         _record_fetch_telemetry(
             url=url,
             outcome="proxy_success",
             started=started,
-            http_status=response.status_code,
-            body_bytes=len(response.content),
+            http_status=response_status,
+            body_bytes=len(body),
             tier_used="proxy",
+            provider="jina",
+            trigger=trigger,
         )
-        return _FetchResult(extracted, None, False, 0.0, url, "text/markdown")
-    except httpx.HTTPStatusError as exc:
-        return failure(
-            f"Jina Reader HTTP {exc.response.status_code} for {url}",
-            status=exc.response.status_code,
+        return _FetchResult(
+            extracted, None, False, 0.0, url, "text/markdown", "jina"
         )
-    except httpx.TimeoutException as exc:
-        return failure(f"Jina Reader request failed: {exc}")
+    except (asyncio.TimeoutError, httpx.TimeoutException) as exc:
+        return failure(f"Jina Reader request failed: {exc}", outcome="timeout")
     except httpx.RequestError as exc:
         return failure(f"Jina Reader request failed: {exc}")
+    except (UnicodeError, ValueError) as exc:
+        return failure(f"Jina Reader returned an invalid response: {exc}")
     except Exception as exc:
         return failure(f"Jina Reader request failed: {exc}")
 
 
-async def _web_fetch_impl(url: str, max_chars: int = 20000) -> _FetchResult:
+async def _web_fetch_impl_inner(
+    url: str,
+    max_chars: int = 20000,
+    attempt_state: dict[str, str] | None = None,
+) -> _FetchResult:
     """Fetch and extract one URL, returning text plus internal cache metadata."""
     max_chars = min(50000, max(1, int(max_chars)))
+    attempt_state = attempt_state if attempt_state is not None else {
+        "provider": "direct",
+        "trigger": "none",
+    }
     fetch_started = time.monotonic()
     cache = _get_cache()
+
+    def finish(
+        result: _FetchResult,
+        *,
+        trigger: str = "none",
+        http_status: int | None = None,
+        body_bytes: int | None = None,
+    ) -> _FetchResult:
+        _record_fetch_operation(
+            url=url,
+            result=result,
+            started=fetch_started,
+            trigger=trigger,
+            http_status=http_status,
+            body_bytes=body_bytes,
+        )
+        return result
+
+    def failure(message: str, *, provider: str = "none") -> _FetchResult:
+        text = _fetch_error(message)
+        return _FetchResult(text, text, False, 0.0, url, "", provider)
+
+    def cache_fallback(result: _FetchResult) -> None:
+        if cache is None:
+            return
+        try:
+            cache.put_content(
+                url,
+                result.text,
+                content_type="text/markdown",
+                final_url=url,
+            )
+        except Exception:
+            pass
+
+    def bound_fallback(result: _FetchResult) -> _FetchResult:
+        return _FetchResult(
+            _bound_fetch_text(result.text, max_chars),
+            result.error,
+            result.cache_hit,
+            result.cache_age_seconds,
+            result.url,
+            result.content_type,
+            result.provider,
+        )
+
+    async def fallback_success(trigger: str) -> _FetchResult | None:
+        if DECODO_FALLBACK_ENABLED and _resolve_decodo_key():
+            attempt_state.update(provider="decodo", trigger=trigger)
+            try:
+                result = await _decodo_scraper_fetch(url, 50000, trigger)
+            except Exception as exc:
+                logger.warning("Decodo fallback failed (%s)", type(exc).__name__)
+            else:
+                if result.error is None:
+                    cache_fallback(result)
+                    return bound_fallback(result)
+        if JINA_FALLBACK_ENABLED:
+            attempt_state.update(provider="jina", trigger=trigger)
+            try:
+                result = await _jina_reader_fetch(url, 50000, trigger)
+            except Exception as exc:
+                logger.warning("Jina Reader fallback failed (%s)", type(exc).__name__)
+            else:
+                if result.error is None:
+                    cache_fallback(result)
+                    return bound_fallback(result)
+        return None
+
     try:
         cached = (
             cache.get_content(url)
@@ -2851,49 +3166,29 @@ async def _web_fetch_impl(url: str, max_chars: int = 20000) -> _FetchResult:
     except Exception:
         cached = None
     if cached is not None:
-        text = cached.content.decode("utf-8", errors="replace")
-        text = _bound_fetch_text(text, max_chars)
+        text = _bound_fetch_text(
+            cached.content.decode("utf-8", errors="replace"), max_chars
+        )
         _record_fetch_telemetry(
             url=url,
             outcome="success",
             started=fetch_started,
             body_bytes=len(cached.content),
             cache_hit=True,
+            provider="cache",
         )
-        return _FetchResult(
-            text=text,
-            error=None,
-            cache_hit=True,
-            cache_age_seconds=cached.age_seconds,
-            url=cached.final_url or url,
-            content_type=cached.content_type,
+        return finish(
+            _FetchResult(
+                text=text,
+                error=None,
+                cache_hit=True,
+                cache_age_seconds=cached.age_seconds,
+                url=cached.final_url or url,
+                content_type=cached.content_type,
+                provider="cache",
+            ),
+            body_bytes=len(cached.content),
         )
-
-    def failure(message: str) -> _FetchResult:
-        text = _fetch_error(message)
-        return _FetchResult(text, text, False, 0.0, url, "")
-
-    async def jina_success() -> _FetchResult | None:
-        if not JINA_FALLBACK_ENABLED:
-            return None
-        try:
-            result = await _jina_reader_fetch(url, max_chars)
-        except Exception as exc:
-            logger.warning("Jina Reader fallback failed (%s)", type(exc).__name__)
-            return None
-        if result.error is not None:
-            return None
-        if cache is not None:
-            try:
-                cache.put_content(
-                    url,
-                    result.text,
-                    content_type="text/markdown",
-                    final_url=url,
-                )
-            except Exception:
-                pass
-        return result
 
     try:
         current_url, body, content_type, http_status = await asyncio.wait_for(
@@ -2902,11 +3197,14 @@ async def _web_fetch_impl(url: str, max_chars: int = 20000) -> _FetchResult:
         )
     except httpx.HTTPStatusError as exc:
         status = exc.response.status_code
+        trigger = f"http_{status}" if status in {403, 429} else "none"
         _record_fetch_telemetry(
             url=url,
             outcome="http_error",
             started=fetch_started,
             http_status=status,
+            provider="direct",
+            trigger=trigger,
         )
         direct_failure = failure(f"HTTP {status} from {url}")
         error_content_type = exc.response.headers.get("content-type", "").lower()
@@ -2917,39 +3215,31 @@ async def _web_fetch_impl(url: str, max_chars: int = 20000) -> _FetchResult:
             or "json" in error_media_type
             or "xml" in error_media_type
         )
-        if status in {403, 429} and (
-            not error_media_type or error_is_textual
-        ):
-            jina = await jina_success()
-            if jina is not None:
-                return jina
-        return direct_failure
+        if trigger != "none" and (not error_media_type or error_is_textual):
+            fallback = await fallback_success(trigger)
+            if fallback is not None:
+                return finish(
+                    fallback,
+                    trigger=trigger,
+                    body_bytes=len(fallback.text.encode("utf-8")),
+                )
+        return finish(direct_failure, trigger=trigger, http_status=status)
     except httpx.TimeoutException as exc:
         _record_fetch_telemetry(url=url, outcome="timeout", started=fetch_started)
-        return failure(f"request failed: {exc}")
+        return finish(failure(f"request failed: {exc}"))
     except httpx.RequestError as exc:
         _record_fetch_telemetry(url=url, outcome="connection_error", started=fetch_started)
-        return failure(f"request failed: {exc}")
+        return finish(failure(f"request failed: {exc}"))
     except asyncio.TimeoutError:
         _record_fetch_telemetry(url=url, outcome="timeout", started=fetch_started)
-        return failure(f"request exceeded {FETCH_TIMEOUT:g} second deadline")
+        return finish(failure(f"request exceeded {FETCH_TIMEOUT:g} second deadline"))
     except ValueError as exc:
         _record_fetch_telemetry(url=url, outcome="connection_error", started=fetch_started)
-        return failure(str(exc))
+        return finish(failure(str(exc)))
     except Exception as exc:
         _record_fetch_telemetry(url=url, outcome="connection_error", started=fetch_started)
-        return failure(f"unexpected error: {exc}")
+        return finish(failure(f"unexpected error: {exc}"))
 
-    _record_fetch_telemetry(
-        url=url,
-        outcome="success",
-        started=fetch_started,
-        http_status=http_status,
-        body_bytes=len(body),
-    )
-
-    # Do not send PDFs or binary responses to Jina. For a public HTML response,
-    # escalate only when the direct body is empty, tiny, or a challenge page.
     media_type = content_type.split(";", 1)[0].strip()
     is_pdf = "application/pdf" in content_type or body.startswith(b"%PDF-")
     is_textual = (
@@ -2958,22 +3248,60 @@ async def _web_fetch_impl(url: str, max_chars: int = 20000) -> _FetchResult:
         or "json" in media_type
         or "xml" in media_type
     )
-    if JINA_FALLBACK_ENABLED and not is_pdf and (not media_type or is_textual):
+    if not is_pdf and (not media_type or is_textual):
         decoded_for_fallback = _decode_text_body(body, content_type)
         is_html = "html" in media_type
-        if not body or (is_html and (
+        trigger = "none"
+        if not body:
+            trigger = "empty"
+        elif is_html and (
             len(body) < 200 or _looks_like_antibot_page(decoded_for_fallback)
-        )):
+        ):
+            trigger = "antibot"
+        if trigger != "none":
+            _record_fetch_telemetry(
+                url=url,
+                outcome="challenge",
+                started=fetch_started,
+                http_status=http_status,
+                body_bytes=len(body),
+                provider="direct",
+                trigger=trigger,
+            )
             reason = (
                 "empty response"
-                if not body
+                if trigger == "empty"
                 else "response appears to be an anti-bot page"
             )
             direct_failure = failure(f"{reason} from {url}")
-            jina = await jina_success()
-            if jina is not None:
-                return jina
-            return direct_failure
+            fallback = await fallback_success(trigger)
+            if fallback is not None:
+                return finish(
+                    fallback,
+                    trigger=trigger,
+                    body_bytes=len(fallback.text.encode("utf-8")),
+                )
+            return finish(
+                direct_failure,
+                trigger=trigger,
+                http_status=http_status,
+                body_bytes=len(body),
+            )
+
+    def extraction_failure(message: str) -> _FetchResult:
+        _record_fetch_telemetry(
+            url=url,
+            outcome="extraction_error",
+            started=fetch_started,
+            http_status=http_status,
+            body_bytes=len(body),
+            provider="direct",
+        )
+        return finish(
+            failure(message, provider="direct"),
+            http_status=http_status,
+            body_bytes=len(body),
+        )
 
     full_extracted: str
     effective_content_type = content_type
@@ -2994,12 +3322,11 @@ async def _web_fetch_impl(url: str, max_chars: int = 20000) -> _FetchResult:
             asyncio.TimeoutError,
             _OutputLimitExceeded,
         ) as exc:
-            return failure(f"PDF extraction failed: {exc}")
+            return extraction_failure(f"PDF extraction failed: {exc}")
         if text is None:
-            return failure(method)
+            return extraction_failure(method)
         full_extracted = _pdf_fetch_text(current_url, text, method, 50000)
     else:
-        media_type = content_type.split(";", 1)[0].strip()
         textual = (
             "html" in media_type
             or media_type.startswith("text/")
@@ -3007,9 +3334,13 @@ async def _web_fetch_impl(url: str, max_chars: int = 20000) -> _FetchResult:
             or "xml" in media_type
         )
         if not _looks_like_text(body, content_type):
-            return failure(f"unsupported binary content type: {media_type or 'unknown'}")
+            return extraction_failure(
+                f"unsupported binary content type: {media_type or 'unknown'}"
+            )
         if not textual and media_type not in {"", "application/octet-stream"}:
-            return failure(f"unsupported binary content type: {media_type or 'unknown'}")
+            return extraction_failure(
+                f"unsupported binary content type: {media_type or 'unknown'}"
+            )
 
         decoded = _decode_text_body(body, content_type)
         if "html" in media_type:
@@ -3018,13 +3349,13 @@ async def _web_fetch_impl(url: str, max_chars: int = 20000) -> _FetchResult:
                     decoded, current_url, 50000
                 )
             except asyncio.TimeoutError:
-                return failure(
+                return extraction_failure(
                     f"HTML extraction exceeded {HTML_EXTRACT_TIMEOUT:g} second deadline"
                 )
             except _OutputLimitExceeded as exc:
-                return failure(f"HTML extraction failed: {exc}")
+                return extraction_failure(f"HTML extraction failed: {exc}")
             except (OSError, RuntimeError) as exc:
-                return failure(f"HTML extraction failed: {exc}")
+                return extraction_failure(f"HTML extraction failed: {exc}")
         else:
             full_extracted = _truncate_text(decoded, 50000, "\n\n... (truncated)")
 
@@ -3039,14 +3370,54 @@ async def _web_fetch_impl(url: str, max_chars: int = 20000) -> _FetchResult:
             )
         except Exception:
             pass
-    return _FetchResult(
-        text=extracted,
-        error=None,
-        cache_hit=False,
-        cache_age_seconds=0.0,
-        url=current_url,
-        content_type=effective_content_type,
+    _record_fetch_telemetry(
+        url=url,
+        outcome="success",
+        started=fetch_started,
+        http_status=http_status,
+        body_bytes=len(body),
+        provider="direct",
     )
+    return finish(
+        _FetchResult(
+            text=extracted,
+            error=None,
+            cache_hit=False,
+            cache_age_seconds=0.0,
+            url=current_url,
+            content_type=effective_content_type,
+            provider="direct",
+        ),
+        http_status=http_status,
+        body_bytes=len(body),
+    )
+
+
+async def _web_fetch_impl(url: str, max_chars: int = 20000) -> _FetchResult:
+    """Run one fetch under a hard end-to-end wall-clock deadline."""
+    started = time.monotonic()
+    attempt_state = {"provider": "direct", "trigger": "none"}
+    try:
+        return await asyncio.wait_for(
+            _web_fetch_impl_inner(url, max_chars, attempt_state),
+            timeout=FETCH_OPERATION_TIMEOUT,
+        )
+    except asyncio.TimeoutError:
+        message = _fetch_error(
+            f"operation exceeded {FETCH_OPERATION_TIMEOUT:g} second deadline"
+        )
+        result = _FetchResult(message, message, False, 0.0, url, "", "none")
+        provider = attempt_state["provider"]
+        _record_fetch_telemetry(
+            url=url,
+            outcome="timeout",
+            started=started,
+            provider=provider,
+            tier_used="proxy" if provider in {"decodo", "jina"} else "direct",
+            trigger=attempt_state["trigger"],
+        )
+        _record_fetch_operation(url=url, result=result, started=started)
+        return result
 
 
 @mcp.tool()
@@ -3062,6 +3433,7 @@ async def web_fetch(url: str, max_chars: int = 20000) -> ToolResult:
             "cache_age_seconds": max(0, int(result.cache_age_seconds)),
             "url": result.url,
             "content_type": result.content_type,
+            "fetch_provider": result.provider,
         },
     )
 
@@ -3080,6 +3452,7 @@ async def verify_url(url: str, max_chars: int = 20000) -> str:
         "cache_hit": direct.cache_hit,
         "cache_age_seconds": max(0, int(direct.cache_age_seconds)),
         "content_type": direct.content_type,
+        "fetch_provider": direct.provider,
     })
 
 

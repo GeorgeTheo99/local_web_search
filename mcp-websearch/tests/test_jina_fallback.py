@@ -35,11 +35,17 @@ class _JinaResponse:
     status_code = 200
 
     def __init__(self, content: str):
-        self.text = content
         self.content = content.encode("utf-8")
+        self.headers: dict[str, str] = {}
 
-    def raise_for_status(self):
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
         return None
+
+    async def aiter_raw(self):
+        yield self.content
 
 
 class _JinaClient:
@@ -53,7 +59,8 @@ class _JinaClient:
     async def __aexit__(self, exc_type, exc, tb):
         return None
 
-    async def get(self, url: str, *, headers: dict[str, str]):
+    def stream(self, method: str, url: str, *, headers: dict[str, str]):
+        assert method == "GET"
         self.calls.append((url, headers))
         return self.response
 
@@ -90,7 +97,7 @@ async def test_403_direct_fetch_triggers_jina_fallback(monkeypatch, isolated_fet
     assert jina_calls == [
         (
             f"https://r.jina.ai/{url}",
-            {"Accept": "text/plain"},
+            {"Accept": "text/plain", "Accept-Encoding": "identity"},
         )
     ]
     assert srv._telemetry is not None and srv._telemetry.flush()
@@ -110,7 +117,7 @@ async def test_real_200_content_does_not_trigger_jina(monkeypatch, isolated_fetc
         direct_calls += 1
         return url, b"real page content " * 20, "text/plain", 200
 
-    async def unexpected_jina(_url, _max_chars):
+    async def unexpected_jina(_url, _max_chars, _trigger="none"):
         pytest.fail("Jina should not be called for real direct content")
 
     monkeypatch.setattr(srv, "_fetch_public_body", successful_fetch)
@@ -131,8 +138,8 @@ async def test_antibot_direct_page_triggers_jina_fallback(monkeypatch, isolated_
     async def challenge_fetch(_url):
         return url, b"<html><title>Just a moment...</title></html>", "text/html", 200
 
-    async def successful_jina(_url, _max_chars):
-        return srv._FetchResult(content, None, False, 0.0, url, "text/markdown")
+    async def successful_jina(_url, _max_chars, _trigger="none"):
+        return srv._FetchResult(content, None, False, 0.0, url, "text/markdown", "jina")
 
     monkeypatch.setattr(srv, "_fetch_public_body", challenge_fetch)
     monkeypatch.setattr(srv, "_jina_reader_fetch", successful_jina)
@@ -152,7 +159,7 @@ async def test_disabled_jina_fallback_skips_escalation(monkeypatch, isolated_fet
     async def blocked_fetch(_url):
         raise _http_error(403, url)
 
-    async def unexpected_jina(_url, _max_chars):
+    async def unexpected_jina(_url, _max_chars, _trigger="none"):
         pytest.fail("disabled Jina fallback must not be called")
 
     monkeypatch.setattr(srv, "_fetch_public_body", blocked_fetch)
@@ -179,9 +186,9 @@ async def test_jina_failure_returns_original_direct_error(monkeypatch, isolated_
     async def blocked_fetch(_url):
         raise direct_error
 
-    async def failed_jina(_url, _max_chars):
+    async def failed_jina(_url, _max_chars, _trigger="none"):
         message = "Fetch error: Jina Reader request failed"
-        return srv._FetchResult(message, message, False, 0.0, url, "")
+        return srv._FetchResult(message, message, False, 0.0, url, "", "jina")
 
     monkeypatch.setattr(srv, "_fetch_public_body", blocked_fetch)
     monkeypatch.setattr(srv, "_jina_reader_fetch", failed_jina)
@@ -203,10 +210,10 @@ async def test_jina_result_is_cached(monkeypatch, isolated_fetch):
         direct_calls += 1
         raise _http_error(403, url)
 
-    async def successful_jina(_url, _max_chars):
+    async def successful_jina(_url, _max_chars, _trigger="none"):
         nonlocal jina_calls
         jina_calls += 1
-        return srv._FetchResult(content, None, False, 0.0, url, "text/markdown")
+        return srv._FetchResult(content, None, False, 0.0, url, "text/markdown", "jina")
 
     monkeypatch.setattr(srv, "_fetch_public_body", blocked_fetch)
     monkeypatch.setattr(srv, "_jina_reader_fetch", successful_jina)
