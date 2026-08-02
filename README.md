@@ -115,12 +115,15 @@ Decodo is an optional fallback for public HTML pages that return `403`/`429`,
 an empty response, or recognizable anti-bot HTML. It uses the unified Web
 Scraping API in synchronous Universal/Web mode with the premium proxy pool,
 JavaScript rendering, and Markdown output. The fallback is enabled only when an
-owner-only token exists at `$LOCAL_SEARCH_DATA_DIR/decodo_key`:
+owner-only Web Scraping API authorization token exists at
+`$LOCAL_SEARCH_DATA_DIR/decodo_key`. Copy only the token value after `Basic`
+from Decodo's Web Scraping API Playground-generated `Authorization` header—not
+the `Basic ` prefix, a generic Decodo API key, or another product's credential:
 
 ```bash
 mkdir -p data && chmod 700 data
 umask 077
-read -r -s -p 'Decodo API token: ' DECODO_KEY; printf '\n'
+read -r -s -p 'Decodo Web Scraping token (value after Basic): ' DECODO_KEY; printf '\n'
 printf '%s\n' "$DECODO_KEY" > data/decodo_key
 unset DECODO_KEY
 chmod 600 data/decodo_key
