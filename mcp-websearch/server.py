@@ -2855,6 +2855,7 @@ def _looks_like_antibot_page(html: str) -> bool:
             "Human Verification",
             "Access Denied",
             "Pardon Our Interruption",
+            "Press & Hold to confirm you are",
             "captcha",
         )
     )

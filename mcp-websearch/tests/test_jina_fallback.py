@@ -175,6 +175,9 @@ def test_antibot_page_detection_handles_cloudflare_and_datadome_markers():
     assert srv._looks_like_antibot_page("Performing security verification for Human Verification")
     assert srv._looks_like_antibot_page("DataDome challenge: captcha")
     assert srv._looks_like_antibot_page("Access Denied — Pardon Our Interruption")
+    assert srv._looks_like_antibot_page(
+        "Before we continue... Press & Hold to confirm you are a human"
+    )
     assert not srv._looks_like_antibot_page("<html><body>Actual article content</body></html>")
 
 
