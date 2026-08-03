@@ -688,6 +688,7 @@ def _record_fetch_telemetry(
     cache_hit: bool = False,
     provider: str = "direct",
     trigger: str = "none",
+    provider_http_status: int | None = None,
 ) -> None:
     """Queue a host-only fetch attempt; never retain a full URL or path."""
     try:
@@ -703,6 +704,7 @@ def _record_fetch_telemetry(
                 cache_hit=cache_hit,
                 provider=provider,
                 trigger=trigger,
+                provider_http_status=provider_http_status,
             )
         )
     except Exception as exc:
@@ -2001,6 +2003,7 @@ async def _health_payload() -> dict[str, Any]:
                 "output": "raw",
                 "timeout_s": BRAVE_TIMEOUT,
                 "credential_configured": _provider_credential_configured("brave"),
+                "credential_usable": _provider_credential_usable("brave"),
                 "circuit": brave_breaker,
                 "last_state": provider_states.get("brave"),
             }
@@ -2890,6 +2893,7 @@ async def _decodo_scraper_fetch(
     """
     started = time.monotonic()
     token = _resolve_decodo_key()
+    response_status: int | None = None
 
     def failure(
         message: str,
@@ -2906,6 +2910,7 @@ async def _decodo_scraper_fetch(
             tier_used="proxy",
             provider="decodo",
             trigger=trigger,
+            provider_http_status=response_status,
         )
         return _FetchResult(text, text, False, 0.0, url, "", "decodo")
 
@@ -2927,7 +2932,6 @@ async def _decodo_scraper_fetch(
         "locale": "en-us",
         "device_type": "desktop",
     }
-    response_status: int | None = None
     response_bytes = 0
     try:
         async with asyncio.timeout(DECODO_TIMEOUT):
@@ -2982,6 +2986,7 @@ async def _decodo_scraper_fetch(
             tier_used="proxy",
             provider="decodo",
             trigger=trigger,
+            provider_http_status=response_status,
         )
         return _FetchResult(
             extracted, None, False, 0.0, url, "text/markdown", "decodo"
@@ -3010,6 +3015,7 @@ async def _jina_reader_fetch(
     api_key = os.environ.get("JINA_API_KEY", "").strip()
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
+    response_status: int | None = None
 
     def failure(
         message: str,
@@ -3026,6 +3032,7 @@ async def _jina_reader_fetch(
             tier_used="proxy",
             provider="jina",
             trigger=trigger,
+            provider_http_status=response_status,
         )
         return _FetchResult(text, text, False, 0.0, url, "", "jina")
 
@@ -3062,6 +3069,7 @@ async def _jina_reader_fetch(
             tier_used="proxy",
             provider="jina",
             trigger=trigger,
+            provider_http_status=response_status,
         )
         return _FetchResult(
             extracted, None, False, 0.0, url, "text/markdown", "jina"

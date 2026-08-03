@@ -145,7 +145,7 @@ async def test_decodo_failure_preserves_direct_error(monkeypatch, isolated_fetch
     calls: list[dict[str, Any]] = []
     response = _StreamResponse(
         200,
-        {"results": [{"content": "Access denied", "status_code": 403}]},
+        {"results": [{"content": "Payment required", "status_code": 402}]},
     )
 
     async def blocked_fetch(_url):
@@ -163,6 +163,18 @@ async def test_decodo_failure_preserves_direct_error(monkeypatch, isolated_fetch
     assert result.error == f"Fetch error: HTTP 403 from {url}"
     assert result.provider == "none"
     assert len(calls) == 1
+
+    telemetry = srv._get_telemetry()
+    assert telemetry.flush()
+    with sqlite3.connect(telemetry.db_path) as conn:
+        attempt = conn.execute(
+            "SELECT http_status, provider_http_status FROM fetch_events "
+            "WHERE provider = 'decodo' ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+    assert attempt == (402, 200)
+    assert telemetry.stats("24h")["fetches"]["attempts"]["decodo"][
+        "payment_required_402s"
+    ] == 0
 
 
 @pytest.mark.asyncio

@@ -367,6 +367,7 @@ async def test_health_reports_brave_as_the_only_provider(monkeypatch):
     health = await srv._health_payload()
     assert health["provider_stack"] == "brave"
     assert [provider["name"] for provider in health["providers"]] == ["brave"]
+    assert health["providers"][0]["credential_usable"] is True
     assert set(health) == {
         "status", "ready", "service", "policy", "provider_stack",
         "providers", "telemetry", "last_search",

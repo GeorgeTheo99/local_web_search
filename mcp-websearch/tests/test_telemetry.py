@@ -120,7 +120,7 @@ def test_v6_database_migrates_fetch_provider_columns_before_index_creation(tmp_p
                 "SELECT name FROM sqlite_master "
                 "WHERE type = 'table' AND name = 'fetch_operations'"
             ).fetchone()
-        assert {"provider", "trigger"} <= columns
+        assert {"provider", "trigger", "provider_http_status"} <= columns
         assert providers == [
             ("direct", "none"),
             ("jina", "none"),
@@ -245,6 +245,97 @@ def test_aggregation_windows_and_provider_counts(tmp_path):
 
         assert store.stats("7d", now=now)["searches"]["total"] == 2
         assert store.stats("30d", now=now)["searches"]["total"] == 3
+    finally:
+        store.close()
+
+
+def test_provider_account_and_quota_signals_are_aggregated(tmp_path):
+    now = 2_000_000_000
+    store = TelemetryStore(tmp_path / "data")
+    try:
+        for offset, http_status in enumerate((401, 402, 403, 429), start=1):
+            store.record(SearchEvent(
+                created_at=now - offset,
+                status="error",
+                backend="none",
+                mode="normal",
+                requested_count=5,
+                result_count=0,
+                total_latency_ms=10.0,
+                providers=(ProviderEvent(
+                    provider="brave",
+                    state="error",
+                    attempts=1,
+                    latency_ms=10.0,
+                    error_kind="http",
+                    http_status=http_status,
+                    credential_mode="keyed",
+                    circuit_before="closed",
+                    circuit_after="closed",
+                ),),
+            ))
+            store.record_fetch(FetchEvent(
+                "example.com",
+                http_status,
+                "proxy_error",
+                "proxy",
+                None,
+                10.0,
+                created_at=now - offset,
+                provider="decodo",
+                trigger="http_403",
+                provider_http_status=http_status,
+            ))
+        store.record(SearchEvent(
+            created_at=now - 5,
+            status="error",
+            backend="none",
+            mode="normal",
+            requested_count=5,
+            result_count=0,
+            total_latency_ms=1.0,
+            providers=(ProviderEvent(
+                provider="brave",
+                state="error",
+                attempts=0,
+                error_kind="internal_error",
+                credential_mode="none",
+            ),),
+        ))
+        store.record_fetch(FetchEvent(
+            "example.com",
+            200,
+            "proxy_success",
+            "proxy",
+            100,
+            10.0,
+            created_at=now - 5,
+            provider="decodo",
+            trigger="http_403",
+            provider_http_status=200,
+        ))
+        assert store.flush()
+
+        stats = store.stats("24h", now=now)
+
+        brave = stats["providers"]["brave"]
+        assert brave["selected_searches"] == 5
+        assert brave["attempts"] == 4
+        assert brave["errors"] == 5
+        assert brave["attempt_errors"] == 4
+        assert brave["http_401s"] == 1
+        assert brave["payment_required_402s"] == 1
+        assert brave["http_403s"] == 1
+        assert brave["rate_limited_429s"] == 1
+
+        decodo = stats["fetches"]["attempts"]["decodo"]
+        assert decodo["attempts"] == 5
+        assert decodo["successes"] == 1
+        assert decodo["errors"] == 4
+        assert decodo["http_401s"] == 1
+        assert decodo["payment_required_402s"] == 1
+        assert decodo["http_403s"] == 1
+        assert decodo["rate_limited_429s"] == 1
     finally:
         store.close()
 

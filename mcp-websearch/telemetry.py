@@ -28,7 +28,7 @@ from typing import Any
 logger = logging.getLogger("websearch-mcp.telemetry")
 
 DB_FILENAME = "telemetry.sqlite3"
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 VALID_WINDOWS = {"24h": 24 * 60 * 60, "7d": 7 * 24 * 60 * 60, "30d": 30 * 24 * 60 * 60}
 
 _SEARCH_STATUSES = {"ok", "empty", "degraded", "error", "timeout"}
@@ -115,6 +115,7 @@ class FetchEvent:
     cache_hit: bool = False
     provider: str = "direct"
     trigger: str = "none"
+    provider_http_status: int | None = None
 
 
 @dataclass(frozen=True)
@@ -294,7 +295,8 @@ class TelemetryStore:
                     latency_ms REAL NOT NULL,
                     cache_hit INTEGER NOT NULL DEFAULT 0,
                     provider TEXT NOT NULL DEFAULT 'direct',
-                    trigger TEXT NOT NULL DEFAULT 'none'
+                    trigger TEXT NOT NULL DEFAULT 'none',
+                    provider_http_status INTEGER
                 );
                 CREATE INDEX IF NOT EXISTS idx_fetch_events_created_at
                     ON fetch_events(created_at);
@@ -379,6 +381,15 @@ class TelemetryStore:
                     "CREATE INDEX IF NOT EXISTS idx_fetch_events_provider "
                     "ON fetch_events(provider, created_at)"
                 )
+
+            if current_version < 8:
+                fetch_columns = {
+                    str(row[1]) for row in conn.execute("PRAGMA table_info(fetch_events)")
+                }
+                if "provider_http_status" not in fetch_columns:
+                    conn.execute(
+                        "ALTER TABLE fetch_events ADD COLUMN provider_http_status INTEGER"
+                    )
 
             conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         self._secure_files()
@@ -576,6 +587,9 @@ class TelemetryStore:
         http_status = event.http_status
         if http_status is not None and not 100 <= int(http_status) <= 599:
             http_status = None
+        provider_http_status = event.provider_http_status
+        if provider_http_status is not None and not 100 <= int(provider_http_status) <= 599:
+            provider_http_status = None
         body_bytes = None if event.bytes is None else max(0, int(event.bytes))
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
@@ -591,8 +605,9 @@ class TelemetryStore:
                     """
                     INSERT INTO fetch_events(
                         created_at, url_host, http_status, outcome, tier_used,
-                        bytes, latency_ms, cache_hit, provider, trigger
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        bytes, latency_ms, cache_hit, provider, trigger,
+                        provider_http_status
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         max(0, int(event.created_at)),
@@ -605,6 +620,7 @@ class TelemetryStore:
                         int(bool(event.cache_hit)),
                         _enum(event.provider, _FETCH_PROVIDERS, "none"),
                         _enum(event.trigger, _FETCH_TRIGGERS, "none"),
+                        provider_http_status,
                     ),
                 )
         self._mark_drops_persisted(len(pending_drops))
@@ -733,6 +749,11 @@ class TelemetryStore:
                        SUM(CASE WHEN p.attempts > 0 THEN 1 ELSE 0 END) AS attempted_searches,
                        SUM(p.attempts) AS attempts,
                        SUM(CASE WHEN p.state IN ('error', 'timeout') THEN 1 ELSE 0 END) AS errors,
+                       SUM(CASE WHEN p.attempts > 0 AND p.state IN ('error', 'timeout')
+                                THEN 1 ELSE 0 END) AS attempt_errors,
+                       SUM(CASE WHEN p.http_status = 401 THEN 1 ELSE 0 END) AS http_401s,
+                       SUM(CASE WHEN p.http_status = 402 THEN 1 ELSE 0 END) AS payment_required_402s,
+                       SUM(CASE WHEN p.http_status = 403 THEN 1 ELSE 0 END) AS http_403s,
                        SUM(CASE WHEN p.http_status = 429 THEN 1 ELSE 0 END) AS rate_limited_429s,
                        SUM(CASE WHEN p.state = 'circuit_open' THEN 1 ELSE 0 END) AS circuit_open_skips,
                        SUM(CASE WHEN p.circuit_transition IN ('opened', 'reopened')
@@ -803,6 +824,11 @@ class TelemetryStore:
                 SELECT provider,
                        COUNT(*) AS attempts,
                        COALESCE(SUM(outcome IN ('success', 'proxy_success')), 0) AS successes,
+                       COALESCE(SUM(outcome NOT IN ('success', 'proxy_success')), 0) AS errors,
+                       SUM(CASE WHEN provider_http_status = 401 THEN 1 ELSE 0 END) AS http_401s,
+                       SUM(CASE WHEN provider_http_status = 402 THEN 1 ELSE 0 END) AS payment_required_402s,
+                       SUM(CASE WHEN provider_http_status = 403 THEN 1 ELSE 0 END) AS http_403s,
+                       SUM(CASE WHEN provider_http_status = 429 THEN 1 ELSE 0 END) AS rate_limited_429s,
                        AVG(latency_ms) AS avg_latency
                 FROM fetch_events
                 WHERE created_at >= ? AND created_at <= ?
@@ -834,9 +860,14 @@ class TelemetryStore:
             str(row["provider"]): {
                 "attempts": int(row["attempts"] or 0),
                 "successes": int(row["successes"] or 0),
+                "errors": int(row["errors"] or 0),
                 "success_rate": round(
                     int(row["successes"] or 0) / int(row["attempts"] or 1), 4
                 ),
+                "http_401s": int(row["http_401s"] or 0),
+                "payment_required_402s": int(row["payment_required_402s"] or 0),
+                "http_403s": int(row["http_403s"] or 0),
+                "rate_limited_429s": int(row["rate_limited_429s"] or 0),
                 "average_latency_ms": round(float(row["avg_latency"] or 0.0), 1),
             }
             for row in fetch_attempt_rows
@@ -863,6 +894,10 @@ class TelemetryStore:
                 "attempted_searches": int(row["attempted_searches"] or 0),
                 "attempts": int(row["attempts"] or 0),
                 "errors": int(row["errors"] or 0),
+                "attempt_errors": int(row["attempt_errors"] or 0),
+                "http_401s": int(row["http_401s"] or 0),
+                "payment_required_402s": int(row["payment_required_402s"] or 0),
+                "http_403s": int(row["http_403s"] or 0),
                 "rate_limited_429s": int(row["rate_limited_429s"] or 0),
                 "circuit_open_skips": int(row["circuit_open_skips"] or 0),
                 "circuit_trips": int(row["circuit_trips"] or 0),
