@@ -272,7 +272,7 @@ async def test_decodo_failure_falls_through_to_jina(monkeypatch, isolated_fetch)
     async def blocked_fetch(_url):
         raise _http_error(403, url)
 
-    async def successful_jina(jina_url, max_chars, trigger="none"):
+    async def successful_jina(jina_url, max_chars, trigger="none", **_kwargs):
         jina_calls.append((jina_url, max_chars, trigger))
         return srv._FetchResult(
             jina_content, None, False, 0.0, jina_url, "text/markdown", "jina"
@@ -407,7 +407,7 @@ async def test_fetch_operation_has_hard_timeout_and_preserves_cancellation(
     url = "https://example.com/slow"
     monkeypatch.setattr(srv, "FETCH_OPERATION_TIMEOUT", 0.01)
 
-    async def slow_inner(_url, _max_chars=20000, _attempt_state=None):
+    async def slow_inner(_url, _max_chars=20000, _attempt_state=None, **_kwargs):
         assert _attempt_state is not None
         _attempt_state.update(provider="decodo", trigger="http_403")
         await srv.asyncio.sleep(10)
@@ -429,7 +429,7 @@ async def test_fetch_operation_has_hard_timeout_and_preserves_cancellation(
 
     started = srv.asyncio.Event()
 
-    async def cancellable_inner(_url, _max_chars=20000, _attempt_state=None):
+    async def cancellable_inner(_url, _max_chars=20000, _attempt_state=None, **_kwargs):
         started.set()
         await srv.asyncio.sleep(10)
         raise AssertionError("unreachable")

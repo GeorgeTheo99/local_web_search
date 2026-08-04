@@ -54,6 +54,7 @@ import re
 import shutil
 import signal
 import socket
+import ssl
 import sys
 import tempfile
 import time
@@ -175,14 +176,20 @@ BatchQueries = Annotated[
 ]
 
 # Other tunables.
-FETCH_TIMEOUT = _bounded_float("WEBSEARCH_FETCH_TIMEOUT", 30.0, minimum=1.0, maximum=60.0)
+# Direct fetch is budgeted below the operation deadline so that the Decodo and
+# Jina fallback tiers retain a meaningful share after a direct timeout. Defaults:
+# direct 20s -> Decodo 25s -> Jina up to the remaining ~15s under one 60s cap.
+FETCH_TIMEOUT = _bounded_float("WEBSEARCH_FETCH_TIMEOUT", 20.0, minimum=1.0, maximum=60.0)
+# Bounded DNS resolution so a hung lookup fails closed as a validation error
+# (no fallback) instead of consuming the whole direct-fetch budget.
+DNS_RESOLVE_TIMEOUT = _bounded_float("WEBSEARCH_DNS_TIMEOUT", 8.0, minimum=1.0, maximum=30.0)
 DECODO_FALLBACK_ENABLED = os.environ.get("DECODO_FALLBACK_ENABLED", "1").strip().lower() not in {
     "0",
     "false",
     "no",
     "off",
 }
-DECODO_TIMEOUT = _bounded_float("DECODO_TIMEOUT", 30.0, minimum=1.0, maximum=60.0)
+DECODO_TIMEOUT = _bounded_float("DECODO_TIMEOUT", 25.0, minimum=1.0, maximum=60.0)
 DECODO_RESPONSE_MAX_BYTES = _bounded_int(
     "DECODO_RESPONSE_MAX_BYTES", 5 * 1024 * 1024, minimum=4096, maximum=20 * 1024 * 1024
 )
@@ -1495,6 +1502,24 @@ _PRIVATE_IP_ATTRS = ("is_private", "is_loopback", "is_link_local",
                      "is_multicast", "is_reserved", "is_unspecified")
 
 
+class _UnsafeTargetError(ValueError):
+    """Raised when a URL cannot be proven public before any remote fetch.
+
+    This is the hard fail-closed boundary: the destination never passed DNS/IP
+    validation, so it must never be handed to Decodo or Jina to resolve
+    independently. It is a ``ValueError`` subclass for backward compatibility.
+    """
+
+
+# HTTP statuses whose textual/missing-MIME error bodies are eligible for the
+# Decodo -> Jina fallback. Deterministic client errors (400/401/404/405/410/422)
+# and binary error bodies are intentionally excluded. 500/52x are lower
+# confidence but recoverable via the premium proxy + rendered browser tier.
+_FALLBACK_HTTP_STATUSES: frozenset[int] = frozenset(
+    {403, 408, 429, 500, 502, 503, 504, 520, 521, 522, 523, 524, 527}
+)
+
+
 async def _resolve_host_ips(host: str, port: int, scheme: str) -> list[ipaddress._BaseAddress]:
     try:
         ip = ipaddress.ip_address(host)
@@ -1502,10 +1527,15 @@ async def _resolve_host_ips(host: str, port: int, scheme: str) -> list[ipaddress
     except ValueError:
         pass
     try:
-        infos = await asyncio.to_thread(
-            socket.getaddrinfo, host, port or (443 if scheme == "https" else 80),
-            type=socket.SOCK_STREAM,
+        infos = await asyncio.wait_for(
+            asyncio.to_thread(
+                socket.getaddrinfo, host, port or (443 if scheme == "https" else 80),
+                type=socket.SOCK_STREAM,
+            ),
+            timeout=DNS_RESOLVE_TIMEOUT,
         )
+    except asyncio.TimeoutError as exc:
+        raise ValueError(f"DNS resolution exceeded {DNS_RESOLVE_TIMEOUT:g} second deadline") from exc
     except socket.gaierror as exc:
         raise ValueError(f"Could not resolve URL host: {exc}") from exc
     return [ipaddress.ip_address(info[4][0]) for info in infos]
@@ -1538,18 +1568,23 @@ def _cache_lookup_allowed(url: str) -> bool:
 async def _validate_public_http_url(url: str) -> list[ipaddress._BaseAddress]:
     parsed = urllib.parse.urlparse(url)
     if parsed.scheme not in {"http", "https"} or not parsed.hostname:
-        raise ValueError("Only public http(s) URLs can be fetched")
+        raise _UnsafeTargetError("Only public http(s) URLs can be fetched")
     if parsed.username is not None or parsed.password is not None:
-        raise ValueError("Credential-bearing URLs cannot be fetched")
+        raise _UnsafeTargetError("Credential-bearing URLs cannot be fetched")
     host = parsed.hostname.strip().lower()
     if host in {"localhost", "local"} or host.endswith(".localhost"):
-        raise ValueError("Refusing to fetch local/private URL")
-    addresses = await _resolve_host_ips(host, parsed.port, parsed.scheme)
+        raise _UnsafeTargetError("Refusing to fetch local/private URL")
+    try:
+        addresses = await _resolve_host_ips(host, parsed.port, parsed.scheme)
+    except ValueError as exc:
+        # DNS resolution failure or timeout: the target was never proven
+        # public, so it must fail closed rather than be proxied independently.
+        raise _UnsafeTargetError(str(exc)) from exc
     if not addresses:
-        raise ValueError("Could not resolve URL host")
+        raise _UnsafeTargetError("Could not resolve URL host")
     for ip in addresses:
         if _is_private_ip(ip):
-            raise ValueError("Refusing to fetch local/private URL")
+            raise _UnsafeTargetError("Refusing to fetch local/private URL")
     # Prefer IPv4 when both families are returned because many local machines
     # lack working public IPv6. The selected address is pinned for the request.
     return sorted(set(addresses), key=lambda ip: (ip.version != 4, str(ip)))
@@ -2933,13 +2968,14 @@ async def _read_identity_provider_body(
 
 
 async def _decodo_scraper_fetch(
-    url: str, max_chars: int, trigger: str = "none"
+    url: str, max_chars: int, trigger: str = "none", *, timeout: float | None = None
 ) -> _FetchResult:
     """Fetch one validated public page through Decodo's universal scraper.
 
     The fallback uses the premium proxy pool, browser rendering, and Markdown
     output because it is reached only after a direct anti-bot failure. The
     destination URL is never accompanied by caller headers, cookies, or auth.
+    ``timeout`` clamps this tier to the remaining shared operation budget.
     """
     started = time.monotonic()
     token = _resolve_decodo_key()
@@ -2983,10 +3019,11 @@ async def _decodo_scraper_fetch(
         "device_type": "desktop",
     }
     response_bytes = 0
+    tier_timeout = DECODO_TIMEOUT if timeout is None else max(1.0, float(timeout))
     try:
-        async with asyncio.timeout(DECODO_TIMEOUT):
+        async with asyncio.timeout(tier_timeout):
             async with httpx.AsyncClient(
-                timeout=DECODO_TIMEOUT,
+                timeout=tier_timeout,
                 trust_env=False,
                 follow_redirects=False,
             ) as client:
@@ -3053,12 +3090,13 @@ async def _decodo_scraper_fetch(
 
 
 async def _jina_reader_fetch(
-    url: str, max_chars: int, trigger: str = "none"
+    url: str, max_chars: int, trigger: str = "none", *, timeout: float | None = None
 ) -> _FetchResult:
     """Fetch a public page through Jina Reader as a server-side fallback.
 
     Jina receives the public URL being fetched; this is intentionally only used
     after direct public-URL validation, never for authenticated/private traffic.
+    ``timeout`` clamps this tier to the remaining shared operation budget.
     """
     started = time.monotonic()
     headers = {"Accept": "text/plain", "Accept-Encoding": "identity"}
@@ -3086,10 +3124,11 @@ async def _jina_reader_fetch(
         )
         return _FetchResult(text, text, False, 0.0, url, "", "jina")
 
+    tier_timeout = JINA_TIMEOUT if timeout is None else max(1.0, float(timeout))
     try:
-        async with asyncio.timeout(JINA_TIMEOUT):
+        async with asyncio.timeout(tier_timeout):
             async with httpx.AsyncClient(
-                timeout=JINA_TIMEOUT, trust_env=False, follow_redirects=False
+                timeout=tier_timeout, trust_env=False, follow_redirects=False
             ) as client:
                 async with client.stream(
                     "GET", f"https://r.jina.ai/{url}", headers=headers
@@ -3134,18 +3173,37 @@ async def _jina_reader_fetch(
         return failure(f"Jina Reader request failed: {exc}")
 
 
+def _connection_error_trigger(exc: BaseException) -> str:
+    """Classify a transport-layer failure as a telemetry trigger kind."""
+    cause = exc
+    while cause is not None:
+        if isinstance(cause, ssl.SSLError):
+            return "tls_error"
+        cause = cause.__cause__ or cause.__context__
+    return "connection_error"
+
+
 async def _web_fetch_impl_inner(
     url: str,
     max_chars: int = 20000,
     attempt_state: dict[str, str] | None = None,
+    *,
+    deadline: float | None = None,
 ) -> _FetchResult:
-    """Fetch and extract one URL, returning text plus internal cache metadata."""
+    """Fetch and extract one URL, returning text plus internal cache metadata.
+
+    ``deadline`` is the monotonic wall-clock time at which the overall fetch
+    operation must complete; fallback tiers are clamped to the remaining budget.
+    """
     max_chars = min(50000, max(1, int(max_chars)))
     attempt_state = attempt_state if attempt_state is not None else {
         "provider": "direct",
         "trigger": "none",
     }
     fetch_started = time.monotonic()
+    operation_deadline = deadline if deadline is not None else (
+        fetch_started + FETCH_OPERATION_TIMEOUT
+    )
     cache = _get_cache()
 
     def finish(
@@ -3194,20 +3252,30 @@ async def _web_fetch_impl_inner(
         )
 
     async def fallback_success(trigger: str) -> _FetchResult | None:
+        remaining = operation_deadline - time.monotonic()
+        if remaining < 1.0:
+            return None
         if DECODO_FALLBACK_ENABLED and _resolve_decodo_key():
             attempt_state.update(provider="decodo", trigger=trigger)
             try:
-                result = await _decodo_scraper_fetch(url, 50000, trigger)
+                result = await _decodo_scraper_fetch(
+                    url, 50000, trigger, timeout=remaining
+                )
             except Exception as exc:
                 logger.warning("Decodo fallback failed (%s)", type(exc).__name__)
             else:
                 if result.error is None:
                     cache_fallback(result)
                     return bound_fallback(result)
+        remaining = operation_deadline - time.monotonic()
+        if remaining < 1.0:
+            return None
         if JINA_FALLBACK_ENABLED:
             attempt_state.update(provider="jina", trigger=trigger)
             try:
-                result = await _jina_reader_fetch(url, 50000, trigger)
+                result = await _jina_reader_fetch(
+                    url, 50000, trigger, timeout=remaining
+                )
             except Exception as exc:
                 logger.warning("Jina Reader fallback failed (%s)", type(exc).__name__)
             else:
@@ -3254,9 +3322,20 @@ async def _web_fetch_impl_inner(
             _fetch_public_body(url),
             timeout=FETCH_TIMEOUT,
         )
+    except _UnsafeTargetError as exc:
+        # Hard fail-closed boundary: the target never passed public validation,
+        # so it must never be handed to Decodo or Jina to resolve independently.
+        _record_fetch_telemetry(
+            url=url,
+            outcome="unsafe_url",
+            started=fetch_started,
+            provider="direct",
+            trigger="unsafe_url",
+        )
+        return finish(failure(str(exc)), trigger="unsafe_url")
     except httpx.HTTPStatusError as exc:
         status = exc.response.status_code
-        trigger = f"http_{status}" if status in {403, 429} else "none"
+        trigger = f"http_{status}" if status in _FALLBACK_HTTP_STATUSES else "none"
         _record_fetch_telemetry(
             url=url,
             outcome="http_error",
@@ -3284,16 +3363,69 @@ async def _web_fetch_impl_inner(
                 )
         return finish(direct_failure, trigger=trigger, http_status=status)
     except httpx.TimeoutException as exc:
-        _record_fetch_telemetry(url=url, outcome="timeout", started=fetch_started)
-        return finish(failure(f"request failed: {exc}"))
+        trigger = "timeout"
+        _record_fetch_telemetry(
+            url=url,
+            outcome="timeout",
+            started=fetch_started,
+            provider="direct",
+            trigger=trigger,
+        )
+        direct_failure = failure(f"request failed: {exc}")
+        fallback = await fallback_success(trigger)
+        if fallback is not None:
+            return finish(
+                fallback,
+                trigger=trigger,
+                body_bytes=len(fallback.text.encode("utf-8")),
+            )
+        return finish(direct_failure, trigger=trigger)
     except httpx.RequestError as exc:
-        _record_fetch_telemetry(url=url, outcome="connection_error", started=fetch_started)
-        return finish(failure(f"request failed: {exc}"))
+        trigger = _connection_error_trigger(exc)
+        _record_fetch_telemetry(
+            url=url,
+            outcome="connection_error",
+            started=fetch_started,
+            provider="direct",
+            trigger=trigger,
+        )
+        direct_failure = failure(f"request failed: {exc}")
+        fallback = await fallback_success(trigger)
+        if fallback is not None:
+            return finish(
+                fallback,
+                trigger=trigger,
+                body_bytes=len(fallback.text.encode("utf-8")),
+            )
+        return finish(direct_failure, trigger=trigger)
     except asyncio.TimeoutError:
-        _record_fetch_telemetry(url=url, outcome="timeout", started=fetch_started)
-        return finish(failure(f"request exceeded {FETCH_TIMEOUT:g} second deadline"))
+        trigger = "timeout"
+        _record_fetch_telemetry(
+            url=url,
+            outcome="timeout",
+            started=fetch_started,
+            provider="direct",
+            trigger=trigger,
+        )
+        direct_failure = failure(f"request exceeded {FETCH_TIMEOUT:g} second deadline")
+        fallback = await fallback_success(trigger)
+        if fallback is not None:
+            return finish(
+                fallback,
+                trigger=trigger,
+                body_bytes=len(fallback.text.encode("utf-8")),
+            )
+        return finish(direct_failure, trigger=trigger)
     except ValueError as exc:
-        _record_fetch_telemetry(url=url, outcome="connection_error", started=fetch_started)
+        # Post-validation policy failures (oversize, unsupported encoding,
+        # redirect missing Location, too many redirects) and any other
+        # validation-time ValueError: no remote fallback.
+        _record_fetch_telemetry(
+            url=url,
+            outcome="policy_error",
+            started=fetch_started,
+            provider="direct",
+        )
         return finish(failure(str(exc)))
     except Exception as exc:
         _record_fetch_telemetry(url=url, outcome="connection_error", started=fetch_started)
@@ -3362,6 +3494,35 @@ async def _web_fetch_impl_inner(
             body_bytes=len(body),
         )
 
+    async def extraction_fallback_failure(message: str) -> _FetchResult:
+        # HTML extraction failures are recoverable via Decodo's rendered browser
+        # + Markdown output, so record the direct failure and try the fallback
+        # tiers before giving up. PDF/binary failures use ``extraction_failure``.
+        trigger = "extraction_error"
+        _record_fetch_telemetry(
+            url=url,
+            outcome="extraction_error",
+            started=fetch_started,
+            http_status=http_status,
+            body_bytes=len(body),
+            provider="direct",
+            trigger=trigger,
+        )
+        direct_failure = failure(message, provider="direct")
+        fallback = await fallback_success(trigger)
+        if fallback is not None:
+            return finish(
+                fallback,
+                trigger=trigger,
+                body_bytes=len(fallback.text.encode("utf-8")),
+            )
+        return finish(
+            direct_failure,
+            trigger=trigger,
+            http_status=http_status,
+            body_bytes=len(body),
+        )
+
     full_extracted: str
     effective_content_type = content_type
     if is_pdf:
@@ -3408,13 +3569,13 @@ async def _web_fetch_impl_inner(
                     decoded, current_url, 50000
                 )
             except asyncio.TimeoutError:
-                return extraction_failure(
+                return await extraction_fallback_failure(
                     f"HTML extraction exceeded {HTML_EXTRACT_TIMEOUT:g} second deadline"
                 )
             except _OutputLimitExceeded as exc:
-                return extraction_failure(f"HTML extraction failed: {exc}")
+                return await extraction_fallback_failure(f"HTML extraction failed: {exc}")
             except (OSError, RuntimeError) as exc:
-                return extraction_failure(f"HTML extraction failed: {exc}")
+                return await extraction_fallback_failure(f"HTML extraction failed: {exc}")
         else:
             full_extracted = _truncate_text(decoded, 50000, "\n\n... (truncated)")
 
@@ -3456,9 +3617,10 @@ async def _web_fetch_impl(url: str, max_chars: int = 20000) -> _FetchResult:
     """Run one fetch under a hard end-to-end wall-clock deadline."""
     started = time.monotonic()
     attempt_state = {"provider": "direct", "trigger": "none"}
+    deadline = started + FETCH_OPERATION_TIMEOUT
     try:
         return await asyncio.wait_for(
-            _web_fetch_impl_inner(url, max_chars, attempt_state),
+            _web_fetch_impl_inner(url, max_chars, attempt_state, deadline=deadline),
             timeout=FETCH_OPERATION_TIMEOUT,
         )
     except asyncio.TimeoutError:

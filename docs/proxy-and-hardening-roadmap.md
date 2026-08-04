@@ -21,12 +21,17 @@ Decodo uses the synchronous Universal/Web scraper at
 - JavaScript rendering (`headless: html`)
 - Markdown output
 - US geography and locale
-- a bounded 30-second provider timeout, 5 MiB identity-response cap, and
-  60-second end-to-end fetch deadline
+- a bounded 25-second provider timeout, 5 MiB identity-response cap, and a
+  shared 60-second end-to-end fetch deadline (direct 20s → Decodo 25s → Jina
+  up to the remaining ~15s)
 
 The fallback receives only a previously validated public URL. Caller headers,
 cookies, credentials, and private-network destinations are never forwarded.
-PDFs and binary responses remain on the direct path.
+URLs that never pass DNS/IP validation fail closed and are never proxied.
+Recoverable direct-fetch failures (recoverable HTTP statuses, empty/anti-bot
+HTML, timeouts, connection/TLS errors, and HTML extraction failures) escalate
+through Decodo then Jina; deterministic client errors, oversize/encoding/redirect
+policy failures, PDFs, and binary responses remain on the direct path.
 
 ## Why Decodo Web Scraping API
 

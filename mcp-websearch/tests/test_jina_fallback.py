@@ -117,7 +117,7 @@ async def test_real_200_content_does_not_trigger_jina(monkeypatch, isolated_fetc
         direct_calls += 1
         return url, b"real page content " * 20, "text/plain", 200
 
-    async def unexpected_jina(_url, _max_chars, _trigger="none"):
+    async def unexpected_jina(_url, _max_chars, _trigger="none", **_kwargs):
         pytest.fail("Jina should not be called for real direct content")
 
     monkeypatch.setattr(srv, "_fetch_public_body", successful_fetch)
@@ -138,7 +138,7 @@ async def test_antibot_direct_page_triggers_jina_fallback(monkeypatch, isolated_
     async def challenge_fetch(_url):
         return url, b"<html><title>Just a moment...</title></html>", "text/html", 200
 
-    async def successful_jina(_url, _max_chars, _trigger="none"):
+    async def successful_jina(_url, _max_chars, _trigger="none", **_kwargs):
         return srv._FetchResult(content, None, False, 0.0, url, "text/markdown", "jina")
 
     monkeypatch.setattr(srv, "_fetch_public_body", challenge_fetch)
@@ -189,7 +189,7 @@ async def test_jina_failure_returns_original_direct_error(monkeypatch, isolated_
     async def blocked_fetch(_url):
         raise direct_error
 
-    async def failed_jina(_url, _max_chars, _trigger="none"):
+    async def failed_jina(_url, _max_chars, _trigger="none", **_kwargs):
         message = "Fetch error: Jina Reader request failed"
         return srv._FetchResult(message, message, False, 0.0, url, "", "jina")
 
@@ -213,7 +213,7 @@ async def test_jina_result_is_cached(monkeypatch, isolated_fetch):
         direct_calls += 1
         raise _http_error(403, url)
 
-    async def successful_jina(_url, _max_chars, _trigger="none"):
+    async def successful_jina(_url, _max_chars, _trigger="none", **_kwargs):
         nonlocal jina_calls
         jina_calls += 1
         return srv._FetchResult(content, None, False, 0.0, url, "text/markdown", "jina")

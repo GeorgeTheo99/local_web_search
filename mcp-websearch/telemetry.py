@@ -56,10 +56,36 @@ _FETCH_OUTCOMES = {
     "extraction_error",
     "proxy_success",
     "proxy_error",
+    "unsafe_url",
+    "policy_error",
 }
 _FETCH_TIERS = {"direct", "proxy", "browser"}
 _FETCH_PROVIDERS = {"cache", "direct", "jina", "decodo", "none"}
-_FETCH_TRIGGERS = {"none", "http_403", "http_429", "empty", "antibot"}
+# Mirrors server._FALLBACK_HTTP_STATUSES plus the non-HTTP trigger kinds. Keep
+# in sync when the fallback eligibility matrix changes.
+_FETCH_TRIGGERS = {
+    "none",
+    "empty",
+    "antibot",
+    "http_403",
+    "http_408",
+    "http_429",
+    "http_500",
+    "http_502",
+    "http_503",
+    "http_504",
+    "http_520",
+    "http_521",
+    "http_522",
+    "http_523",
+    "http_524",
+    "http_527",
+    "timeout",
+    "connection_error",
+    "tls_error",
+    "extraction_error",
+    "unsafe_url",
+}
 _FETCH_OPERATION_OUTCOMES = {"success", "error"}
 
 

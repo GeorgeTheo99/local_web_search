@@ -111,14 +111,17 @@ credentials.
 
 ## Decodo credential
 
-Decodo is an optional fallback for public HTML pages that return `403`/`429`,
-an empty response, or recognizable anti-bot HTML. It uses the unified Web
-Scraping API in synchronous Universal/Web mode with the premium proxy pool,
-JavaScript rendering, and Markdown output. The fallback is enabled only when an
-owner-only Web Scraping API authorization token exists at
-`$LOCAL_SEARCH_DATA_DIR/decodo_key`. Copy only the token value after `Basic`
-from Decodo's Web Scraping API Playground-generated `Authorization` header—not
-the `Basic ` prefix, a generic Decodo API key, or another product's credential:
+Decodo is the primary remote fallback for public HTML pages that fail the
+direct fetch with a recoverable error: `403`/`408`/`429`, recoverable edge
+statuses (`500`/`502`/`503`/`504` and CDN `520`–`524`/`527`), an empty or
+anti-bot/challenge response, a direct timeout, a connection/TLS failure, or an
+HTML extraction failure. It uses the unified Web Scraping API in synchronous
+Universal/Web mode with the premium proxy pool, JavaScript rendering, and
+Markdown output. The fallback is enabled only when an owner-only Web Scraping
+API authorization token exists at `$LOCAL_SEARCH_DATA_DIR/decodo_key`. Copy
+only the token value after `Basic` from Decodo's Web Scraping API
+Playground-generated `Authorization` header—not the `Basic ` prefix, a generic
+Decodo API key, or another product's credential:
 
 ```bash
 mkdir -p data && chmod 700 data
@@ -189,9 +192,18 @@ The default 20 MiB body cap is enforced before reading a valid oversized
 responses cannot bypass it. Fetches request `Accept-Encoding: identity` and
 reject encoded responses before reading their bodies.
 
-After public-URL validation, blocked textual responses escalate to Decodo when
-configured and then to Jina Reader as a temporary final fallback. PDFs and
-binary responses never leave the direct path. Successful fallback Markdown is
+After public-URL validation, recoverable direct-fetch failures escalate to
+Decodo when configured and then to Jina Reader as a final fallback, in that
+order for every eligible trigger. Eligible triggers are `403`/`408`/`429`,
+recoverable edge statuses (`500`/`502`/`503`/`504` and CDN `520`–`524`/`527`),
+empty or anti-bot/challenge HTML, direct timeouts, connection/TLS failures,
+and HTML extraction failures. URLs that never pass DNS/IP validation
+(private/loopback/credential-bearing/unresolvable) fail closed and are never
+proxied. Deterministic client errors (`400`/`401`/`404`/`405`/`410`/`422`),
+oversize/encoding/redirect policy failures, PDFs, and binary responses never
+leave the direct path. The direct fetch, Decodo, and Jina tiers share one
+60-second operation deadline (direct 20s → Decodo 25s → Jina up to the
+remaining ~15s by default; env-tunable). Successful fallback Markdown is
 cached. Structured output includes `fetch_provider` (`cache`, `direct`,
 `decodo`, or `jina`).
 
