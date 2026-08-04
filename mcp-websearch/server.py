@@ -71,7 +71,7 @@ from fastmcp.server.dependencies import get_http_headers
 from fastmcp.tools.tool import ToolResult
 from pydantic import WithJsonSchema
 from starlette.requests import Request
-from starlette.responses import JSONResponse
+from starlette.responses import FileResponse, JSONResponse, RedirectResponse
 
 import html_extraction as htmlx
 from cache import WebCache, canonicalize_url
@@ -2011,6 +2011,56 @@ async def _health_payload() -> dict[str, Any]:
         "telemetry": _get_telemetry().status(),
         "last_search": _last_search,
     }
+
+
+_UI_ROOT = Path(__file__).resolve().parent / "ui"
+
+
+@mcp.custom_route("/", methods=["GET"])
+async def ui_redirect(request: Request) -> RedirectResponse:
+    """Send browser users to the dedicated local operations UI."""
+    return RedirectResponse("/ui", status_code=307)
+
+
+@mcp.custom_route("/ui", methods=["GET"])
+async def ui(request: Request) -> FileResponse:
+    """Serve the loopback-only Local Search operations UI."""
+    return FileResponse(
+        _UI_ROOT / "index.html",
+        media_type="text/html",
+        headers={
+            "Cache-Control": "no-store",
+            "Content-Security-Policy": (
+                "default-src 'self'; script-src 'self'; style-src 'self'; "
+                "connect-src 'self'; img-src 'self'; object-src 'none'; "
+                "base-uri 'none'; frame-ancestors 'none'"
+            ),
+            "X-Content-Type-Options": "nosniff",
+            "X-Frame-Options": "DENY",
+            "Referrer-Policy": "no-referrer",
+        },
+    )
+
+
+_UI_ASSET_HEADERS = {
+    "Cache-Control": "no-store",
+    "X-Content-Type-Options": "nosniff",
+    "Referrer-Policy": "no-referrer",
+}
+
+
+@mcp.custom_route("/ui/styles.css", methods=["GET"])
+async def ui_styles(request: Request) -> FileResponse:
+    return FileResponse(
+        _UI_ROOT / "styles.css", media_type="text/css", headers=_UI_ASSET_HEADERS
+    )
+
+
+@mcp.custom_route("/ui/app.js", methods=["GET"])
+async def ui_script(request: Request) -> FileResponse:
+    return FileResponse(
+        _UI_ROOT / "app.js", media_type="text/javascript", headers=_UI_ASSET_HEADERS
+    )
 
 
 @mcp.custom_route("/live", methods=["GET"])

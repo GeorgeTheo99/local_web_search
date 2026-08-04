@@ -43,6 +43,39 @@ def test_loopback_origin_validation():
         assert not http_server._loopback_origin(value)
 
 
+def test_ui_redirect_and_assets_are_served_with_security_headers():
+    with TestClient(http_server.build_app(), base_url="http://127.0.0.1:8889") as client:
+        redirect = client.get("/", follow_redirects=False)
+        page = client.get("/ui")
+        styles = client.get("/ui/styles.css")
+        script = client.get("/ui/app.js")
+    assert redirect.status_code == 307
+    assert redirect.headers["location"] == "/ui"
+    assert page.status_code == 200
+    assert page.headers["content-type"].startswith("text/html")
+    assert page.headers["cache-control"] == "no-store"
+    assert "frame-ancestors 'none'" in page.headers["content-security-policy"]
+    assert page.headers["x-content-type-options"] == "nosniff"
+    assert "Local Search" in page.text
+    assert styles.status_code == 200
+    assert styles.headers["content-type"].startswith("text/css")
+    assert styles.headers["cache-control"] == "no-store"
+    assert styles.headers["x-content-type-options"] == "nosniff"
+    assert script.status_code == 200
+    assert script.headers["cache-control"] == "no-store"
+    assert script.headers["x-content-type-options"] == "nosniff"
+    assert "fetch('/health'" in script.text
+    assert "innerHTML" not in script.text
+
+
+def test_ui_is_covered_by_loopback_guard():
+    with TestClient(http_server.build_app(), base_url="http://127.0.0.1:8889") as client:
+        bad_host = client.get("/ui", headers={"host": "attacker.example"})
+        bad_origin = client.get("/ui/app.js", headers={"origin": "https://attacker.example"})
+    assert bad_host.status_code == 421
+    assert bad_origin.status_code == 403
+
+
 def test_app_accepts_loopback_host_without_origin():
     with TestClient(http_server.build_app(), base_url="http://127.0.0.1:8889") as client:
         response = client.get("/live")

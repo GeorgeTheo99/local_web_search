@@ -204,6 +204,7 @@ Decodo/Jina fallbacks, and reports the actual `method`/`fetch_provider`.
 
 | Endpoint | Purpose |
 |---|---|
+| `GET /ui` | Concise loopback-only browser dashboard for broker health and query-free telemetry |
 | `GET /live` | Dependency-free process liveness |
 | `GET /ready` | Brave readiness; HTTP 503 when its credential or circuit is unavailable |
 | `GET /health` | Compatibility diagnostics; always HTTP 200 |
@@ -223,6 +224,7 @@ paths.
 
 `/stats` exposes numeric search/provider, cache, end-to-end fetch, and
 fetch-attempt aggregates. Cache hits have no search-provider attempt or cost.
+Open `http://127.0.0.1:8889/ui` for a read-only operational view of these metrics.
 
 The private cache lives under `$LOCAL_SEARCH_DATA_DIR/cache/`. Search keys are
 query hashes and cached search payloads contain returned result data; fetched

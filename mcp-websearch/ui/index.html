@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="color-scheme" content="dark">
+<title>Local Search</title>
+<link rel="stylesheet" href="/ui/styles.css">
+<script src="/ui/app.js" defer></script>
+</head>
+<body>
+<main>
+  <header>
+    <div>
+      <p class="kicker">Private search infrastructure</p>
+      <h1>Local Search</h1>
+      <p class="lede">Brave-backed search and resilient page retrieval. Query text is never stored.</p>
+    </div>
+    <div class="state" id="state" aria-live="polite"><i></i><span>Connecting</span></div>
+  </header>
+
+  <nav aria-label="Telemetry window">
+    <div class="tabs" id="windows">
+      <button type="button" data-window="24h" aria-pressed="true">24 hours</button>
+      <button type="button" data-window="7d" aria-pressed="false">7 days</button>
+      <button type="button" data-window="30d" aria-pressed="false">30 days</button>
+    </div>
+    <button class="refresh" id="refresh" type="button">Refresh</button>
+  </nav>
+
+  <section class="metrics" aria-label="Key metrics">
+    <article><span>Searches</span><strong id="search-total">—</strong><small id="search-outcomes">Waiting for telemetry</small></article>
+    <article><span>Average latency</span><strong id="search-latency">—</strong><small>Search completion</small></article>
+    <article><span>Page fetches</span><strong id="fetch-total">—</strong><small id="fetch-success">Waiting for telemetry</small></article>
+    <article><span>Search cache</span><strong id="cache-rate">—</strong><small id="cache-detail">Waiting for telemetry</small></article>
+  </section>
+
+  <section class="details">
+    <article class="panel provider-panel">
+      <div class="panel-head"><div><p class="label">Provider</p><h2>Brave Search</h2></div><span class="badge" id="provider-state">Checking</span></div>
+      <div class="rows">
+        <div><span>Credential</span><strong id="credential">—</strong></div>
+        <div><span>Circuit</span><strong id="circuit">—</strong></div>
+        <div><span>Attempts</span><strong id="attempts">—</strong></div>
+        <div><span>Provider errors</span><strong id="provider-errors">—</strong></div>
+      </div>
+    </article>
+    <article class="panel routing-panel">
+      <div class="panel-head"><div><p class="label">Routing</p><h2>Fallback & cache</h2></div></div>
+      <div class="rows">
+        <div><span>Search fallback</span><strong id="fallback">—</strong></div>
+        <div><span>Fetch success</span><strong id="fetch-rate">—</strong></div>
+        <div><span>Fetch cache</span><strong id="fetch-cache">—</strong></div>
+        <div><span>Telemetry</span><strong id="telemetry">—</strong></div>
+      </div>
+    </article>
+  </section>
+
+  <footer><span id="updated">Loading broker status…</span><span class="endpoint">MCP · <code>/mcp</code></span></footer>
+</main>
+<div class="error" id="error" role="alert" hidden></div>
+</body>
+</html>
