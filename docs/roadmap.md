@@ -96,7 +96,7 @@ search:
 **2c. User-Agent suffix**
 ```yaml
 outgoing:
-  useragent_suffix: "contact: admin@localserver99"
+  useragent_suffix: "contact: <admin-contact>"
 ```
 - Some engines are more lenient with contact info in the UA
 

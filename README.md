@@ -38,7 +38,7 @@ started install. The installer fails fast with an actionable message when the
 key is absent or has unsafe permissions.
 
 ```bash
-cd /Users/localserver99/local_code/local_web_search
+cd ~/local_code/local_web_search
 mkdir -p data && chmod 700 data
 umask 077
 read -r -s -p 'Brave API key: ' BRAVE_KEY; printf '\n'
