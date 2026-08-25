@@ -65,6 +65,26 @@ scripts/local-search install
 Subsequent `scripts/local-search update` calls re-exec the newly pulled script
 after each pull.
 
+### Maintainer Git and runtime topology
+
+On the maintainer server, `~/repos/local_web_search.git` is the authoritative
+local bare repository. The development checkout keeps `origin` pointed at that
+bare repository and a separate `github` remote for the public mirror:
+
+```bash
+git push origin main    # update the authoritative local bare repository
+git push github main    # manually publish the same commit to GitHub
+```
+
+There is no automatic bare-to-GitHub mirroring. Verify synchronization with
+`git rev-parse HEAD origin/main github/main`.
+
+The LaunchAgent runs directly from the development checkout rather than a
+separate deploy checkout. Pushing either remote does not restart the service;
+after runtime-affecting local changes, use `scripts/local-search restart` (or
+`scripts/local-search install` when dependencies or the plist changed).
+Consumer machines cloned from GitHub use `scripts/local-search update` normally.
+
 Common commands:
 
 ```bash
