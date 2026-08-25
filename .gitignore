@@ -20,6 +20,26 @@ data/brave_key
 data/kagi_key
 data/perplexity_key
 
+# Common local credential files
+.env
+.env.*
+*.env
+*.env.*
+!*.env.example
+!*.env.*.example
+*.p8
+*.pem
+*.key
+*.p12
+*.pfx
+credentials*.json
+secrets*.json
+secrets*.yaml
+secrets*.yml
+.npmrc
+.pypirc
+.netrc
+
 # pytest
 .pytest_cache/
 

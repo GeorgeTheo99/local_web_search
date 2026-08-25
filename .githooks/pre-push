@@ -1,0 +1,18 @@
+#!/bin/sh
+set -eu
+
+repo=$(git rev-parse --show-toplevel)
+if ! command -v gitleaks >/dev/null 2>&1; then
+  echo "pre-push: gitleaks is required (brew install gitleaks)" >&2
+  exit 1
+fi
+zero=0000000000000000000000000000000000000000
+while read -r local_ref local_sha remote_ref remote_sha; do
+  [ "$local_sha" != "$zero" ] || continue
+  if [ "$remote_sha" = "$zero" ]; then
+    range="$local_sha"
+  else
+    range="$remote_sha..$local_sha"
+  fi
+  gitleaks git "$repo" --no-banner --redact --config "$repo/.gitleaks.toml" --gitleaks-ignore-path "$repo/.gitleaksignore" --log-opts="$range"
+done

@@ -85,6 +85,19 @@ after runtime-affecting local changes, use `scripts/local-search restart` (or
 `scripts/local-search install` when dependencies or the plist changed).
 Consumer machines cloned from GitHub use `scripts/local-search update` normally.
 
+Secret scanning is enforced in three layers: tracked pre-commit/pre-push hooks,
+the authoritative bare repository's pre-receive hook, and the pinned GitHub
+Gitleaks workflow. Install Gitleaks and activate the worktree hooks once per
+clone:
+
+```bash
+brew install gitleaks
+git config core.hooksPath .githooks
+```
+
+Do not bypass failed scans. `.gitleaksignore` contains only an exact fingerprint
+for a synthetic credential fixture, not a file-wide exception.
+
 Common commands:
 
 ```bash
