@@ -22,10 +22,13 @@ MCP_DIR="$ROOT_DIR/mcp-websearch"
 MCP_LABEL="com.local.mcp-websearch"
 PLIST_DIR="$HOME/Library/LaunchAgents"
 MCP_PLIST="$PLIST_DIR/$MCP_LABEL.plist"
-INSTALL_CONFIG="$ROOT_DIR/data/install.env"
+INSTALL_CONFIG="${LOCAL_SEARCH_INSTALL_CONFIG:-$ROOT_DIR/data/install.env}"
 
 installed_config_value() {
-  [ -f "$INSTALL_CONFIG" ] || return 0
+  local metadata
+  [ -f "$INSTALL_CONFIG" ] && [ ! -L "$INSTALL_CONFIG" ] || return 0
+  metadata="$(stat -f '%u %l %Lp' "$INSTALL_CONFIG" 2>/dev/null || stat -c '%u %h %a' "$INSTALL_CONFIG" 2>/dev/null || true)"
+  [ "$metadata" = "$(id -u) 1 600" ] || return 0
   awk -v prefix="$1=" 'index($0, prefix) == 1 {print substr($0, length(prefix) + 1); exit}' \
     "$INSTALL_CONFIG"
 }
@@ -35,6 +38,8 @@ installed_mcp_env() {
   /usr/libexec/PlistBuddy -c "Print :EnvironmentVariables:$1" "$MCP_PLIST" 2>/dev/null || true
 }
 
+MCP_PORT="${MCP_PORT:-$(installed_config_value MCP_PORT)}"
+MCP_PORT="${MCP_PORT:-$(installed_mcp_env MCP_PORT)}"
 MCP_PORT="${MCP_PORT:-8889}"
 WEBSEARCH_PROVIDER_STACK="brave"
 WEBSEARCH_SEARCH_MODE="${WEBSEARCH_SEARCH_MODE:-$(installed_config_value WEBSEARCH_SEARCH_MODE)}"
@@ -108,9 +113,12 @@ validate_search_configuration() {
     normal|sensitive|maximum_recall) ;;
     *) die "WEBSEARCH_SEARCH_MODE must be normal, sensitive, or maximum_recall" ;;
   esac
+  case "$MCP_PORT" in
+    ''|*[!0-9]*) die "MCP_PORT must contain only ASCII digits" ;;
+  esac
   python3 - "$WEBSEARCH_TOTAL_TIMEOUT" "$WEBSEARCH_BRAVE_TIMEOUT" \
     "$DECODO_TIMEOUT" "$DECODO_RESPONSE_MAX_BYTES" \
-    "$WEBSEARCH_FETCH_OPERATION_TIMEOUT" <<'PY' || exit 1
+    "$WEBSEARCH_FETCH_OPERATION_TIMEOUT" "$MCP_PORT" <<'PY' || exit 1
 import sys
 try:
     total = float(sys.argv[1])
@@ -118,8 +126,9 @@ try:
     decodo = float(sys.argv[3])
     max_bytes = int(sys.argv[4])
     operation = float(sys.argv[5])
+    mcp_port = int(sys.argv[6])
 except ValueError:
-    raise SystemExit("timeouts must be numeric and DECODO_RESPONSE_MAX_BYTES must be an integer")
+    raise SystemExit("timeouts and MCP_PORT must be numeric and DECODO_RESPONSE_MAX_BYTES must be an integer")
 if not 1 <= total <= 18:
     raise SystemExit("WEBSEARCH_TOTAL_TIMEOUT must be between 1 and 18")
 if not 0.25 <= brave <= total:
@@ -130,6 +139,8 @@ if not 4096 <= max_bytes <= 20 * 1024 * 1024:
     raise SystemExit("DECODO_RESPONSE_MAX_BYTES must be between 4096 and 20971520")
 if not 1 <= operation <= 120:
     raise SystemExit("WEBSEARCH_FETCH_OPERATION_TIMEOUT must be between 1 and 120")
+if not 1 <= mcp_port <= 65535:
+    raise SystemExit("MCP_PORT must be between 1 and 65535")
 PY
 }
 
@@ -139,8 +150,27 @@ ensure_data_dir() {
 }
 
 persist_install_config() {
+  validate_search_configuration
   ensure_data_dir
+  local config_dir metadata tmp
+  config_dir="$(dirname "$INSTALL_CONFIG")"
+  [ ! -L "$config_dir" ] || die "refusing symlinked install-config directory: $config_dir"
+  mkdir -p "$config_dir"
+  [ -d "$config_dir" ] && [ ! -L "$config_dir" ] || die "install-config parent is not a safe directory: $config_dir"
+  metadata="$(stat -f '%u' "$config_dir" 2>/dev/null || stat -c '%u' "$config_dir")"
+  [ "$metadata" = "$(id -u)" ] || die "install-config directory is not owned by this user: $config_dir"
+  chmod 700 "$config_dir"
+  if [ -e "$INSTALL_CONFIG" ] || [ -L "$INSTALL_CONFIG" ]; then
+    [ -f "$INSTALL_CONFIG" ] && [ ! -L "$INSTALL_CONFIG" ] \
+      || die "refusing unsafe install config: $INSTALL_CONFIG"
+    metadata="$(stat -f '%u %l' "$INSTALL_CONFIG" 2>/dev/null || stat -c '%u %h' "$INSTALL_CONFIG")"
+    [ "$metadata" = "$(id -u) 1" ] \
+      || die "install config has unsafe ownership or hard links: $INSTALL_CONFIG"
+  fi
+  tmp="$(mktemp "$config_dir/.install.env.XXXXXX")"
+  chmod 600 "$tmp"
   (umask 077; printf '%s\n' \
+    "MCP_PORT=$MCP_PORT" \
     "LOCAL_SEARCH_DATA_DIR=$LOCAL_SEARCH_DATA_DIR" \
     "LOCAL_SEARCH_TELEMETRY_ENABLED=$LOCAL_SEARCH_TELEMETRY_ENABLED" \
     "WEBSEARCH_PROVIDER_STACK=brave" \
@@ -151,7 +181,8 @@ persist_install_config() {
     "DECODO_TIMEOUT=$DECODO_TIMEOUT" \
     "DECODO_RESPONSE_MAX_BYTES=$DECODO_RESPONSE_MAX_BYTES" \
     "WEBSEARCH_FETCH_OPERATION_TIMEOUT=$WEBSEARCH_FETCH_OPERATION_TIMEOUT" \
-    >"$INSTALL_CONFIG")
+    >"$tmp")
+  mv -f "$tmp" "$INSTALL_CONFIG"
   chmod 600 "$INSTALL_CONFIG"
 }
 
@@ -267,8 +298,19 @@ ensure_private_logs() {
 install_plist() {
   ensure_private_logs
   ensure_data_dir
+  validate_search_configuration
+  local plist preflight
+  plist="$(mcp_plist)"
+  preflight="$(mktemp "${TMPDIR:-/tmp}/local-search.plist.XXXXXX")"
+  chmod 600 "$preflight"
+  printf '%s' "$plist" >"$preflight"
+  if ! /usr/bin/plutil -lint "$preflight" >/dev/null; then
+    rm -f "$preflight"
+    die "generated LaunchAgent plist is invalid"
+  fi
+  rm -f "$preflight"
   persist_install_config
-  write_plist
+  write_plist "$MCP_LABEL" "$plist"
 }
 
 retire_legacy_searxng() {
@@ -365,6 +407,7 @@ cmd_install() {
   local start=1
   [ "${1:-}" = "--no-start" ] && start=0
   check_prereqs
+  validate_search_configuration
   [ "$start" -eq 0 ] || check_provider_credentials
   log "Installing local-search into $ROOT_DIR"
   ensure_mcp_venv
@@ -411,6 +454,7 @@ MCP_DIR=$MCP_DIR
 MCP_VENV=$MCP_VENV
 MCP_PORT=$MCP_PORT
 MCP_LABEL=$MCP_LABEL
+INSTALL_CONFIG=$INSTALL_CONFIG
 WEBSEARCH_PROVIDER_STACK=brave
 WEBSEARCH_SEARCH_MODE=$WEBSEARCH_SEARCH_MODE
 WEBSEARCH_TOTAL_TIMEOUT=$WEBSEARCH_TOTAL_TIMEOUT

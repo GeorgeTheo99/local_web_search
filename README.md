@@ -311,10 +311,14 @@ Important environment variables:
 | `MCP_PORT` | `8889` |
 
 Use `scripts/local-search env` to inspect resolved non-secret values. The
-`install` command persists settings, rewrites the launchd plist, and starts it
-unless `--no-start` is used. `restart` only restarts the already-installed
-plist; it does **not** re-render changed shell variables or `data/install.env`.
-Run `scripts/local-search install` after changing persistent configuration.
+`install` command persists settings—including `MCP_PORT`—in the owner-only
+`data/install.env`, rewrites the launchd plist, and starts it unless
+`--no-start` is used. Fresh shell sessions and updates recover that persisted
+port (or migrate it from the installed plist) before falling back to `8889`.
+An explicit `MCP_PORT` environment value takes precedence when intentionally
+re-running `install`. `restart` only restarts the already-installed plist; it
+does **not** re-render changed shell variables or `data/install.env`. Run
+`scripts/local-search install` after changing persistent configuration.
 
 ## Client configuration
 

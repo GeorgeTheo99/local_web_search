@@ -30,6 +30,8 @@ def _source_and_run(
         "DECODO_RESPONSE_MAX_BYTES": "1048576",
         "WEBSEARCH_FETCH_OPERATION_TIMEOUT": "55",
     }
+    env.pop("MCP_PORT", None)
+    env.pop("LOCAL_SEARCH_INSTALL_CONFIG", None)
     env.update(env_overrides or {})
     completed = subprocess.run(
         ["bash", "-c", f'source "{SCRIPT}"; {command}'],
@@ -64,8 +66,9 @@ def test_brave_credential_preflight_accepts_owner_only_key(tmp_path):
     assert _source_and_run("check_provider_credentials; printf passed", tmp_path) == "passed"
 
 
-def test_generated_plist_propagates_search_mode_and_provider_timeouts(tmp_path):
-    plist = _source_and_run("mcp_plist", tmp_path)
+def test_generated_plist_propagates_search_mode_provider_timeouts_and_port(tmp_path):
+    plist = _source_and_run("mcp_plist", tmp_path, {"MCP_PORT": "18889"})
+    assert "<key>MCP_PORT</key><string>18889</string>" in plist
     assert "<key>WEBSEARCH_PROVIDER_STACK</key><string>brave</string>" in plist
     assert "<key>WEBSEARCH_SEARCH_MODE</key><string>sensitive</string>" in plist
     assert "<key>WEBSEARCH_TOTAL_TIMEOUT</key><string>17</string>" in plist
@@ -78,6 +81,7 @@ def test_generated_plist_propagates_search_mode_and_provider_timeouts(tmp_path):
 
 def test_env_command_reports_propagated_search_configuration(tmp_path):
     output = _source_and_run("cmd_env", tmp_path)
+    assert "MCP_PORT=8889" in output
     assert "WEBSEARCH_PROVIDER_STACK=brave" in output
     assert "WEBSEARCH_SEARCH_MODE=sensitive" in output
     assert "WEBSEARCH_TOTAL_TIMEOUT=17" in output
@@ -86,6 +90,47 @@ def test_env_command_reports_propagated_search_configuration(tmp_path):
     assert "DECODO_TIMEOUT=21" in output
     assert "DECODO_RESPONSE_MAX_BYTES=1048576" in output
     assert "WEBSEARCH_FETCH_OPERATION_TIMEOUT=55" in output
+
+
+def test_fresh_shell_recovers_persisted_mcp_port(tmp_path):
+    install_config = tmp_path / "data" / "install.env"
+    install_config.parent.mkdir()
+    install_config.write_text("MCP_PORT=18889\n", encoding="utf-8")
+    install_config.chmod(0o600)
+    output = _source_and_run(
+        "cmd_env",
+        tmp_path,
+        {"LOCAL_SEARCH_INSTALL_CONFIG": str(install_config)},
+    )
+    assert "MCP_PORT=18889" in output
+    assert f"INSTALL_CONFIG={install_config}" in output
+
+
+def test_fresh_shell_ignores_nonprivate_install_config(tmp_path):
+    install_config = tmp_path / "data" / "install.env"
+    install_config.parent.mkdir()
+    install_config.write_text("MCP_PORT=18889\n", encoding="utf-8")
+    install_config.chmod(0o644)
+    output = _source_and_run(
+        "cmd_env",
+        tmp_path,
+        {"LOCAL_SEARCH_INSTALL_CONFIG": str(install_config)},
+    )
+    assert "MCP_PORT=8889" in output
+
+
+def test_install_config_persists_explicit_mcp_port(tmp_path):
+    install_config = tmp_path / "data" / "install.env"
+    _source_and_run(
+        "persist_install_config",
+        tmp_path,
+        {
+            "LOCAL_SEARCH_INSTALL_CONFIG": str(install_config),
+            "MCP_PORT": "28889",
+        },
+    )
+    assert "MCP_PORT=28889" in install_config.read_text(encoding="utf-8").splitlines()
+    assert install_config.stat().st_mode & 0o777 == 0o600
 
 
 def test_decodo_preflight_rejects_unsafe_optional_key(tmp_path):
@@ -108,6 +153,55 @@ def test_stdio_exports_all_decodo_runtime_settings():
     assert "export WEBSEARCH_FETCH_OPERATION_TIMEOUT" in script
 
 
+def test_operator_rejects_invalid_mcp_port(tmp_path):
+    with pytest.raises(subprocess.CalledProcessError) as error:
+        _source_and_run("validate_search_configuration", tmp_path, {"MCP_PORT": "70000"})
+    assert "MCP_PORT must be between 1 and 65535" in error.value.stderr
+
+
+@pytest.mark.parametrize("port", [" 18889", "+18889", "١٨٨٨٩"])
+def test_operator_rejects_noncanonical_mcp_port(tmp_path, port):
+    with pytest.raises(subprocess.CalledProcessError) as error:
+        _source_and_run("validate_search_configuration", tmp_path, {"MCP_PORT": port})
+    assert "MCP_PORT must contain only ASCII digits" in error.value.stderr
+
+
+def test_invalid_port_does_not_poison_existing_install_config(tmp_path):
+    install_config = tmp_path / "data" / "install.env"
+    install_config.parent.mkdir()
+    install_config.write_text("MCP_PORT=18889\n", encoding="utf-8")
+    with pytest.raises(subprocess.CalledProcessError):
+        _source_and_run(
+            "persist_install_config",
+            tmp_path,
+            {
+                "LOCAL_SEARCH_INSTALL_CONFIG": str(install_config),
+                "MCP_PORT": "70000",
+            },
+        )
+    assert install_config.read_text(encoding="utf-8") == "MCP_PORT=18889\n"
+
+
+def test_persistence_refuses_symlinked_install_config(tmp_path):
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    victim = tmp_path / "victim"
+    victim.write_text("unchanged\n", encoding="utf-8")
+    install_config = data_dir / "install.env"
+    install_config.symlink_to(victim)
+    with pytest.raises(subprocess.CalledProcessError) as error:
+        _source_and_run(
+            "persist_install_config",
+            tmp_path,
+            {
+                "LOCAL_SEARCH_INSTALL_CONFIG": str(install_config),
+                "MCP_PORT": "18889",
+            },
+        )
+    assert "refusing unsafe install config" in error.value.stderr
+    assert victim.read_text(encoding="utf-8") == "unchanged\n"
+
+
 def test_operator_rejects_noninteger_decodo_response_limit(tmp_path):
     with pytest.raises(subprocess.CalledProcessError) as error:
         _source_and_run(
@@ -122,6 +216,7 @@ def test_update_reexecs_new_script_and_retires_legacy_only_after_verify():
     script = SCRIPT.read_text(encoding="utf-8")
     assert 'exec "$ROOT_DIR/scripts/local-search" _update-after-pull' in script
     install_body = script.split("cmd_install() {", 1)[1].split("cmd_uninstall() {", 1)[0]
+    assert install_body.index("validate_search_configuration") < install_body.index("ensure_mcp_venv")
     assert install_body.index("verify || die") < install_body.index("retire_legacy_searxng")
     update_body = script.split("cmd_update_after_pull() {", 1)[1].split("cmd_update() {", 1)[0]
     assert update_body.index("check_provider_credentials") < update_body.index("install_plist")
