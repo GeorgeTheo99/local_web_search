@@ -37,6 +37,23 @@ ATTACHMENT_SUFFIXES = {
     ".zip",
 }
 TRUNCATION_SUFFIX = "\n\n... (truncated)"
+# Increment when the body-content validation contract changes. Legacy HTML
+# cache entries have version zero and must be extracted again.
+HTML_EXTRACTION_VERSION = 1
+
+
+def is_insufficient_html_text(text: str) -> bool:
+    """Recognize empty/script-shell output, not an arbitrary minimum length.
+
+    Exact whole-output matches avoid rejecting articles discussing JavaScript
+    or loading indicators. This is a shell check, not a relevance guarantee.
+    """
+    normalized = " ".join(text.split()).casefold().strip(" .!…")
+    return normalized in {
+        "", "loading", "loading content", "please wait",
+        "enable javascript", "please enable javascript",
+        "javascript is required", "you need to enable javascript to run this app",
+    }
 
 
 class TextExtractor(HTMLParser):
@@ -51,7 +68,9 @@ class TextExtractor(HTMLParser):
         self._anchor_chunks: list[str] = []
 
     def handle_starttag(self, tag, attrs):
-        if tag in ("script", "style", "noscript"):
+        # Skip the text-bearing metadata elements, not the entire head: HTML
+        # permits implicit </head>/<body> before visible content such as <p>.
+        if tag in ("script", "style", "noscript", "title"):
             self._skip_depth += 1
             return
         if self._skip_depth:
@@ -70,7 +89,7 @@ class TextExtractor(HTMLParser):
             self._anchor_chunks = []
 
     def handle_endtag(self, tag):
-        if tag in ("script", "style", "noscript"):
+        if tag in ("script", "style", "noscript", "title"):
             self._skip_depth = max(0, self._skip_depth - 1)
             return
         if tag == "a" and self._anchor_href is not None:

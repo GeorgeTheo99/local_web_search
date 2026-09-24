@@ -3286,7 +3286,7 @@ async def _web_fetch_impl_inner(
 
     try:
         cached = (
-            cache.get_content(url)
+            cache.get_content(url, html_extraction_version=htmlx.HTML_EXTRACTION_VERSION)
             if cache is not None and _cache_lookup_allowed(url)
             else None
         )
@@ -3445,9 +3445,7 @@ async def _web_fetch_impl_inner(
         trigger = "none"
         if not body:
             trigger = "empty"
-        elif is_html and (
-            len(body) < 200 or _looks_like_antibot_page(decoded_for_fallback)
-        ):
+        elif is_html and _looks_like_antibot_page(decoded_for_fallback):
             trigger = "antibot"
         if trigger != "none":
             _record_fetch_telemetry(
@@ -3576,6 +3574,13 @@ async def _web_fetch_impl_inner(
                 return await extraction_fallback_failure(f"HTML extraction failed: {exc}")
             except (OSError, RuntimeError) as exc:
                 return await extraction_fallback_failure(f"HTML extraction failed: {exc}")
+            # Check full output before caller truncation or cache writes. A title
+            # or script shell is not a successful retrieval, even without an
+            # extractor exception; legitimate short body text remains valid.
+            if htmlx.is_insufficient_html_text(full_extracted):
+                return await extraction_fallback_failure(
+                    "HTML extraction produced no substantive body content"
+                )
         else:
             full_extracted = _truncate_text(decoded, 50000, "\n\n... (truncated)")
 
@@ -3587,6 +3592,7 @@ async def _web_fetch_impl_inner(
                 full_extracted,
                 content_type=effective_content_type,
                 final_url=current_url,
+                html_extraction_version=htmlx.HTML_EXTRACTION_VERSION,
             )
         except Exception:
             pass

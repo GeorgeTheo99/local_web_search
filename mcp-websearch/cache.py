@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 CACHE_DB_FILENAME = "cache.sqlite3"
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 SEARCH_TTL_SECONDS = 2 * 60 * 60
 NEWS_SEARCH_TTL_SECONDS = 30 * 60
 GENERAL_CONTENT_TTL_SECONDS = 24 * 60 * 60
@@ -254,7 +254,16 @@ class WebCache:
             CREATE INDEX IF NOT EXISTS idx_content_accessed ON content_entries(last_accessed_at);
             """
         )
-        conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+        # Serialize the additive migration across broker/maintenance processes.
+        with conn:
+            conn.execute("BEGIN IMMEDIATE")
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(content_entries)")}
+            if "html_extraction_version" not in columns:
+                conn.execute(
+                    "ALTER TABLE content_entries ADD COLUMN "
+                    "html_extraction_version INTEGER NOT NULL DEFAULT 0"
+                )
+            conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         conn.commit()
         self._secure_files()
         self.available = True
@@ -367,7 +376,9 @@ class WebCache:
         except Exception:
             return
 
-    def get_content(self, url: str) -> ContentCacheHit | None:
+    def get_content(
+        self, url: str, *, html_extraction_version: int = 0
+    ) -> ContentCacheHit | None:
         if not self.available or self._conn is None:
             return None
         now = self._clock()
@@ -376,14 +387,21 @@ class WebCache:
             with self._lock:
                 assert self._conn is not None
                 row = self._conn.execute(
-                    "SELECT blob_relpath, content_type, final_url, created_at, expires_at "
+                    "SELECT blob_relpath, content_type, final_url, created_at, expires_at, "
+                    "html_extraction_version "
                     "FROM content_entries WHERE url_hash = ?",
                     (url_hash,),
                 ).fetchone()
                 if row is None:
                     return None
                 blob_path = self.root / str(row[0])
-                if int(row[4]) <= now or not blob_path.is_file():
+                # Old HTML lacks evidence of body-content validation. Refetch it
+                # lazily, before recording a hit; leave other cache entries alone.
+                stale_html = (
+                    "html" in str(row[1]).split(";", 1)[0].lower()
+                    and int(row[5]) < html_extraction_version
+                )
+                if stale_html or int(row[4]) <= now or not blob_path.is_file():
                     self._conn.execute("DELETE FROM content_entries WHERE url_hash = ?", (url_hash,))
                     self._conn.commit()
                     try:
@@ -415,6 +433,7 @@ class WebCache:
         *,
         content_type: str,
         final_url: str | None = None,
+        html_extraction_version: int = 0,
     ) -> None:
         if not self.available or self._conn is None:
             return
@@ -455,8 +474,8 @@ class WebCache:
                     INSERT INTO content_entries(
                         url_hash, canonical_url, final_url, blob_relpath,
                         content_type, created_at, expires_at, last_accessed_at,
-                        hit_count, size_bytes
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?)
+                        hit_count, size_bytes, html_extraction_version
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
                     ON CONFLICT(url_hash) DO UPDATE SET
                         canonical_url = excluded.canonical_url,
                         final_url = excluded.final_url,
@@ -466,7 +485,8 @@ class WebCache:
                         expires_at = excluded.expires_at,
                         last_accessed_at = excluded.last_accessed_at,
                         hit_count = 0,
-                        size_bytes = excluded.size_bytes
+                        size_bytes = excluded.size_bytes,
+                        html_extraction_version = excluded.html_extraction_version
                     """,
                     (
                         url_hash,
@@ -478,6 +498,7 @@ class WebCache:
                         expires_at,
                         now,
                         len(content_bytes),
+                        int(html_extraction_version),
                     ),
                 )
                 self._conn.commit()

@@ -240,6 +240,13 @@ remaining ~15s by default; env-tunable). Successful fallback Markdown is
 cached. Structured output includes `fetch_provider` (`cache`, `direct`,
 `decodo`, or `jina`).
 
+HTML extraction excludes title, script, style, and noscript text. Empty extracted bodies and
+recognized whole-output loading/JavaScript placeholders are extraction failures,
+not successful fetches, and use the same bounded fallback path. Short HTML body
+text remains valid; there is no minimum body or extracted-text length. Validation
+runs before caller truncation and cache writes. This detects common empty shells,
+not every low-quality page or whether content answers a particular question.
+
 ### `verify_url(url)`
 
 Runs the same cached and bounded fetch path as `web_fetch`, including configured
@@ -275,6 +282,15 @@ The private cache lives under `$LOCAL_SEARCH_DATA_DIR/cache/`. Search keys are
 query hashes and cached search payloads contain returned result data; fetched
 content entries retain canonical URLs and extracted bodies. Cache hits emit
 provider-free telemetry and report zero estimated provider cost.
+
+Cache schema v2 adds an HTML extraction-version marker. Older HTML entries lack
+body-validation evidence and are discarded individually when requested, then
+re-fetched through the normal public-URL checks; no bulk cache reset is needed.
+Newly validated short HTML is cacheable. Search entries and non-HTML content
+(including fallback Markdown) are unaffected. Back up the cache with SQLite's
+backup API before a runtime upgrade if a schema-v1 rollback is needed: an older
+broker cannot open a v2 cache and will operate without caching until its v1 backup
+is restored while the service is stopped.
 
 ```bash
 scripts/local-search stats 7d
