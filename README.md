@@ -1,6 +1,6 @@
 # local_web_search
 
-Local, loopback-only web search and page retrieval for macOS:
+Local-first web search and page retrieval for macOS (loopback-only by default):
 
 - **FastMCP broker** on `http://127.0.0.1:8889/mcp`
 - **Brave Search API** for ranked web and image search
@@ -79,11 +79,12 @@ git push github main    # manually publish the same commit to GitHub
 There is no automatic bare-to-GitHub mirroring. Verify synchronization with
 `git rev-parse HEAD origin/main github/main`.
 
-The LaunchAgent runs directly from the development checkout rather than a
-separate deploy checkout. Pushing either remote does not restart the service;
-after runtime-affecting local changes, use `scripts/local-search restart` (or
-`scripts/local-search install` when dependencies or the plist changed).
-Consumer machines cloned from GitHub use `scripts/local-search update` normally.
+The maintainer's Homebrew-managed LaunchAgent runs from the installed module at
+`~/.local/share/pi-shared/modules/local_web_search`, not the development checkout.
+Publish approved source changes, then use `pi-shared update --modules-only` to
+install them; do not edit installed copies. Pushing a remote alone does not
+restart the service. For standalone clones, use `scripts/local-search update`.
+Use the installed operator's `install` when persistent configuration changes.
 
 Secret scanning is enforced in three layers: tracked pre-commit/pre-push hooks,
 the authoritative bare repository's pre-receive hook, and the pinned GitHub
@@ -350,10 +351,16 @@ For stdio clients:
 scripts/local-search mcp-stdio
 ```
 
-Services intentionally bind to loopback. Remote use is supported only through a
-persistent SSH local forward; see
-[`docs/remote-mcp-over-ssh.md`](docs/remote-mcp-over-ssh.md). Do not publish the
-broker through Caddy, a LAN listener, a tailnet listener, or a public endpoint.
+Services always bind to loopback. Remote access supports either:
+
+- A persistent [SSH local forward](docs/remote-mcp-over-ssh.md) (no broker changes).
+- Explicit [Tailscale HTTPS mode](docs/remote-mcp-over-tailnet.md): a separate
+  MCP-only loopback ingress behind Tailscale Serve, restricted to one configured
+  hostname. All devices permitted by your tailnet access rules are trusted;
+  no API key is needed. Local diagnostics remain private.
+
+Remote ingress is off by default (`MCP_TAILNET_HOST` empty). Do not publish either
+listener through a public proxy, a LAN listener, or Tailscale Funnel.
 
 ## Verification
 
@@ -381,7 +388,8 @@ retained as immutable evidence, not active configuration.
 
 ## Security and reliability
 
-- Loopback Host/Origin enforcement on MCP HTTP transport
+- Loopback Host/Origin enforcement by default; opt-in MCP-only Tailscale ingress
+  with an exact hostname and HTTPS Origin policy (never public Funnel)
 - Public-address validation and DNS/IP pinning for fetches
 - Redirect-chain revalidation
 - Bounded provider JSON, fetch bodies, Decodo responses, extraction output, and subprocess stderr

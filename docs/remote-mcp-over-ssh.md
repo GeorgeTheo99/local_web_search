@@ -1,6 +1,7 @@
 # Remote MCP client over a persistent SSH tunnel
 
-This is the supported remote-access path for local-search. It keeps the broker
+This is the SSH remote-access path for local-search. For URL-only access, see
+[opt-in Tailscale HTTPS mode](remote-mcp-over-tailnet.md). SSH keeps the broker
 bound to server loopback and exposes only a client-local endpoint:
 
 ```text

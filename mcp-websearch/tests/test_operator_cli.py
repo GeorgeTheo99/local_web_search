@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import plistlib
 import subprocess
 from pathlib import Path
 
@@ -29,6 +30,8 @@ def _source_and_run(
         "DECODO_TIMEOUT": "21",
         "DECODO_RESPONSE_MAX_BYTES": "1048576",
         "WEBSEARCH_FETCH_OPERATION_TIMEOUT": "55",
+        "MCP_TAILNET_HOST": "",
+        "MCP_TAILNET_PORT": "8891",
     }
     env.pop("MCP_PORT", None)
     env.pop("LOCAL_SEARCH_INSTALL_CONFIG", None)
@@ -41,6 +44,117 @@ def _source_and_run(
         env=env,
     )
     return completed.stdout
+
+
+def test_tailnet_plist_is_separate_mcp_only_process(tmp_path):
+    import plistlib
+    raw = _source_and_run("mcp_plist tailnet", tmp_path, {
+        "MCP_TAILNET_HOST": "search.tail123.ts.net", "MCP_TAILNET_PORT": "18891",
+    })
+    plist = plistlib.loads(raw.encode())
+    assert plist["Label"] == "com.local.mcp-websearch-tailnet"
+    assert plist["ProgramArguments"][-1] == "--tailnet"
+    assert plist["EnvironmentVariables"]["MCP_PORT"] == "18891"
+    assert plist["EnvironmentVariables"]["MCP_TAILNET_HOST"] == "search.tail123.ts.net"
+    assert plist["StandardErrorPath"].endswith("mcp-websearch-tailnet.log")
+    assert plist["Umask"] == 63
+    local = plistlib.loads(_source_and_run("mcp_plist", tmp_path).encode())
+    assert "--tailnet" not in local["ProgramArguments"]
+    assert "MCP_TAILNET_HOST" not in local["EnvironmentVariables"]
+
+
+@pytest.mark.parametrize("values", [
+    {"MCP_TAILNET_HOST": "https://search.tail123.ts.net"},
+    {"MCP_TAILNET_HOST": "*.tail123.ts.net"},
+    {"MCP_TAILNET_HOST": "evil.example"},
+    {"MCP_TAILNET_HOST": "search.tail123.ts.net\n"},
+    {"MCP_TAILNET_HOST": "search.tail123.ts.net", "MCP_TAILNET_PORT": "8889", "MCP_PORT": "8889"},
+    {"MCP_TAILNET_PORT": "70000"},
+    {"MCP_TAILNET_PORT": "+8891"},
+])
+def test_tailnet_invalid_config_rejected(tmp_path, values):
+    with pytest.raises(subprocess.CalledProcessError) as error:
+        _source_and_run("validate_search_configuration", tmp_path, values)
+    assert "MCP_TAILNET_" in error.value.stderr
+
+
+def test_tailnet_config_persists_and_explicit_empty_disables(tmp_path):
+    config = tmp_path / "data" / "install.env"
+    env = {"LOCAL_SEARCH_INSTALL_CONFIG": str(config),
+           "MCP_TAILNET_HOST": "search.tail123.ts.net", "MCP_TAILNET_PORT": "18891"}
+    _source_and_run("persist_install_config", tmp_path, env)
+    assert "MCP_TAILNET_HOST=search.tail123.ts.net" in config.read_text()
+    # Read using the same private-file loader as fresh operator invocations.
+    assert _source_and_run("installed_config_value MCP_TAILNET_HOST", tmp_path, env).strip() == "search.tail123.ts.net"
+    _source_and_run("persist_install_config", tmp_path, {**env, "MCP_TAILNET_HOST": ""})
+    assert "MCP_TAILNET_HOST=\n" in config.read_text()
+
+
+def test_bootstrap_services_includes_installed_tailnet_plist(tmp_path):
+    plist = tmp_path / "tailnet.plist"
+    plist.touch()
+    output = _source_and_run(
+        f'TAILNET_PLIST="{plist}"; bootstrap_service() {{ printf "%s\\n" "${{1:-local}}"; }}; bootstrap_services', tmp_path,
+    )
+    assert output.splitlines() == ["local", "com.local.mcp-websearch-tailnet"]
+
+
+def test_install_with_remote_disabled_retires_only_ingress(tmp_path):
+    plist = tmp_path / "tailnet.plist"
+    plist.write_bytes(plistlib.dumps({"EnvironmentVariables": {"MCP_PORT": "18891"}}))
+    output = _source_and_run(
+        f'TAILNET_PLIST="{plist}"; '
+        'ensure_private_logs() { :; }; write_plist() { :; }; _wait_port_free() { :; }; '
+        'launchctl() { printf "%s\\n" "$*" >> "$LOCAL_SEARCH_DATA_DIR/launchctl.log"; '
+        'printf "Could not find service\\n" >&2; return 113; }; '
+        'install_plist; printf "%s" "$(< "$LOCAL_SEARCH_DATA_DIR/launchctl.log")"',
+        tmp_path, {"LOCAL_SEARCH_INSTALL_CONFIG": str(tmp_path / "data" / "install.env")},
+    )
+    assert not plist.exists()
+    assert output.endswith("/com.local.mcp-websearch-tailnet")
+
+
+@pytest.mark.parametrize("behavior", ["bootout-fails", "unknown-state", "still-registered"])
+def test_failed_remote_disable_retains_plist(tmp_path, behavior):
+    plist = tmp_path / "tailnet.plist"
+    plist.write_text("owned-plist")
+    if behavior == "bootout-fails":
+        stub = 'launchctl() { [ "$1" = print ]; }; '
+    elif behavior == "unknown-state":
+        stub = 'launchctl() { echo "permission denied" >&2; return 1; }; '
+    else:
+        stub = 'launchctl() { return 0; }; sleep() { :; }; '
+    with pytest.raises(subprocess.CalledProcessError) as error:
+        _source_and_run(
+            f'TAILNET_PLIST="{plist}"; '
+            'ensure_private_logs() { :; }; write_plist() { :; }; '
+            + stub + 'install_plist',
+            tmp_path, {"LOCAL_SEARCH_INSTALL_CONFIG": str(tmp_path / "data" / "install.env")},
+        )
+    assert "plist retained" in error.value.stderr
+    assert plist.read_text() == "owned-plist"
+
+
+def test_failed_listener_shutdown_retry_retains_ingress_ownership(tmp_path):
+    plist = tmp_path / "tailnet.plist"
+    content = plistlib.dumps({"EnvironmentVariables": {"MCP_PORT": "18891"}})
+    plist.write_bytes(content)
+    gone = tmp_path / "unregistered"
+    waits = tmp_path / "waits"
+    command = (
+        f'TAILNET_PLIST="{plist}"; '
+        f'launchctl() {{ if [ "$1" = bootout ]; then touch "{gone}"; return 0; fi; '
+        f'if [ -f "{gone}" ]; then echo "Could not find service" >&2; return 113; fi; return 0; }}; '
+        f'_wait_port_free() {{ echo wait >> "{waits}"; die "listener still bound"; }}; '
+        'cmd_uninstall'
+    )
+    for _ in range(2):
+        with pytest.raises(subprocess.CalledProcessError) as error:
+            _source_and_run(command, tmp_path)
+        assert "listener still bound" in error.value.stderr
+        assert plist.read_bytes() == content
+    assert gone.exists()
+    assert waits.read_text().splitlines() == ["wait", "wait"]
 
 
 def test_ensure_data_dir_creates_private_cache_directory(tmp_path):

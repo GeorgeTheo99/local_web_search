@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the loopback-only websearch MCP server as an HTTP service.
+"""Run websearch on loopback, optionally as an MCP-only Tailscale Serve backend.
 
 Serves:
   POST /mcp    — MCP streamable-http transport (tools/list, tools/call)
@@ -16,8 +16,10 @@ Configuration via environment:
 
 from __future__ import annotations
 
+import argparse
 import logging
 import os
+import re
 import urllib.parse
 from collections.abc import Awaitable, Callable
 from typing import Any
@@ -79,6 +81,52 @@ def _loopback_origin(value: str) -> bool:
     )
 
 
+def validate_tailnet_host(value: str) -> str:
+    """Require one canonical MagicDNS hostname, never a URL or wildcard."""
+    label = r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
+    if len(value) > 253 or not re.fullmatch(rf"{label}\.{label}\.ts\.net", value):
+        raise ValueError("MCP_TAILNET_HOST must be a lowercase device.tailnet.ts.net hostname")
+    return value
+
+
+class TailnetRequestGuard:
+    """MCP-only ingress. Authorization is Tailscale Serve's network boundary.
+
+    This must use a separate loopback listener, never the local diagnostic app.
+    Local processes are trusted; Host/Origin checks are not authentication.
+    """
+
+    def __init__(self, app: Callable[..., Awaitable[Any]], hostname: str) -> None:
+        self.app = app
+        self.hostname = validate_tailnet_host(hostname)
+
+    async def __call__(self, scope: dict[str, Any], receive: Any, send: Any) -> None:
+        if scope.get("type") != "http":
+            await self.app(scope, receive, send)
+            return
+        headers = scope.get("headers") or []
+        hosts = [v.decode("latin-1") for k, v in headers if k.lower() == b"host"]
+        origins = [v.decode("latin-1") for k, v in headers if k.lower() == b"origin"]
+        peer = scope.get("client")
+        error = None
+        if not peer or peer[0] != MCP_BIND_HOST:
+            error = (403, "loopback proxy required")
+        elif len(hosts) != 1 or hosts[0] not in {self.hostname, f"{self.hostname}:443"}:
+            error = (421, "configured tailnet Host required")
+        elif len(origins) > 1 or (origins and origins[0] not in {
+            f"https://{self.hostname}", f"https://{self.hostname}:443",
+        }):
+            error = (403, "same-site HTTPS Origin required")
+        elif scope.get("path") != "/mcp" or scope.get("query_string"):
+            error = (404, "not found")
+        elif scope.get("method") != "POST":
+            error = (405, "POST required")
+        if error:
+            await PlainTextResponse(error[1], status_code=error[0])(scope, receive, send)
+            return
+        await self.app(scope, receive, send)
+
+
 class LoopbackRequestGuard:
     """Reject non-loopback Host/Origin values before MCP request handling."""
 
@@ -102,16 +150,27 @@ class LoopbackRequestGuard:
         await self.app(scope, receive, send)
 
 
-def build_app():
+def build_app(*, tailnet_host: str | None = None):
+    guard = (
+        Middleware(TailnetRequestGuard, hostname=validate_tailnet_host(tailnet_host))
+        if tailnet_host is not None else Middleware(LoopbackRequestGuard)
+    )
     return mcp.http_app(
         transport="streamable-http",
         json_response=True,
         stateless_http=True,
-        middleware=[Middleware(LoopbackRequestGuard)],
+        middleware=[guard],
     )
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--tailnet", action="store_true", help="MCP-only Serve backend")
+    args = parser.parse_args()
+    tailnet_host = None
+    if args.tailnet:
+        tailnet_host = validate_tailnet_host(os.environ.get("MCP_TAILNET_HOST", ""))
+    app = build_app(tailnet_host=tailnet_host)
     # Initialize private SQLite state before accepting search requests.
     _get_telemetry()
     # uvicorn is a fastmcp dependency; import lazily so stdio mode (server.py)
@@ -119,11 +178,13 @@ def main() -> None:
     import uvicorn
 
     uvicorn.run(
-        build_app(),
+        app,
         host=MCP_BIND_HOST,
         port=MCP_PORT,
         log_level=LOG_LEVEL.lower(),
         access_log=False,
+        # Preserve the actual peer; forwarded client IPs are not local peers.
+        proxy_headers=False,
     )
 
 

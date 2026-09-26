@@ -9,7 +9,7 @@
 #   local-search stats [24h|7d|30d]    query-free aggregate telemetry
 #   local-search telemetry-reset --yes explicitly erase telemetry events
 #   local-search verify                health + tools/list smoke
-#   local-search logs [mcp] [lines]
+#   local-search logs [mcp|tailnet] [lines]
 #   local-search rotate-logs --yes     privately archive operational logs
 #   local-search update                git pull + dependency sync + restart
 #   local-search mcp-stdio             run MCP in stdio mode
@@ -22,6 +22,8 @@ MCP_DIR="$ROOT_DIR/mcp-websearch"
 MCP_LABEL="com.local.mcp-websearch"
 PLIST_DIR="$HOME/Library/LaunchAgents"
 MCP_PLIST="$PLIST_DIR/$MCP_LABEL.plist"
+TAILNET_LABEL="com.local.mcp-websearch-tailnet"
+TAILNET_PLIST="$PLIST_DIR/$TAILNET_LABEL.plist"
 INSTALL_CONFIG="${LOCAL_SEARCH_INSTALL_CONFIG:-$ROOT_DIR/data/install.env}"
 
 installed_config_value() {
@@ -41,6 +43,10 @@ installed_mcp_env() {
 MCP_PORT="${MCP_PORT:-$(installed_config_value MCP_PORT)}"
 MCP_PORT="${MCP_PORT:-$(installed_mcp_env MCP_PORT)}"
 MCP_PORT="${MCP_PORT:-8889}"
+# An explicitly empty hostname disables remote ingress, even after installation.
+MCP_TAILNET_HOST="${MCP_TAILNET_HOST-$(installed_config_value MCP_TAILNET_HOST)}"
+MCP_TAILNET_PORT="${MCP_TAILNET_PORT:-$(installed_config_value MCP_TAILNET_PORT)}"
+MCP_TAILNET_PORT="${MCP_TAILNET_PORT:-8891}"
 WEBSEARCH_PROVIDER_STACK="brave"
 WEBSEARCH_SEARCH_MODE="${WEBSEARCH_SEARCH_MODE:-$(installed_config_value WEBSEARCH_SEARCH_MODE)}"
 WEBSEARCH_SEARCH_MODE="${WEBSEARCH_SEARCH_MODE:-$(installed_mcp_env WEBSEARCH_SEARCH_MODE)}"
@@ -118,7 +124,9 @@ validate_search_configuration() {
   esac
   python3 - "$WEBSEARCH_TOTAL_TIMEOUT" "$WEBSEARCH_BRAVE_TIMEOUT" \
     "$DECODO_TIMEOUT" "$DECODO_RESPONSE_MAX_BYTES" \
-    "$WEBSEARCH_FETCH_OPERATION_TIMEOUT" "$MCP_PORT" <<'PY' || exit 1
+    "$WEBSEARCH_FETCH_OPERATION_TIMEOUT" "$MCP_PORT" \
+    "$MCP_TAILNET_HOST" "$MCP_TAILNET_PORT" <<'PY' || exit 1
+import re
 import sys
 try:
     total = float(sys.argv[1])
@@ -141,6 +149,14 @@ if not 1 <= operation <= 120:
     raise SystemExit("WEBSEARCH_FETCH_OPERATION_TIMEOUT must be between 1 and 120")
 if not 1 <= mcp_port <= 65535:
     raise SystemExit("MCP_PORT must be between 1 and 65535")
+host, port = sys.argv[7:9]
+label = r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
+if host and (len(host) > 253 or not re.fullmatch(rf"{label}\.{label}\.ts\.net", host)):
+    raise SystemExit("MCP_TAILNET_HOST must be a lowercase device.tailnet.ts.net hostname")
+if not re.fullmatch(r"[0-9]{1,5}", port) or not 1 <= int(port) <= 65535:
+    raise SystemExit("MCP_TAILNET_PORT must be an ASCII integer between 1 and 65535")
+if host and int(port) == mcp_port:
+    raise SystemExit("MCP_TAILNET_PORT must differ from MCP_PORT")
 PY
 }
 
@@ -171,6 +187,8 @@ persist_install_config() {
   chmod 600 "$tmp"
   (umask 077; printf '%s\n' \
     "MCP_PORT=$MCP_PORT" \
+    "MCP_TAILNET_HOST=$MCP_TAILNET_HOST" \
+    "MCP_TAILNET_PORT=$MCP_TAILNET_PORT" \
     "LOCAL_SEARCH_DATA_DIR=$LOCAL_SEARCH_DATA_DIR" \
     "LOCAL_SEARCH_TELEMETRY_ENABLED=$LOCAL_SEARCH_TELEMETRY_ENABLED" \
     "WEBSEARCH_PROVIDER_STACK=brave" \
@@ -255,17 +273,25 @@ write_plist() {
 
 mcp_plist() {
   validate_search_configuration
+  local label="$MCP_LABEL" port="$MCP_PORT" extra_arg="" log_name="mcp-websearch" tailnet_env=""
+  if [ "${1:-}" = "tailnet" ]; then
+    [ -n "$MCP_TAILNET_HOST" ] || die "MCP_TAILNET_HOST is required for tailnet ingress"
+    label="$TAILNET_LABEL"; port="$MCP_TAILNET_PORT"
+    extra_arg='<string>--tailnet</string>'; log_name="mcp-websearch-tailnet"
+    tailnet_env="<key>MCP_TAILNET_HOST</key><string>${MCP_TAILNET_HOST}</string>"
+  fi
   cat <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
-<key>Label</key><string>${MCP_LABEL}</string>
+<key>Label</key><string>${label}</string>
 <key>ProgramArguments</key><array>
-  <string>${MCP_VENV}/bin/python</string><string>${MCP_DIR}/http_server.py</string>
+  <string>${MCP_VENV}/bin/python</string><string>${MCP_DIR}/http_server.py</string>${extra_arg}
 </array>
 <key>WorkingDirectory</key><string>${MCP_DIR}</string>
 <key>EnvironmentVariables</key><dict>
-  <key>MCP_PORT</key><string>${MCP_PORT}</string>
+  <key>MCP_PORT</key><string>${port}</string>
+  ${tailnet_env}
   <key>WEBSEARCH_PROVIDER_STACK</key><string>brave</string>
   <key>WEBSEARCH_SEARCH_MODE</key><string>${WEBSEARCH_SEARCH_MODE}</string>
   <key>WEBSEARCH_TOTAL_TIMEOUT</key><string>${WEBSEARCH_TOTAL_TIMEOUT}</string>
@@ -278,8 +304,8 @@ mcp_plist() {
   <key>WEBSEARCH_FETCH_OPERATION_TIMEOUT</key><string>${WEBSEARCH_FETCH_OPERATION_TIMEOUT}</string>
   <key>FASTMCP_SHOW_SERVER_BANNER</key><string>false</string>
 </dict>
-<key>StandardOutPath</key><string>${LOG_DIR}/mcp-websearch.log</string>
-<key>StandardErrorPath</key><string>${LOG_DIR}/mcp-websearch.log</string>
+<key>StandardOutPath</key><string>${LOG_DIR}/${log_name}.log</string>
+<key>StandardErrorPath</key><string>${LOG_DIR}/${log_name}.log</string>
 <key>KeepAlive</key><true/>
 <key>RunAtLoad</key><true/>
 <key>ThrottleInterval</key><integer>5</integer>
@@ -291,8 +317,8 @@ EOF
 ensure_private_logs() {
   mkdir -p "$LOG_DIR"
   chmod 700 "$LOG_DIR"
-  (umask 077; touch "$LOG_DIR/mcp-websearch.log")
-  chmod 600 "$LOG_DIR/mcp-websearch.log"
+  (umask 077; touch "$LOG_DIR/mcp-websearch.log" "$LOG_DIR/mcp-websearch-tailnet.log")
+  chmod 600 "$LOG_DIR/mcp-websearch.log" "$LOG_DIR/mcp-websearch-tailnet.log"
 }
 
 install_plist() {
@@ -311,6 +337,12 @@ install_plist() {
   rm -f "$preflight"
   persist_install_config
   write_plist "$MCP_LABEL" "$plist"
+  if [ -n "$MCP_TAILNET_HOST" ]; then
+    write_plist "$TAILNET_LABEL" "$(mcp_plist tailnet)"
+  else
+    stop_tailnet_service
+    rm -f "$TAILNET_PLIST"
+  fi
 }
 
 retire_legacy_searxng() {
@@ -318,22 +350,77 @@ retire_legacy_searxng() {
   rm -f "$PLIST_DIR/com.local.searxng.plist"
 }
 
-bootout_service() { launchctl bootout "gui/$(id -u)/$MCP_LABEL" >/dev/null 2>&1 || true; }
+wait_tailnet_port_free() {
+  if [ -f "$TAILNET_PLIST" ]; then
+    local port
+    port="$(/usr/libexec/PlistBuddy -c 'Print :EnvironmentVariables:MCP_PORT' "$TAILNET_PLIST")" \
+      || die "cannot verify tailnet listener shutdown; plist retained"
+    _wait_port_free "$port"
+  fi
+}
+
+stop_tailnet_service() {
+  local target="gui/$(id -u)/$TAILNET_LABEL" state attempt
+  if state="$(launchctl print "$target" 2>&1)"; then
+    launchctl bootout "$target" >/dev/null 2>&1 \
+      || die "could not stop tailnet ingress; plist retained"
+    for attempt in 1 2 3 4 5; do
+      if state="$(launchctl print "$target" 2>&1)"; then
+        sleep 1
+      else
+        case "$state" in
+          *"Could not find service"*)
+            wait_tailnet_port_free
+            return 0 ;;
+          *) die "cannot verify tailnet service state; plist retained" ;;
+        esac
+      fi
+    done
+    die "tailnet ingress is still registered; plist retained"
+  else
+    case "$state" in
+      *"Could not find service"*) wait_tailnet_port_free; return 0 ;;
+      *) die "cannot establish tailnet service state; plist retained" ;;
+    esac
+  fi
+}
+
+bootout_service() {
+  stop_tailnet_service
+  launchctl bootout "gui/$(id -u)/$MCP_LABEL" >/dev/null 2>&1 || true
+}
 
 bootstrap_service() {
-  local target="gui/$(id -u)/$MCP_LABEL" attempt
-  [ -f "$MCP_PLIST" ] || die "missing $MCP_PLIST; run install first"
+  local label="${1:-$MCP_LABEL}" plist="${2:-$MCP_PLIST}"
+  local target="gui/$(id -u)/$label" attempt
+  [ -f "$plist" ] || die "missing $plist; run install first"
   launchctl enable "$target" 2>/dev/null || true
   if launchctl print "$target" >/dev/null 2>&1; then
     launchctl kickstart -k "$target" >/dev/null 2>&1 && return
-    bootout_service
+    launchctl bootout "$target" >/dev/null 2>&1 || true
     sleep 1
   fi
   for attempt in 1 2 3; do
-    launchctl bootstrap "gui/$(id -u)" "$MCP_PLIST" >/dev/null 2>&1 && return
+    launchctl bootstrap "gui/$(id -u)" "$plist" >/dev/null 2>&1 && return
     sleep 1
   done
-  die "could not bootstrap $MCP_LABEL"
+  die "could not bootstrap $label"
+}
+
+bootstrap_services() {
+  bootstrap_service
+  if [ -f "$TAILNET_PLIST" ]; then
+    bootstrap_service "$TAILNET_LABEL" "$TAILNET_PLIST"
+  fi
+}
+
+wait_ports_free() {
+  _wait_port_free "$MCP_PORT"
+  if [ -f "$TAILNET_PLIST" ]; then
+    local port
+    port="$(/usr/libexec/PlistBuddy -c 'Print :EnvironmentVariables:MCP_PORT' "$TAILNET_PLIST")"
+    _wait_port_free "$port"
+  fi
 }
 
 _wait_port_free() {
@@ -347,7 +434,7 @@ _wait_port_free() {
 
 start_services() {
   check_provider_credentials
-  bootstrap_service
+  bootstrap_services
 }
 
 stop_services() { bootout_service; }
@@ -355,8 +442,8 @@ stop_services() { bootout_service; }
 restart_services() {
   check_provider_credentials
   stop_services
-  _wait_port_free "$MCP_PORT"
-  bootstrap_service
+  wait_ports_free
+  bootstrap_services
   wait_http "http://127.0.0.1:${MCP_PORT}/live" '"status":"ok"' 30
 }
 
@@ -392,11 +479,29 @@ verify() {
     warn "MCP tools/list unexpected: '$tools'"
     rc=1
   fi
+  if [ -n "$MCP_TAILNET_HOST" ]; then
+    log "Tailnet ingress tools/list (local backend check; not a TLS/network test)"
+    if curl -fsS --max-time 5 --retry 10 --retry-connrefused --retry-delay 1 --retry-max-time 20 \
+      "http://127.0.0.1:${MCP_TAILNET_PORT}/mcp" \
+      -H "Host: $MCP_TAILNET_HOST" \
+      -H 'Content-Type: application/json' -H 'Accept: application/json' \
+      -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' \
+      | python3 -c 'import json,sys; d=json.load(sys.stdin); names={t["name"] for t in d["result"]["tools"]}; sys.exit(not {"web_search","web_fetch"} <= names)'; then
+      ok "MCP-only tailnet ingress ready"
+    else
+      warn "tailnet ingress unavailable"
+      rc=1
+    fi
+  fi
   return "$rc"
 }
 
 status() {
   local state health
+  if [ -f "$TAILNET_PLIST" ]; then
+    state="$(launchctl print "gui/$(id -u)/$TAILNET_LABEL" 2>/dev/null | awk -F' = ' '/^[[:space:]]*state/ {print $2; exit}' || echo 'not-loaded')"
+    printf '%-22s %s\n' "tailnet ingress:" "${state:-unknown} (MCP-only; Serve managed separately)"
+  fi
   state="$(launchctl print "gui/$(id -u)/$MCP_LABEL" 2>/dev/null | awk -F' = ' '/^[[:space:]]*state/ {print $2; exit}' || echo 'not-loaded')"
   printf '%-22s %s\n' "mcp-websearch launchd:" "${state:-unknown}"
   health="$(curl -fsS --max-time 3 "http://127.0.0.1:${MCP_PORT}/health" 2>/dev/null || echo 'DOWN')"
@@ -414,7 +519,7 @@ cmd_install() {
   install_plist
   if [ "$start" -eq 1 ]; then
     stop_services
-    _wait_port_free "$MCP_PORT"
+    wait_ports_free
     start_services
     verify || die "verification failed; check 'local-search logs mcp'"
     retire_legacy_searxng
@@ -424,7 +529,7 @@ cmd_install() {
 
 cmd_uninstall() {
   stop_services
-  rm -f "$MCP_PLIST"
+  rm -f "$MCP_PLIST" "$TAILNET_PLIST"
   retire_legacy_searxng
   ok "Uninstalled (venv, telemetry, cache, and keys retained)"
 }
@@ -453,6 +558,8 @@ ROOT_DIR=$ROOT_DIR
 MCP_DIR=$MCP_DIR
 MCP_VENV=$MCP_VENV
 MCP_PORT=$MCP_PORT
+MCP_TAILNET_HOST=$MCP_TAILNET_HOST
+MCP_TAILNET_PORT=$MCP_TAILNET_PORT
 MCP_LABEL=$MCP_LABEL
 INSTALL_CONFIG=$INSTALL_CONFIG
 WEBSEARCH_PROVIDER_STACK=brave
@@ -481,17 +588,19 @@ cmd_telemetry_reset() {
   [ "${1:-}" = "--yes" ] || die "usage: local-search telemetry-reset --yes"
   [ -x "$MCP_VENV/bin/python" ] || die "MCP venv missing; run install first"
   ensure_data_dir
-  local was_loaded=0 rc=0
-  if launchctl print "gui/$(id -u)/$MCP_LABEL" >/dev/null 2>&1; then
-    was_loaded=1
-    bootout_service
-    _wait_port_free "$MCP_PORT"
-  fi
+  local was_loaded=0 tailnet_loaded=0 rc=0
+  launchctl print "gui/$(id -u)/$MCP_LABEL" >/dev/null 2>&1 && was_loaded=1
+  launchctl print "gui/$(id -u)/$TAILNET_LABEL" >/dev/null 2>&1 && tailnet_loaded=1
+  bootout_service
+  wait_ports_free
   "$MCP_VENV/bin/python" "$MCP_DIR/telemetry.py" reset \
     --data-dir "$LOCAL_SEARCH_DATA_DIR" || rc=$?
   if [ "$was_loaded" -eq 1 ]; then
     bootstrap_service
     wait_http "http://127.0.0.1:${MCP_PORT}/live" '"status":"ok"' 30 || rc=1
+  fi
+  if [ "$tailnet_loaded" -eq 1 ]; then
+    bootstrap_service "$TAILNET_LABEL" "$TAILNET_PLIST"
   fi
   return "$rc"
 }
@@ -501,31 +610,38 @@ cmd_logs() {
   ensure_private_logs
   case "$which" in
     mcp|mcp-websearch|all|"") tail "$lines" "$LOG_DIR/mcp-websearch.log" 2>/dev/null || warn "no mcp log yet" ;;
-    *) die "usage: local-search logs [mcp] [lines]" ;;
+    tailnet) tail "$lines" "$LOG_DIR/mcp-websearch-tailnet.log" 2>/dev/null || warn "no tailnet log yet" ;;
+    *) die "usage: local-search logs [mcp|tailnet] [lines]" ;;
   esac
 }
 
 cmd_rotate_logs() {
   [ "${1:-}" = "--yes" ] || die "usage: local-search rotate-logs --yes"
-  local loaded=0 stamp archive target archived n=0 rc=0
+  local loaded=0 tailnet_loaded=0 stamp archive target archived n=0 rc=0 name
   launchctl print "gui/$(id -u)/$MCP_LABEL" >/dev/null 2>&1 && loaded=1
+  launchctl print "gui/$(id -u)/$TAILNET_LABEL" >/dev/null 2>&1 && tailnet_loaded=1
   stop_services
-  _wait_port_free "$MCP_PORT"
+  wait_ports_free
   ensure_private_logs
   stamp="$(date -u +%Y%m%dT%H%M%SZ)"
   archive="$LOG_DIR/archive"
-  target="$LOG_DIR/mcp-websearch.log"
   mkdir -p "$archive"; chmod 700 "$archive"
-  if [ -s "$target" ]; then
-    archived="$archive/mcp-websearch.${stamp}.log"
-    while [ -e "$archived" ]; do n=$((n+1)); archived="$archive/mcp-websearch.${stamp}.${n}.log"; done
-    mv "$target" "$archived"; chmod 600 "$archived"
-    ok "Archived without deleting: $archived"
-  fi
-  (umask 077; : >"$target"); chmod 600 "$target"
+  for name in mcp-websearch mcp-websearch-tailnet; do
+    target="$LOG_DIR/$name.log"
+    if [ -s "$target" ]; then
+      archived="$archive/${name}.${stamp}.log"
+      while [ -e "$archived" ]; do n=$((n+1)); archived="$archive/${name}.${stamp}.${n}.log"; done
+      mv "$target" "$archived"; chmod 600 "$archived"
+      ok "Archived without deleting: $archived"
+    fi
+    (umask 077; : >"$target"); chmod 600 "$target"
+  done
   if [ "$loaded" -eq 1 ]; then
     bootstrap_service || rc=1
     wait_http "http://127.0.0.1:${MCP_PORT}/live" '"status":"ok"' 30 || rc=1
+  fi
+  if [ "$tailnet_loaded" -eq 1 ]; then
+    bootstrap_service "$TAILNET_LABEL" "$TAILNET_PLIST" || rc=1
   fi
   return "$rc"
 }
