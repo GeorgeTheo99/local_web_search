@@ -157,6 +157,24 @@ def test_failed_listener_shutdown_retry_retains_ingress_ownership(tmp_path):
     assert waits.read_text().splitlines() == ["wait", "wait"]
 
 
+@pytest.mark.parametrize("explicit_disable", [False, True])
+def test_fresh_shell_recovers_ingress_from_plist_with_custom_config_path(tmp_path, explicit_disable):
+    home = tmp_path / "home"
+    plist = home / "Library/LaunchAgents/com.local.mcp-websearch-tailnet.plist"
+    plist.parent.mkdir(parents=True)
+    plist.write_bytes(plistlib.dumps({"EnvironmentVariables": {
+        "MCP_TAILNET_HOST": "search.tail123.ts.net", "MCP_PORT": "18891",
+    }}))
+    unset = "MCP_TAILNET_PORT" if explicit_disable else "MCP_TAILNET_HOST MCP_TAILNET_PORT"
+    output = _source_and_run(
+        f'unset {unset}; export HOME="{home}"; source "{SCRIPT}"; cmd_env', tmp_path,
+        {"LOCAL_SEARCH_INSTALL_CONFIG": str(tmp_path / "missing-default.env")},
+    )
+    expected = "" if explicit_disable else "search.tail123.ts.net"
+    assert f"MCP_TAILNET_HOST={expected}\n" in output
+    assert "MCP_TAILNET_PORT=18891\n" in output
+
+
 def test_ensure_data_dir_creates_private_cache_directory(tmp_path):
     _source_and_run("ensure_data_dir", tmp_path)
     data_dir = tmp_path / "data"

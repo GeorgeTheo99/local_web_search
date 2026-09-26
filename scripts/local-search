@@ -40,12 +40,21 @@ installed_mcp_env() {
   /usr/libexec/PlistBuddy -c "Print :EnvironmentVariables:$1" "$MCP_PLIST" 2>/dev/null || true
 }
 
+installed_tailnet_env() {
+  [ -f "$TAILNET_PLIST" ] || return 0
+  /usr/libexec/PlistBuddy -c "Print :EnvironmentVariables:$1" "$TAILNET_PLIST" 2>/dev/null || true
+}
+
 MCP_PORT="${MCP_PORT:-$(installed_config_value MCP_PORT)}"
 MCP_PORT="${MCP_PORT:-$(installed_mcp_env MCP_PORT)}"
 MCP_PORT="${MCP_PORT:-8889}"
 # An explicitly empty hostname disables remote ingress, even after installation.
-MCP_TAILNET_HOST="${MCP_TAILNET_HOST-$(installed_config_value MCP_TAILNET_HOST)}"
+if [ "${MCP_TAILNET_HOST+x}" != x ]; then
+  MCP_TAILNET_HOST="$(installed_config_value MCP_TAILNET_HOST)"
+  MCP_TAILNET_HOST="${MCP_TAILNET_HOST:-$(installed_tailnet_env MCP_TAILNET_HOST)}"
+fi
 MCP_TAILNET_PORT="${MCP_TAILNET_PORT:-$(installed_config_value MCP_TAILNET_PORT)}"
+MCP_TAILNET_PORT="${MCP_TAILNET_PORT:-$(installed_tailnet_env MCP_PORT)}"
 MCP_TAILNET_PORT="${MCP_TAILNET_PORT:-8891}"
 WEBSEARCH_PROVIDER_STACK="brave"
 WEBSEARCH_SEARCH_MODE="${WEBSEARCH_SEARCH_MODE:-$(installed_config_value WEBSEARCH_SEARCH_MODE)}"
