@@ -72,11 +72,15 @@ local bare repository. The development checkout keeps `origin` pointed at that
 bare repository and a separate `github` remote for the public mirror:
 
 ```bash
-git push origin main    # update the authoritative local bare repository
-git push github main    # manually publish the same commit to GitHub
+git fetch github && git merge github/main   # only if the push was rejected
+git push origin main    # update the bare repository and publish to GitHub
 ```
 
-There is no automatic bare-to-GitHub mirroring. Verify synchronization with
+The bare repository's github-sync hooks (`infra/local-ci` `github-sync/`) reject
+a `main` push that is missing commits already on GitHub, then publish the
+accepted tip. GitHub outages only warn; if publishing failed, run
+`git push github main` once GitHub is reachable. Other branches and tags are
+published manually. Verify synchronization with
 `git rev-parse HEAD origin/main github/main`.
 
 The maintainer's Homebrew-managed LaunchAgent runs from the installed module at
