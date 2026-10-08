@@ -159,7 +159,13 @@ Markdown output. The fallback is enabled only when an owner-only Web Scraping
 API authorization token exists at `$LOCAL_SEARCH_DATA_DIR/decodo_key`. Copy
 only the token value after `Basic` from Decodo's Web Scraping API
 Playground-generated `Authorization` header—not the `Basic ` prefix, a generic
-Decodo API key, or another product's credential:
+Decodo API key, or another product's credential.
+
+Decodo is optional; without it, fetch recovery uses Jina Reader only. With a
+pi-shared managed install (setup 0.1.31+), pass
+`--decodo-key-file /absolute/private/decodo.key` to `pi-shared setup --search local`,
+or accept the skippable Decodo step in `pi-shared setup --guided`. For a standalone
+install, create the file directly:
 
 ```bash
 mkdir -p data && chmod 700 data
