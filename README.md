@@ -324,9 +324,9 @@ Important environment variables:
 | `WEBSEARCH_BRAVE_TIMEOUT` | `8` seconds |
 | `WEBSEARCH_SEARCH_MAX_BYTES` | `2 MiB` per provider response |
 | `WEBSEARCH_FETCH_MAX_BYTES` | `20 MiB` |
-| `WEBSEARCH_FETCH_TIMEOUT` | `30` seconds |
+| `WEBSEARCH_FETCH_TIMEOUT` | `20` seconds (direct tier) |
 | `DECODO_FALLBACK_ENABLED` | `true`; inert without `decodo_key` |
-| `DECODO_TIMEOUT` | `30` seconds |
+| `DECODO_TIMEOUT` | `25` seconds |
 | `DECODO_RESPONSE_MAX_BYTES` | `5 MiB` |
 | `WEBSEARCH_FETCH_OPERATION_TIMEOUT` | `60` seconds end-to-end |
 | `JINA_FALLBACK_ENABLED` | `true` |
