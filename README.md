@@ -261,11 +261,13 @@ Decodo/Jina fallbacks, and reports the actual `method`/`fetch_provider`.
 
 | Endpoint | Purpose |
 |---|---|
-| `GET /ui` | Concise loopback-only browser dashboard for broker health and query-free telemetry |
+| `GET /ui` | Loopback browser dashboard: health, attention items, fetch-tier and search observability, recent failed fetch hosts, and resolved config |
 | `GET /live` | Dependency-free process liveness |
 | `GET /ready` | Brave readiness; HTTP 503 when its credential or circuit is unavailable |
 | `GET /health` | Compatibility diagnostics; always HTTP 200 |
 | `GET /stats?window=24h` | Query-free aggregates; windows: `24h`, `7d`, `30d` |
+| `GET /config` | Resolved non-secret configuration; credentials report presence only |
+| `GET /activity?window=24h` | Bucketed search/fetch timeline plus the 25 most recent failed fetch attempts (hostnames only) |
 
 Telemetry is enabled by default and stored in
 `$LOCAL_SEARCH_DATA_DIR/telemetry.sqlite3`. Search telemetry stores bounded
@@ -282,6 +284,10 @@ paths.
 `/stats` exposes numeric search/provider, cache, end-to-end fetch, and
 fetch-attempt aggregates. Cache hits have no search-provider attempt or cost.
 Open `http://127.0.0.1:8889/ui` for a read-only operational view of these metrics.
+The UI uses relative URLs, so a reverse proxy can serve it under a path prefix
+(the maintainer's directory exposes it at `/local-search/` through a GET-only
+allowlist that rewrites `Host` to loopback and never forwards `/mcp`).
+`/activity` is the only endpoint that returns destination hostnames.
 
 The private cache lives under `$LOCAL_SEARCH_DATA_DIR/cache/`. Search keys are
 query hashes and cached search payloads contain returned result data; fetched

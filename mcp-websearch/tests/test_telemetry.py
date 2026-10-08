@@ -206,6 +206,70 @@ def test_fetch_operations_report_terminal_provider_success_rates(tmp_path):
         store.close()
 
 
+def test_activity_buckets_timeline_and_lists_recent_failed_attempts(tmp_path):
+    now = 2_000_000_000
+    store = TelemetryStore(tmp_path / "data")
+    try:
+        # Window edges: `since` lands in the first bucket, `until` in the last.
+        store.record(_event(created_at=now - 86400))
+        store.record(_event(created_at=now))
+        store.record(_event(created_at=now - 86401))
+        store.record(_event(created_at=now - 60))
+        store.record(_event(created_at=now - 3600 - 60, status="timeout"))
+        store.record_fetch_operation(FetchOperation(
+            "ok.example", "success", "direct", "none", 200, 100, 10.0, created_at=now - 30,
+        ))
+        store.record_fetch_operation(FetchOperation(
+            "slow.example", "error", "none", "none", None, None, 60000.0, created_at=now - 20,
+        ))
+        store.record_fetch(FetchEvent(
+            "slow.example", None, "timeout", "direct", None, 20000.0,
+            created_at=now - 40, trigger="timeout",
+        ))
+        store.record_fetch(FetchEvent(
+            "slow.example", None, "timeout", "proxy", None, 25000.0,
+            created_at=now - 20, provider="decodo", trigger="timeout",
+        ))
+        store.record_fetch(FetchEvent(
+            "ok.example", 200, "success", "direct", 100, 10.0, created_at=now - 30,
+        ))
+        store.record_fetch(FetchEvent(
+            "old.example", None, "timeout", "direct", None, 1.0, created_at=now - 2 * 86400,
+        ))
+        store.record_fetch(FetchEvent(
+            "169.254.169.254", None, "unsafe_url", "direct", None, 1.0, created_at=now - 10,
+        ))
+        assert store.flush()
+
+        activity = store.activity("24h", now=now)
+
+        assert activity["bucket_seconds"] == 3600
+        timeline = activity["timeline"]
+        assert len(timeline) == 24
+        assert timeline[0]["start"] == "2033-05-17T03:33:20Z"
+        assert timeline[0]["searches"] == 1
+        assert timeline[-1]["searches"] == 2
+        assert timeline[-1]["search_failures"] == 0
+        assert timeline[-1]["fetches"] == 2
+        assert timeline[-1]["fetch_failures"] == 1
+        assert timeline[-2]["search_failures"] == 1
+        # Matches stats() totals for the same window.
+        assert sum(bucket["searches"] for bucket in timeline) == store.stats("24h", now=now)["searches"]["total"] == 4
+        failures = activity["recent_fetch_failures"]
+        assert [(item["host"], item["provider"]) for item in failures] == [
+            ("slow.example", "decodo"),
+            ("slow.example", "direct"),
+        ]
+        assert failures[0]["outcome"] == "timeout"
+        assert failures[0]["trigger"] == "timeout"
+        assert activity["privacy"] == {"query_data_stored": False, "hostnames_included": True}
+        assert len(store.activity("30d", now=now)["timeline"]) == 30
+        with pytest.raises(InvalidWindow):
+            store.activity("1h", now=now)
+    finally:
+        store.close()
+
+
 def test_persists_current_modes_and_fallback_reasons_without_normalizing_them_away(tmp_path):
     store = TelemetryStore(tmp_path / "data")
     try:

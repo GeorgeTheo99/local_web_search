@@ -1237,6 +1237,44 @@ async def test_stats_rejects_invalid_window():
 
 
 @pytest.mark.asyncio
+async def test_config_reports_settings_without_credential_values(monkeypatch):
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(srv, "_resolve_decodo_key", lambda: "decodo-secret-value")
+    monkeypatch.setenv("JINA_API_KEY", "jina-secret-value")
+    monkeypatch.setenv("BRAVE_API_KEY", "brave-secret-value")
+
+    response = await srv.config(SimpleNamespace(query_params={}))
+    payload = json.loads(response.body)
+
+    assert response.status_code == 200
+    assert payload["provider_stack"] == "brave"
+    assert payload["fetch"]["fallback_order"] == ["direct", "decodo", "jina"]
+    assert payload["fetch"]["decodo"]["credential_configured"] is True
+    assert payload["fetch"]["decodo"]["timeout_s"] == srv.DECODO_TIMEOUT
+    assert payload["fetch"]["jina"]["api_key_configured"] is True
+    assert "secret-value" not in response.body.decode()
+    assert "://" not in response.body.decode()
+
+
+@pytest.mark.asyncio
+async def test_activity_route_validates_window_and_returns_timeline(monkeypatch, tmp_path):
+    from types import SimpleNamespace
+
+    telemetry = srv.TelemetryStore(tmp_path / "telemetry")
+    monkeypatch.setattr(srv, "_telemetry", telemetry)
+    try:
+        ok = await srv.activity(SimpleNamespace(query_params={"window": "7d"}))
+        bad = await srv.activity(SimpleNamespace(query_params={"window": "1h"}))
+    finally:
+        telemetry.close()
+
+    assert ok.status_code == 200
+    assert len(json.loads(ok.body)["timeline"]) == 28
+    assert bad.status_code == 400
+
+
+@pytest.mark.asyncio
 async def test_unavailable_telemetry_never_breaks_search(monkeypatch, tmp_path):
     from types import SimpleNamespace
 

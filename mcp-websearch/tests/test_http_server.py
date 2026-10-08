@@ -64,7 +64,11 @@ def test_ui_redirect_and_assets_are_served_with_security_headers():
     assert script.status_code == 200
     assert script.headers["cache-control"] == "no-store"
     assert script.headers["x-content-type-options"] == "nosniff"
-    assert "fetch('/health'" in script.text
+    # Relative URLs let the directory serve the UI under a path prefix.
+    assert 'href="ui/styles.css"' in page.text
+    assert 'src="ui/app.js"' in page.text
+    assert "health: 'health'" in script.text
+    assert "fetch('/" not in script.text
     assert "innerHTML" not in script.text
 
 

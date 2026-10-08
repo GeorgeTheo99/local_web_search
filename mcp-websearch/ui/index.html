@@ -4,9 +4,11 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="color-scheme" content="dark">
+<meta name="referrer" content="no-referrer">
 <title>Local Search</title>
-<link rel="stylesheet" href="/ui/styles.css">
-<script src="/ui/app.js" defer></script>
+<!-- Relative URLs keep the page working at /ui and behind a path-prefix proxy. -->
+<link rel="stylesheet" href="ui/styles.css">
+<script src="ui/app.js" defer></script>
 </head>
 <body>
 <main>
@@ -14,10 +16,15 @@
     <div>
       <p class="kicker">Private search infrastructure</p>
       <h1>Local Search</h1>
-      <p class="lede">Brave-backed search and resilient page retrieval. Query text is never stored.</p>
+      <p class="lede">Brave-backed search with direct → Decodo → Jina page retrieval. Query text is never stored.</p>
     </div>
     <div class="state" id="state" aria-live="polite"><i></i><span>Connecting</span></div>
   </header>
+
+  <section class="attention" id="attention" aria-label="Attention required" hidden>
+    <p class="label">Needs attention</p>
+    <ul id="attention-list"></ul>
+  </section>
 
   <nav aria-label="Telemetry window">
     <div class="tabs" id="windows">
@@ -30,33 +37,79 @@
 
   <section class="metrics" aria-label="Key metrics">
     <article><span>Searches</span><strong id="search-total">—</strong><small id="search-outcomes">Waiting for telemetry</small></article>
-    <article><span>Average latency</span><strong id="search-latency">—</strong><small>Search completion</small></article>
+    <article><span>Search latency</span><strong id="search-latency">—</strong><small id="search-latency-range">Average completion</small></article>
     <article><span>Page fetches</span><strong id="fetch-total">—</strong><small id="fetch-success">Waiting for telemetry</small></article>
-    <article><span>Search cache</span><strong id="cache-rate">—</strong><small id="cache-detail">Waiting for telemetry</small></article>
+    <article><span>Cache hit rate</span><strong id="cache-rate">—</strong><small id="cache-detail">Waiting for telemetry</small></article>
+  </section>
+
+  <section class="panel activity" aria-labelledby="activity-title">
+    <div class="panel-head">
+      <div><p class="label">Activity</p><h2 id="activity-title">Requests over time</h2></div>
+      <div class="legend" aria-hidden="true"><span class="ok">Succeeded</span><span class="fail">Failed</span></div>
+    </div>
+    <div class="charts">
+      <figure><figcaption>Searches<span id="chart-searches-peak"></span></figcaption><div class="bars" id="chart-searches" role="img" aria-label="Searches over time"></div></figure>
+      <figure><figcaption>Page fetches<span id="chart-fetches-peak"></span></figcaption><div class="bars" id="chart-fetches" role="img" aria-label="Page fetches over time"></div></figure>
+    </div>
+    <div class="axis"><span id="axis-start"></span><span id="axis-end"></span></div>
+  </section>
+
+  <section class="panel pipeline" aria-labelledby="pipeline-title">
+    <div class="panel-head">
+      <div><p class="label">Page retrieval</p><h2 id="pipeline-title">Fetch tiers</h2></div>
+      <span class="hint" id="operation-budget">—</span>
+    </div>
+    <ol class="tiers" id="tiers"></ol>
   </section>
 
   <section class="details">
-    <article class="panel provider-panel">
-      <div class="panel-head"><div><p class="label">Provider</p><h2>Brave Search</h2></div><span class="badge" id="provider-state">Checking</span></div>
+    <article class="panel">
+      <div class="panel-head"><div><p class="label">Search provider</p><h2>Brave Search</h2></div><span class="badge" id="provider-state">Checking</span></div>
       <div class="rows">
         <div><span>Credential</span><strong id="credential">—</strong></div>
         <div><span>Circuit</span><strong id="circuit">—</strong></div>
         <div><span>Attempts</span><strong id="attempts">—</strong></div>
         <div><span>Provider errors</span><strong id="provider-errors">—</strong></div>
+        <div><span>Provider latency</span><strong id="provider-latency">—</strong></div>
+        <div><span>Search fallback</span><strong id="fallback">—</strong></div>
       </div>
     </article>
-    <article class="panel routing-panel">
-      <div class="panel-head"><div><p class="label">Routing</p><h2>Fallback & cache</h2></div></div>
+    <article class="panel">
+      <div class="panel-head"><div><p class="label">Last search</p><h2>Most recent request</h2></div><span class="badge" id="last-state">—</span></div>
       <div class="rows">
-        <div><span>Search fallback</span><strong id="fallback">—</strong></div>
-        <div><span>Fetch success</span><strong id="fetch-rate">—</strong></div>
-        <div><span>Fetch cache</span><strong id="fetch-cache">—</strong></div>
-        <div><span>Telemetry</span><strong id="telemetry">—</strong></div>
+        <div><span>Completed</span><strong id="last-at">—</strong></div>
+        <div><span>Backend</span><strong id="last-backend">—</strong></div>
+        <div><span>Results</span><strong id="last-results">—</strong></div>
+        <div><span>Latency</span><strong id="last-latency">—</strong></div>
+        <div><span>Cache</span><strong id="last-cache">—</strong></div>
+        <div><span>Estimated cost</span><strong id="last-cost">—</strong></div>
       </div>
     </article>
   </section>
 
-  <footer><span id="updated">Loading broker status…</span><span class="endpoint">MCP · <code>/mcp</code></span></footer>
+  <section class="panel failures" aria-labelledby="failures-title">
+    <div class="panel-head">
+      <div><p class="label">Diagnostics</p><h2 id="failures-title">Recent failed fetch attempts</h2></div>
+      <span class="hint">Hostnames only · no paths or queries</span>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th scope="col">When</th><th scope="col">Host</th><th scope="col">Tier</th><th scope="col">Outcome</th><th scope="col">Trigger</th><th scope="col">Status</th><th scope="col" class="num">Latency</th></tr></thead>
+        <tbody id="failures"></tbody>
+      </table>
+    </div>
+    <p class="empty" id="failures-empty" hidden>No failed fetch attempts in this window.</p>
+  </section>
+
+  <section class="panel config" aria-labelledby="config-title">
+    <div class="panel-head">
+      <div><p class="label">Configuration</p><h2 id="config-title">Resolved settings</h2></div>
+      <span class="hint">Credentials show presence only</span>
+    </div>
+    <div class="config-grid" id="config"></div>
+  </section>
+
+  <footer><span id="updated">Loading broker status…</span><span>Telemetry stores no queries, URLs, or result content</span></footer>
 </main>
 <div class="error" id="error" role="alert" hidden></div>
 </body>

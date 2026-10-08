@@ -13,6 +13,8 @@ HTTP diagnostics:
   - GET /ready   provider readiness (503 when no backend is usable)
   - GET /health  compatibility diagnostics (always HTTP 200)
   - GET /stats   query-free aggregate telemetry (24h, 7d, or 30d)
+  - GET /config  resolved non-secret configuration
+  - GET /activity  telemetry timeline and recent failed fetch hostnames
 
 Brave Search is the sole raw-search provider (independent index, strong
 privacy posture, $0.005/query).
@@ -35,7 +37,8 @@ Key configuration:
   BRAVE_API_KEY                       optional stdio/server fallback key
   BRAVE_BASE_URL                      default https://api.search.brave.com
   DECODO_FALLBACK_ENABLED             default true; requires data/decodo_key
-  DECODO_TIMEOUT                      default 30 seconds
+  DECODO_TIMEOUT                      default 25 seconds
+  JINA_TIMEOUT                        default 30 seconds
   WEBSEARCH_FETCH_OPERATION_TIMEOUT   default 60 seconds
   MCP_PORT                            default 8889 (HTTP transport only)
 """
@@ -207,6 +210,13 @@ JINA_FALLBACK_ENABLED = os.environ.get("JINA_FALLBACK_ENABLED", "1").strip().low
     "no",
     "off",
 }
+# Tiers are capped at their own timeouts; when direct + Decodo can consume the
+# whole operation budget, a stalled Decodo leaves Jina no time to run.
+if JINA_FALLBACK_ENABLED and FETCH_TIMEOUT + DECODO_TIMEOUT > FETCH_OPERATION_TIMEOUT - 5:
+    logger.warning(
+        "Fetch budget leaves Jina under 5s: direct %gs + Decodo %gs vs %gs operation timeout",
+        FETCH_TIMEOUT, DECODO_TIMEOUT, FETCH_OPERATION_TIMEOUT,
+    )
 FETCH_MAX_REDIRECTS = _bounded_int("WEBSEARCH_FETCH_MAX_REDIRECTS", 6, minimum=0, maximum=12)
 FETCH_MAX_BYTES = _bounded_int("WEBSEARCH_FETCH_MAX_BYTES", 20 * 1024 * 1024, minimum=1024, maximum=50 * 1024 * 1024)
 PDF_MAX_PAGES = _bounded_int("WEBSEARCH_PDF_MAX_PAGES", 20, minimum=1, maximum=50)
@@ -2135,6 +2145,77 @@ async def stats(request: Request) -> JSONResponse:
         )
     except Exception as exc:
         logger.warning("Telemetry stats failed (%s)", type(exc).__name__)
+        return JSONResponse(
+            {"status": "error", "available": False, "error": "telemetry unavailable"},
+            status_code=503,
+        )
+    return JSONResponse(payload)
+
+
+@mcp.custom_route("/config", methods=["GET"])
+async def config(request: Request) -> JSONResponse:
+    """Return resolved non-secret configuration; credentials report presence only."""
+    return JSONResponse({
+        "service": "mcp-websearch",
+        "provider_stack": _PROVIDER_STACK,
+        "search": {
+            "mode": _SEARCH_MODE,
+            "total_timeout_s": SEARCH_TOTAL_TIMEOUT,
+            "max_results": MAX_NUM_RESULTS,
+            "max_query_chars": MAX_QUERY_CHARS,
+            "response_max_bytes": SEARCH_RESPONSE_MAX_BYTES,
+            "batch_max_queries": BATCH_MAX_QUERIES,
+            "batch_max_concurrency": BATCH_MAX_CONCURRENCY,
+            "circuit_breaker": {
+                "failure_threshold": BREAKER_FAIL_THRESHOLD,
+                "cooldown_s": BREAKER_COOLDOWN,
+            },
+            "brave": {
+                "timeout_s": BRAVE_TIMEOUT,
+                "credential_configured": _provider_credential_configured("brave"),
+                "credential_usable": _provider_credential_usable("brave"),
+            },
+        },
+        "fetch": {
+            "operation_timeout_s": FETCH_OPERATION_TIMEOUT,
+            "direct_timeout_s": FETCH_TIMEOUT,
+            "dns_timeout_s": DNS_RESOLVE_TIMEOUT,
+            "max_bytes": FETCH_MAX_BYTES,
+            "max_redirects": FETCH_MAX_REDIRECTS,
+            "pdf_max_pages": PDF_MAX_PAGES,
+            "fallback_order": ["direct", "decodo", "jina"],
+            "decodo": {
+                "enabled": DECODO_FALLBACK_ENABLED,
+                "credential_configured": bool(_resolve_decodo_key()),
+                "timeout_s": DECODO_TIMEOUT,
+                "response_max_bytes": DECODO_RESPONSE_MAX_BYTES,
+            },
+            "jina": {
+                "enabled": JINA_FALLBACK_ENABLED,
+                "api_key_configured": bool(os.environ.get("JINA_API_KEY", "").strip()),
+                "timeout_s": JINA_TIMEOUT,
+                "response_max_bytes": JINA_RESPONSE_MAX_BYTES,
+            },
+        },
+        "telemetry": {"enabled": TELEMETRY_ENABLED},
+    })
+
+
+@mcp.custom_route("/activity", methods=["GET"])
+async def activity(request: Request) -> JSONResponse:
+    """Return a telemetry timeline and recent failed fetch attempts (hostnames only)."""
+    window = request.query_params.get("window", "24h")
+    try:
+        payload = await asyncio.to_thread(_get_telemetry().activity, window)
+    except InvalidWindow as exc:
+        return JSONResponse({"status": "error", "error": str(exc)}, status_code=400)
+    except TelemetryUnavailable:
+        return JSONResponse(
+            {"status": "error", "available": False, "error": "telemetry unavailable"},
+            status_code=503,
+        )
+    except Exception as exc:
+        logger.warning("Telemetry activity failed (%s)", type(exc).__name__)
         return JSONResponse(
             {"status": "error", "available": False, "error": "telemetry unavailable"},
             status_code=503,

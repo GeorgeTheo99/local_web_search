@@ -30,6 +30,7 @@ logger = logging.getLogger("websearch-mcp.telemetry")
 DB_FILENAME = "telemetry.sqlite3"
 SCHEMA_VERSION = 8
 VALID_WINDOWS = {"24h": 24 * 60 * 60, "7d": 7 * 24 * 60 * 60, "30d": 30 * 24 * 60 * 60}
+ACTIVITY_BUCKET_SECONDS = {"24h": 60 * 60, "7d": 6 * 60 * 60, "30d": 24 * 60 * 60}
 
 _SEARCH_STATUSES = {"ok", "empty", "degraded", "error", "timeout"}
 _BACKENDS = {"none", "brave"}
@@ -995,6 +996,98 @@ class TelemetryStore:
             },
             "providers": providers,
             "privacy": {"query_data_stored": False},
+        }
+
+    def activity(
+        self, window: str = "24h", *, now: int | None = None, limit: int = 25
+    ) -> dict[str, Any]:
+        """Return a bucketed timeline plus recent failed fetch attempts.
+
+        Unlike :meth:`stats`, the failure list includes destination hostnames
+        (never paths or queries) so operators can see which sites need fallbacks.
+        """
+        if window not in VALID_WINDOWS:
+            raise InvalidWindow(f"window must be one of: {', '.join(VALID_WINDOWS)}")
+        if not self.available:
+            raise TelemetryUnavailable(self._reason)
+        self.flush()
+        bucket_seconds = ACTIVITY_BUCKET_SECONDS[window]
+        buckets = VALID_WINDOWS[window] // bucket_seconds
+        until = int(time.time()) if now is None else int(now)
+        # Buckets tile exactly the same [since, until] range as stats(); an event
+        # at `until` itself folds into the final bucket.
+        since = until - VALID_WINDOWS[window]
+        bounds = (since, bucket_seconds, buckets - 1, since, until)
+        with self._operation_lock, self._connect() as conn:
+            conn.execute("BEGIN")
+            search_rows = conn.execute(
+                """
+                SELECT MIN((created_at - ?) / ?, ?) AS bucket,
+                       COUNT(*) AS total,
+                       COALESCE(SUM(status IN ('error', 'timeout')), 0) AS failures
+                FROM search_events WHERE created_at >= ? AND created_at <= ?
+                GROUP BY bucket
+                """,
+                bounds,
+            ).fetchall()
+            fetch_rows = conn.execute(
+                """
+                SELECT MIN((created_at - ?) / ?, ?) AS bucket,
+                       COUNT(*) AS total,
+                       COALESCE(SUM(outcome != 'success'), 0) AS failures
+                FROM fetch_operations WHERE created_at >= ? AND created_at <= ?
+                GROUP BY bucket
+                """,
+                bounds,
+            ).fetchall()
+            # Rejected destinations (unsafe/policy) are not fallback diagnostics and
+            # may name internal hosts, so they never leave the store.
+            failure_rows = conn.execute(
+                """
+                SELECT created_at, url_host, provider, outcome, trigger,
+                       http_status, provider_http_status, latency_ms
+                FROM fetch_events
+                WHERE created_at >= ? AND created_at <= ?
+                  AND provider IN ('direct', 'decodo', 'jina')
+                  AND outcome NOT IN ('success', 'proxy_success', 'unsafe_url', 'policy_error')
+                ORDER BY created_at DESC, id DESC
+                LIMIT ?
+                """,
+                (since, until, max(1, min(100, int(limit)))),
+            ).fetchall()
+
+        searches = {int(row["bucket"]): row for row in search_rows}
+        fetches = {int(row["bucket"]): row for row in fetch_rows}
+        timeline = []
+        for index in range(buckets):
+            search = searches.get(index)
+            fetch = fetches.get(index)
+            timeline.append({
+                "start": _iso_timestamp(since + index * bucket_seconds),
+                "searches": int(search["total"]) if search else 0,
+                "search_failures": int(search["failures"]) if search else 0,
+                "fetches": int(fetch["total"]) if fetch else 0,
+                "fetch_failures": int(fetch["failures"]) if fetch else 0,
+            })
+        return {
+            "status": "ok",
+            "window": window,
+            "bucket_seconds": bucket_seconds,
+            "timeline": timeline,
+            "recent_fetch_failures": [
+                {
+                    "at": _iso_timestamp(int(row["created_at"])),
+                    "host": str(row["url_host"]),
+                    "provider": str(row["provider"]),
+                    "outcome": str(row["outcome"]),
+                    "trigger": str(row["trigger"]),
+                    "http_status": row["http_status"],
+                    "provider_http_status": row["provider_http_status"],
+                    "latency_ms": round(float(row["latency_ms"] or 0.0), 1),
+                }
+                for row in failure_rows
+            ],
+            "privacy": {"query_data_stored": False, "hostnames_included": True},
         }
 
     def reset(self) -> int:
