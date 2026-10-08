@@ -3259,7 +3259,7 @@ async def _web_fetch_impl_inner(
             attempt_state.update(provider="decodo", trigger=trigger)
             try:
                 result = await _decodo_scraper_fetch(
-                    url, 50000, trigger, timeout=remaining
+                    url, 50000, trigger, timeout=min(DECODO_TIMEOUT, remaining)
                 )
             except Exception as exc:
                 logger.warning("Decodo fallback failed (%s)", type(exc).__name__)
@@ -3274,7 +3274,7 @@ async def _web_fetch_impl_inner(
             attempt_state.update(provider="jina", trigger=trigger)
             try:
                 result = await _jina_reader_fetch(
-                    url, 50000, trigger, timeout=remaining
+                    url, 50000, trigger, timeout=min(JINA_TIMEOUT, remaining)
                 )
             except Exception as exc:
                 logger.warning("Jina Reader fallback failed (%s)", type(exc).__name__)

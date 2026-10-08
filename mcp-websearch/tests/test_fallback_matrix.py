@@ -539,6 +539,46 @@ async def test_fallback_tier_timeout_clamped_to_remaining_budget(monkeypatch, is
 
 
 @pytest.mark.asyncio
+async def test_decodo_tier_capped_so_jina_keeps_budget(monkeypatch, isolated_fetch):
+    # With ample operation budget, Decodo must be held to its own tier timeout
+    # rather than the whole remainder, so a stalled Decodo cannot starve Jina.
+    url = "https://example.com/decodo-stall"
+    decodo_timeouts: list[float] = []
+    jina_timeouts: list[float] = []
+    jina_content = "Jina recovered this after Decodo stalled. " * 6
+
+    async def failing_decodo(url_, max_chars, trigger="none", *, timeout=None):
+        decodo_timeouts.append(timeout)
+        text = srv._fetch_error("Decodo request failed: TimeoutError")
+        return srv._FetchResult(text, text, False, 0.0, url_, "", "decodo")
+
+    async def successful_jina(url_, max_chars, trigger="none", *, timeout=None):
+        jina_timeouts.append(timeout)
+        return srv._FetchResult(jina_content, None, False, 0.0, url_, "text/markdown", "jina")
+
+    async def slow_fetch(_url):
+        raise srv.httpx.TimeoutException("read timeout", request=srv.httpx.Request("GET", url))
+
+    monkeypatch.setattr(srv, "FETCH_OPERATION_TIMEOUT", 60.0)
+    monkeypatch.setattr(srv, "DECODO_TIMEOUT", 25.0)
+    monkeypatch.setattr(srv, "JINA_TIMEOUT", 30.0)
+    monkeypatch.setattr(srv, "DECODO_FALLBACK_ENABLED", True)
+    monkeypatch.setattr(srv, "JINA_FALLBACK_ENABLED", True)
+    monkeypatch.setattr(srv, "_resolve_decodo_key", lambda: "test-decodo-token")
+    monkeypatch.setattr(srv, "_fetch_public_body", slow_fetch)
+    monkeypatch.setattr(srv, "_decodo_scraper_fetch", failing_decodo)
+    monkeypatch.setattr(srv, "_jina_reader_fetch", successful_jina)
+
+    result = await srv._web_fetch_impl(url)
+
+    assert result.error is None
+    assert result.provider == "jina"
+    assert decodo_timeouts == [25.0]
+    assert len(jina_timeouts) == 1
+    assert 1.0 <= jina_timeouts[0] <= srv.JINA_TIMEOUT
+
+
+@pytest.mark.asyncio
 async def test_no_fallback_when_operation_budget_exhausted(monkeypatch, isolated_fetch):
     url = "https://example.com/no-budget"
     decodo_calls: list[float] = []
