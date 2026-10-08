@@ -101,8 +101,9 @@ function attentionItems(health, config, stats24) {
   if (!health.ready) items.push({ level: 'critical', text: 'Brave is not ready — check the credential or circuit breaker.' });
   else if (health.status === 'degraded') items.push({ level: 'warn', text: 'The most recent search finished degraded or with an error.' });
   const decodoConfig = ((config || {}).fetch || {}).decodo || {};
+  // Decodo is optional: without a credential the chain is simply direct → Jina.
   if (decodoConfig.enabled && !decodoConfig.credential_configured) {
-    items.push({ level: 'warn', text: 'Decodo fallback is enabled but its credential is missing.' });
+    items.push({ level: 'info', text: 'Decodo fallback is inactive (no credential); page recovery uses Jina only.' });
   }
   if (!stats24 || !stats24.available) return items;
   const attempts = (stats24.fetches || {}).attempts || {};
@@ -122,7 +123,8 @@ function attentionItems(health, config, stats24) {
 function renderAttention(items) {
   const list = $('attention-list');
   list.replaceChildren(...items.map(item => el('li', item.level, item.text)));
-  $('attention').hidden = items.length === 0;
+  // Informational notes alone never raise the attention banner.
+  $('attention').hidden = !items.some(item => item.level !== 'info');
 }
 
 function renderState(health, items) {
