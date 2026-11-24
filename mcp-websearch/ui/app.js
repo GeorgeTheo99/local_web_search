@@ -41,7 +41,10 @@ const providerName = name => PROVIDER_NAMES[name] || name;
 const routeText = providers => (providers || []).map(providerName).join(' → ') || 'none';
 // Settings writes are same-origin loopback only; the directory's proxied copy
 // of this page is read-only.
-const LOOPBACK_PAGE = ['127.0.0.1', 'localhost', '[::1]', '::1'].includes(location.hostname);
+// Only the broker's own /ui page can write settings; the directory's proxied
+// /local-search/ copy is read-only even when opened on a loopback address.
+const LOOPBACK_PAGE = ['127.0.0.1', 'localhost', '[::1]', '::1'].includes(location.hostname)
+  && !location.pathname.startsWith('/local-search/');
 let switching = false;
 const yesNo = value => (value ? 'Yes' : 'No');
 const present = value => (value ? 'Configured' : 'Missing');
