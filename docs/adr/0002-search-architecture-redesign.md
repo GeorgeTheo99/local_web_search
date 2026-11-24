@@ -106,3 +106,19 @@ Shadow is **evaluation-only**. Promotion to automatic SearXNG-first serving
 requires measured fallback decisions plus sufficient parity evidence from
 successful, non-cached dual-provider samples. Operational success rate alone is
 not evidence that SearXNG matches Brave's result coverage or domain quality.
+
+## Parallel amendment (2026-11-23)
+
+Parallel (parallel.ai) is a second raw-search provider alongside Brave:
+
+- The default provider is a runtime setting (`settings.json` in the data
+  directory: `brave` or `parallel`), switched from the loopback dashboard's
+  on/off control or `local-search route set`, with no restart. `parallel`
+  searches Parallel first and falls back to Brave; `brave` searches Brave only.
+- A loopback caller may pin one provider per request with the
+  `X-Search-Provider` header; the tailnet listener ignores it and cannot write
+  settings.
+- The Parallel key is file-only (`parallel_key`), like Decodo's. Image search
+  stays on Brave. The search cache is keyed by route.
+- Parallel's standard terms permit de-identified use of queries and results for
+  model improvement; Brave stays the default until the owner switches.

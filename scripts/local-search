@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# local-search — operator CLI for the Brave-only local web-search broker.
+# local-search — operator CLI for the local web-search broker (Brave, Parallel).
 #
 # Usage:
 #   local-search install [--no-start]   sync venv + plist + start + verify
@@ -7,6 +7,8 @@
 #   local-search start | stop | restart
 #   local-search status                launchd state + /health probe
 #   local-search stats [24h|7d|30d]    query-free aggregate telemetry
+#   local-search route [show]          default search provider and live route
+#   local-search route set brave|parallel  switch the default provider (no restart)
 #   local-search telemetry-reset --yes explicitly erase telemetry events
 #   local-search verify                health + tools/list smoke
 #   local-search logs [mcp|tailnet] [lines]
@@ -593,6 +595,55 @@ cmd_stats() {
     | python3 -m json.tool
 }
 
+cmd_route() {
+  local action="${1:-show}" provider="${2:-}"
+  case "$action" in
+    show)
+      ensure_data_dir
+      if [ -f "$LOCAL_SEARCH_DATA_DIR/settings.json" ]; then
+        printf 'settings.json: %s\n' "$(cat "$LOCAL_SEARCH_DATA_DIR/settings.json")"
+      else
+        printf 'settings.json: absent (built-in default: brave)\n'
+      fi
+      curl -fsS --max-time 10 "http://127.0.0.1:${MCP_PORT}/config" 2>/dev/null \
+        | python3 -I -c 'import json, sys; r = json.load(sys.stdin)["route"]; print("live route:", " -> ".join(r["providers"]), "(default " + r["default_provider"] + ")")' 2>/dev/null \
+        || warn "broker not reachable on 127.0.0.1:${MCP_PORT}"
+      ;;
+    set)
+      case "$provider" in brave|parallel) ;; *) die "usage: local-search route set brave|parallel" ;; esac
+      ensure_data_dir
+      if [ "$provider" = parallel ]; then
+        local key="$LOCAL_SEARCH_DATA_DIR/parallel_key" meta
+        [ -s "$key" ] || die "no Parallel key: write it to $key (mode 600) first"
+        meta="$(stat -f '%Lp' "$key" 2>/dev/null || stat -c '%a' "$key")"
+        [ "$meta" = 600 ] || [ "$meta" = 400 ] || die "$key must be mode 600"
+      fi
+      # Same atomic, owner-only write as the dashboard's POST /settings.
+      python3 -I - "$LOCAL_SEARCH_DATA_DIR" "$provider" <<'PY'
+import json, os, sys, tempfile
+directory, provider = sys.argv[1], sys.argv[2]
+fd, tmp = tempfile.mkstemp(prefix=".settings-", suffix=".json", dir=directory)
+try:
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        os.fchmod(handle.fileno(), 0o600)
+        json.dump({"search_provider": provider}, handle)
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(tmp, os.path.join(directory, "settings.json"))
+except BaseException:
+    try:
+        os.unlink(tmp)
+    except OSError:
+        pass
+    raise
+PY
+      ok "default search provider: $provider (applies to the next search; no restart needed)"
+      ;;
+    *) die "usage: local-search route [show] | route set brave|parallel" ;;
+  esac
+}
+
 cmd_telemetry_reset() {
   [ "${1:-}" = "--yes" ] || die "usage: local-search telemetry-reset --yes"
   [ -x "$MCP_VENV/bin/python" ] || die "MCP venv missing; run install first"
@@ -680,6 +731,7 @@ main() {
     restart) check_prereqs; restart_services; ok "restarted" ;;
     status) status ;;
     stats) shift; cmd_stats "$@" ;;
+    route) shift; cmd_route "$@" ;;
     telemetry-reset) shift; cmd_telemetry_reset "$@" ;;
     verify) verify ;;
     logs) shift; cmd_logs "$@" ;;

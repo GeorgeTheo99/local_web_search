@@ -354,22 +354,23 @@ def test_brave_provider_timeout_reads_module_global(monkeypatch):
     assert srv._BraveProvider().timeout == 0.9
 
 
-def test_provider_stack_brave_opt_in(monkeypatch):
+def test_provider_registry_lists_brave_then_parallel(monkeypatch):
     monkeypatch.setattr(srv, "_PROVIDER_STACK", "brave")
     stack = srv._build_provider_stack()
-    assert [p.name for p in stack] == ["brave"]
+    assert [p.name for p in stack] == ["brave", "parallel"]
 
 
 @pytest.mark.asyncio
-async def test_health_reports_brave_as_the_only_provider(monkeypatch):
+async def test_health_routes_to_brave_by_default(monkeypatch):
     monkeypatch.setattr(srv, "BRAVE_API_KEY_ENV", "brave-env")
     monkeypatch.setattr(srv, "get_http_headers", lambda: {})
     health = await srv._health_payload()
     assert health["provider_stack"] == "brave"
-    assert [provider["name"] for provider in health["providers"]] == ["brave"]
+    assert health["route"]["providers"] == ["brave"]
+    assert [provider["name"] for provider in health["providers"]] == ["brave", "parallel"]
     assert health["providers"][0]["credential_usable"] is True
     assert set(health) == {
-        "status", "ready", "service", "policy", "provider_stack",
+        "status", "ready", "service", "policy", "provider_stack", "route",
         "providers", "telemetry", "last_search",
     }
     assert "brave_timeout_s" in health["policy"]

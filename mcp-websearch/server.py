@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Policy-aware MCP web search broker for Brave Search.
+"""Policy-aware MCP web search broker for Brave Search and Parallel.
 
 Tools:
-  - web_search(query, num_results=8, intent="general")
-  - batch_web_search(queries, num_results=8, intent="general")
-  - image_search(query, num_results=8)
+  - web_search(query, num_results=8, mode=None, intent="general")
+  - batch_web_search(queries, num_results=8, intent="general", mode=None)
+  - image_search(query, num_results=8, mode=None)
   - web_fetch(url, max_chars=20000)           direct fetch with SSRF guard
   - verify_url(url)                           direct-fetch verification
 
@@ -15,9 +15,15 @@ HTTP diagnostics:
   - GET /stats   query-free aggregate telemetry (24h, 7d, or 30d)
   - GET /config  resolved non-secret configuration
   - GET /activity  telemetry timeline and recent failed fetch hostnames
+  - POST /settings  switch the default search provider (same-origin loopback UI)
 
-Brave Search is the sole raw-search provider (independent index, strong
-privacy posture, $0.005/query).
+Raw-search providers are Brave Search (independent index, $0.005/query) and
+Parallel (LLM-oriented excerpts, $0.001/query in fast mode). The default
+provider lives in $LOCAL_SEARCH_DATA_DIR/settings.json: `brave` searches Brave
+only; `parallel` searches Parallel first and falls back to Brave. A loopback
+caller may pin one provider per request with the X-Search-Provider header
+(`brave`, `parallel`, or `auto`); the tailnet listener ignores it. Image
+search stays on Brave.
 
 Searches use one bounded 18-second-or-less budget, overfetch before URL dedupe,
 and return additive status/backend/fallback/timing metadata. Brave uses the
@@ -36,6 +42,10 @@ Key configuration:
   LOCAL_SEARCH_TELEMETRY_ENABLED      default true
   BRAVE_API_KEY                       optional stdio/server fallback key
   BRAVE_BASE_URL                      default https://api.search.brave.com
+  WEBSEARCH_SEARCH_PROVIDER           default provider before settings.json exists (brave)
+  WEBSEARCH_PARALLEL_TIMEOUT          default 8 seconds
+  WEBSEARCH_PARALLEL_MODE             turbo, fast (default), basic, or advanced
+  data/parallel_key                   owner-only Parallel API key (file only)
   DECODO_FALLBACK_ENABLED             default true; requires data/decodo_key
   DECODO_TIMEOUT                      default 25 seconds
   JINA_TIMEOUT                        default 30 seconds
@@ -63,7 +73,7 @@ import tempfile
 import time
 import urllib.parse
 from collections import OrderedDict
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field
 from pathlib import Path
 from threading import Lock
@@ -136,14 +146,33 @@ BRAVE_TIMEOUT = _bounded_float(
 _SEARCH_MODE = os.environ.get("WEBSEARCH_SEARCH_MODE", "normal").strip().lower()
 if _SEARCH_MODE not in {"normal", "sensitive", "maximum_recall"}:
     raise RuntimeError("WEBSEARCH_SEARCH_MODE must be normal, sensitive, or maximum_recall")
-# Kept as a compatibility input for existing launchers; Brave is always used.
+# Kept as a compatibility input for existing launchers; the default provider
+# now comes from settings.json (see _read_settings).
 if os.environ.get("WEBSEARCH_PROVIDER_STACK", "brave").strip().lower() not in {"", "brave"}:
-    logger.warning("WEBSEARCH_PROVIDER_STACK is ignored; Brave is the only provider")
+    logger.warning("WEBSEARCH_PROVIDER_STACK is ignored; use settings.json or the dashboard")
 _PROVIDER_STACK = "brave"
+# Search providers a route may name, in fallback order.
+SEARCH_PROVIDERS = ("brave", "parallel")
+_DEFAULT_SEARCH_PROVIDER = os.environ.get("WEBSEARCH_SEARCH_PROVIDER", "brave").strip().lower()
+if _DEFAULT_SEARCH_PROVIDER not in SEARCH_PROVIDERS:
+    raise RuntimeError("WEBSEARCH_SEARCH_PROVIDER must be brave or parallel")
+PARALLEL_BASE_URL = "https://api.parallel.ai"
+PARALLEL_TIMEOUT = _bounded_float(
+    "WEBSEARCH_PARALLEL_TIMEOUT", 8.0, minimum=0.25, maximum=SEARCH_TOTAL_TIMEOUT
+)
+# Parallel's search modes and their list prices (USD per request).
+_PARALLEL_MODE_COST_USD = {"turbo": 0.001, "fast": 0.001, "basic": 0.005, "advanced": 0.005}
+PARALLEL_MODE = os.environ.get("WEBSEARCH_PARALLEL_MODE", "fast").strip().lower()
+if PARALLEL_MODE not in _PARALLEL_MODE_COST_USD:
+    raise RuntimeError("WEBSEARCH_PARALLEL_MODE must be turbo, fast, basic, or advanced")
+# Parallel excerpts run to thousands of characters; results keep a
+# Brave-sized snippet so consumers' context budgets are unchanged.
+PARALLEL_SNIPPET_MAX_CHARS = 500
 # Per-provider cost rates (USD per billable search request). Used for the
 # estimated_cost_usd field in search responses.
 _PROVIDER_COST_USD: dict[str, float] = {
     "brave": 0.005,
+    "parallel": _PARALLEL_MODE_COST_USD[PARALLEL_MODE],
     "none": 0.0,
 }
 MAX_NUM_RESULTS = 20
@@ -299,7 +328,7 @@ async def _public_fetch_client() -> httpx.AsyncClient:
 mcp = FastMCP(
     "websearch",
     instructions=(
-        "Web and image search plus page fetching via Brave Search. "
+        "Web and image search plus page fetching via Brave Search and Parallel. "
         "Use web_search for one focused query and batch_web_search for two or three independent query angles that can run together. "
         "Use image_search to find public image and source-page URLs without downloading image bytes. "
         "Use web_fetch to retrieve the main text and attachment links from a specific URL."
@@ -437,6 +466,8 @@ class _BraveAuthState:
 
 
 _brave_auth_state = _BraveAuthState()
+# The same credential-fingerprint tracking serves Parallel.
+_parallel_auth_state = _BraveAuthState()
 
 
 # --------------------------------------------------------------------------- #
@@ -483,30 +514,205 @@ class _BraveProvider:
         return "keyed" if _resolve_brave_key() else "none"
 
 
-# Brave is the only active provider. The compatibility environment input above
-# is intentionally not allowed to alter this list.
+class _ParallelProvider:
+    """Parallel Search raw-search provider (LLM-oriented excerpts; API key)."""
+
+    name = "parallel"
+    output = "raw"
+
+    @property
+    def timeout(self) -> float:
+        return PARALLEL_TIMEOUT
+
+    @staticmethod
+    def search(
+        query: str, num_results: int, intent: str = "general"
+    ) -> Awaitable[_BackendOutcome]:
+        return _parallel_search(query, num_results, _resolve_parallel_key(), intent=intent)
+
+    @staticmethod
+    def credential_label() -> str:
+        return "keyed" if _resolve_parallel_key() else "none"
+
+
+# Every registered provider, in fallback order. Which ones a search uses is
+# decided per request by _resolve_search_route.
 def _build_provider_stack() -> list[SearchProvider]:
-    return [_BraveProvider()]
+    return [_BraveProvider(), _ParallelProvider()]
 
 
 _PROVIDERS: list[SearchProvider] = _build_provider_stack()
 
 
+def _provider_named(name: str) -> SearchProvider | None:
+    return next((provider for provider in _PROVIDERS if provider.name == name), None)
+
+
 def _provider_credential_configured(name: str) -> bool:
     """Return whether a provider's credential is resolvable without leaking it."""
-    return name == "brave" and bool(_resolve_brave_key())
+    if name == "brave":
+        return bool(_resolve_brave_key())
+    if name == "parallel":
+        return bool(_resolve_parallel_key())
+    return False
 
 
 def _provider_credential_usable(name: str) -> bool:
     """Return whether the current credential has no known authentication failure."""
-    return name == "brave" and _brave_auth_state.usable(_resolve_brave_key())
+    if name == "brave":
+        return _brave_auth_state.usable(_resolve_brave_key())
+    if name == "parallel":
+        return _parallel_auth_state.usable(_resolve_parallel_key())
+    return False
 
 
-def _default_timings_ms() -> dict[str, float | None]:
-    """Baseline timings dict with every provider's key present and unset."""
+# --------------------------------------------------------------------------- #
+# Search route: settings.json default plus an optional per-request override.
+# --------------------------------------------------------------------------- #
+
+_SETTINGS_FILENAME = "settings.json"
+_SETTINGS_MAX_BYTES = 4096
+_settings_lock = Lock()
+_last_good_settings: dict[str, str] | None = None
+# Which listener this process serves. http_server.py sets "tailnet" for the
+# MCP-only Tailscale backend, which never honors overrides or settings writes.
+_INGRESS = "loopback"
+
+
+def set_ingress(name: str) -> None:
+    global _INGRESS
+    if name not in {"loopback", "tailnet"}:
+        raise ValueError("ingress must be loopback or tailnet")
+    _INGRESS = name
+
+
+def _settings_path() -> Path:
+    return LOCAL_SEARCH_DATA_DIR / _SETTINGS_FILENAME
+
+
+def _read_settings() -> dict[str, str]:
+    """Return the configured default provider and where it came from.
+
+    Re-read on every call so a switch from the dashboard or CLI applies to the
+    next search in every broker process. A missing file means the built-in
+    default; an unreadable or invalid one keeps the last good value.
+    """
+    global _last_good_settings
+    path = _settings_path()
+    try:
+        stat = path.stat()
+    except FileNotFoundError:
+        return {"search_provider": _DEFAULT_SEARCH_PROVIDER, "source": "default"}
+    except OSError:
+        return _last_good_settings or {"search_provider": _DEFAULT_SEARCH_PROVIDER, "source": "default"}
+    try:
+        if stat.st_mode & 0o022 or stat.st_size > _SETTINGS_MAX_BYTES:
+            raise ValueError("settings file is writable by others or too large")
+        data = json.loads(path.read_text(encoding="utf-8"))
+        provider = data.get("search_provider") if isinstance(data, dict) else None
+        if provider not in SEARCH_PROVIDERS:
+            raise ValueError("search_provider must be brave or parallel")
+    except (OSError, ValueError) as exc:
+        logger.warning("Ignoring invalid %s (%s)", _SETTINGS_FILENAME, exc)
+        return _last_good_settings or {"search_provider": _DEFAULT_SEARCH_PROVIDER, "source": "default"}
+    _last_good_settings = {"search_provider": provider, "source": "settings"}
+    return _last_good_settings
+
+
+def _write_settings(search_provider: str) -> dict[str, str]:
+    """Atomically persist the default provider as an owner-only file."""
+    if search_provider not in SEARCH_PROVIDERS:
+        raise ValueError("search_provider must be brave or parallel")
+    path = _settings_path()
+    with _settings_lock:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp_name = tempfile.mkstemp(prefix=".settings-", suffix=".json", dir=path.parent)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                os.fchmod(handle.fileno(), 0o600)
+                json.dump({"search_provider": search_provider}, handle)
+                handle.write("\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp_name, path)
+        except BaseException:
+            with suppress(OSError):
+                os.unlink(tmp_name)
+            raise
+    return _read_settings()
+
+
+@dataclass(frozen=True)
+class _SearchRoute:
+    """Providers one search tries, in order, and why."""
+
+    providers: tuple[str, ...]
+    source: str
+    default_provider: str
+    override: str | None = None
+    override_ignored: str | None = None
+
+    @property
+    def label(self) -> str:
+        return "+".join(self.providers)
+
+    def metadata(self) -> dict[str, Any]:
+        return {
+            "providers": list(self.providers),
+            "source": self.source,
+            "default_provider": self.default_provider,
+            "override": self.override,
+            "override_ignored": self.override_ignored,
+        }
+
+
+def _default_chain(default_provider: str) -> tuple[str, ...]:
+    """Parallel falls back to Brave; providers without a credential are skipped."""
+    chain = ("parallel", "brave") if default_provider == "parallel" else ("brave",)
+    configured = tuple(name for name in chain if _provider_credential_configured(name))
+    return configured or chain[-1:]
+
+
+def _requested_provider_override() -> str | None:
+    """Return the loopback caller's X-Search-Provider value, if any."""
+    if _INGRESS != "loopback":
+        return None
+    try:
+        headers = get_http_headers()
+    except LookupError:
+        return None
+    value = str(headers.get("x-search-provider") or "").strip().lower()
+    return None if value in {"", "auto", "default"} else value
+
+
+def _resolve_search_route(*, allow_override: bool = True) -> _SearchRoute:
+    settings = _read_settings()
+    default_provider = settings["search_provider"]
+    chain = _default_chain(default_provider)
+    override = _requested_provider_override() if allow_override else None
+    if override is None:
+        return _SearchRoute(chain, settings["source"], default_provider)
+    if override not in SEARCH_PROVIDERS:
+        reason = "unknown_provider"
+    elif not _provider_credential_configured(override):
+        reason = "provider_unconfigured"
+    else:
+        return _SearchRoute((override,), "override", default_provider, override=override)
+    return _SearchRoute(
+        chain, settings["source"], default_provider,
+        override=override[:32], override_ignored=reason,
+    )
+
+
+def _active_provider_names() -> tuple[str, ...]:
+    return _resolve_search_route(allow_override=False).providers
+
+
+def _default_timings_ms(names: tuple[str, ...] | None = None) -> dict[str, float | None]:
+    """Baseline timings dict with the route's provider keys present and unset."""
     timings: dict[str, float | None] = {"total": 0.0}
-    for provider in _PROVIDERS:
-        timings[provider.name] = None
+    for name in names if names is not None else _active_provider_names():
+        timings[name] = None
     return timings
 
 
@@ -633,6 +839,7 @@ def _record_last_search(payload: dict[str, Any]) -> None:
         "estimated_cost_usd": payload.get("estimated_cost_usd", 0.0),
         "cache_hit": bool(payload.get("cache_hit", False)),
         "cache_age_seconds": int(payload.get("cache_age_seconds", 0) or 0),
+        "route": (payload.get("route") or {}).get("providers"),
     }
 
 
@@ -812,15 +1019,21 @@ _SEARCH_CACHE_PAYLOAD_KEYS = {
 
 
 def _search_cache_variant(
-    requested: int, mode: str, intent: str = "general"
+    requested: int, mode: str, intent: str = "general", providers: str = "brave"
 ) -> str:
-    """Describe every policy input that can change a cached search result."""
+    """Describe every policy input that can change a cached search result.
+
+    ``providers`` is the route label (e.g. ``parallel+brave``), so switching
+    the default provider or pinning one never serves another route's results.
+    The Parallel mode is part of the label because it changes the results.
+    """
+    label = providers.replace("parallel", f"parallel:{PARALLEL_MODE}")
     return json.dumps(
         {
             "num_results": requested,
             "search_mode": mode,
             "intent": intent,
-            "provider": "brave",
+            "provider": label,
         },
         sort_keys=True,
         separators=(",", ":"),
@@ -903,6 +1116,7 @@ def _search_error_payload(
     mode: str | None = None,
     search_mode: str | None = None,
     safe_search: str | None = None,
+    route: dict[str, Any] | None = None,
 ) -> str:
     payload = {
         "query": query,
@@ -924,6 +1138,8 @@ def _search_error_payload(
     }
     if safe_search:
         payload["safe_search"] = safe_search
+    if route:
+        payload["route"] = route
     _record_last_search(payload)
     return json.dumps(payload)
 
@@ -1123,6 +1339,7 @@ def _format_results(
     search_mode: str | None = None,
     cache_hit: bool = False,
     cache_age_seconds: float = 0.0,
+    route: dict[str, Any] | None = None,
 ) -> str:
     """Format results as the legacy contract plus additive provider metadata."""
     effective_status = status or ("ok" if results else "empty")
@@ -1170,6 +1387,8 @@ def _format_results(
         payload["answer"] = answer
     if citations:
         payload["citations"] = list(citations)
+    if route:
+        payload["route"] = route
     _record_last_search(payload)
     return json.dumps(payload)
 
@@ -1688,6 +1907,18 @@ def _resolve_decodo_key() -> str:
     return token
 
 
+def _resolve_parallel_key() -> str:
+    """Return the owner-only Parallel API key, or empty when not configured.
+
+    Like Decodo's, the key is file-only: never an environment variable, a
+    process argument, or a request header.
+    """
+    token = _read_secret_file(LOCAL_SEARCH_DATA_DIR / "parallel_key")
+    if not token or any(char.isspace() or ord(char) < 33 or ord(char) > 126 for char in token):
+        return ""
+    return token
+
+
 # --------------------------------------------------------------------------- #
 # Backend: Brave Search. Independent index; raw ranked results.
 # --------------------------------------------------------------------------- #
@@ -2004,15 +2235,208 @@ async def _brave_image_search(query: str, num_results: int, api_key: str) -> _Ba
         circuit_transition=circuit_transition,
         circuit_failures=int(circuit_after["consecutive_failures"]),
     )
+
+
 # --------------------------------------------------------------------------- #
+# Backend: Parallel Search. Ranked URLs with LLM-oriented excerpts.
+# --------------------------------------------------------------------------- #
+
+# Freshness windows matching Brave's `pm` (current) and `pd` (news).
+_PARALLEL_FRESHNESS_DAYS = {"current": 31, "news": 1}
+
+
+def _parallel_snippet(excerpts: Any) -> str:
+    """Collapse the first excerpt into one bounded, plain-text snippet."""
+    if not isinstance(excerpts, list):
+        return ""
+    text = next((item for item in excerpts if isinstance(item, str) and item.strip()), "")
+    text = " ".join(text.split())
+    if len(text) <= PARALLEL_SNIPPET_MAX_CHARS:
+        return text
+    return text[: PARALLEL_SNIPPET_MAX_CHARS - 1].rstrip() + "…"
+
+
+def _normalize_parallel_result(r: dict) -> dict[str, Any] | None:
+    """Normalize one Parallel `results` entry to the broker's result shape."""
+    url = _public_http_url(r.get("url"))
+    if url is None:
+        return None
+    snippet = _parallel_snippet(r.get("excerpts"))
+    published = r.get("publish_date")
+    if isinstance(published, str) and published and not snippet.endswith(published):
+        snippet = f"{snippet} (published {published})".strip()
+    return {
+        "title": r.get("title") or "Untitled",
+        "url": url,
+        "domain": _domain(url),
+        "snippet": snippet,
+        "engine": "parallel",
+        "provider": "parallel",
+        "score": None,
+    }
+
+
+def _parallel_request_body(query: str, fetch_count: int, intent: str) -> dict[str, Any]:
+    """Build a /v1/search body from the broker's single keyword query.
+
+    Consumers send one query, so it serves as both the objective and the only
+    keyword search; Parallel ranks best with a goal-style objective, which a
+    future optional argument can supply.
+    """
+    advanced: dict[str, Any] = {"max_results": fetch_count}
+    if days := _PARALLEL_FRESHNESS_DAYS.get(intent):
+        after = time.strftime("%Y-%m-%d", time.gmtime(time.time() - days * 86400))
+        advanced["source_policy"] = {"after_date": after}
+    return {
+        "objective": query,
+        "search_queries": [query],
+        "mode": PARALLEL_MODE,
+        "max_chars_total": max(2000, fetch_count * 2 * PARALLEL_SNIPPET_MAX_CHARS),
+        "advanced_settings": advanced,
+    }
+
+
+async def _parallel_search(
+    query: str, num_results: int, api_key: str, intent: str = "general"
+) -> _BackendOutcome:
+    """Search Parallel. Requires an API key (the keyless tier is MCP-only)."""
+    started = time.monotonic()
+    credential_mode = "keyed" if api_key else "none"
+    circuit_before = _breaker.snapshot("parallel")
+    if not api_key:
+        circuit_after = _breaker.snapshot("parallel")
+        return _BackendOutcome(
+            backend="parallel",
+            state="error",
+            elapsed_ms=round((time.monotonic() - started) * 1000, 1),
+            error="missing API key",
+            credential_mode="none",
+            circuit_before=str(circuit_before["state"]),
+            circuit_after=str(circuit_after["state"]),
+            circuit_failures=int(circuit_after["consecutive_failures"]),
+        )
+    if not _breaker.allow("parallel"):
+        logger.info("Parallel circuit open; skipping")
+        circuit_after = _breaker.snapshot("parallel")
+        return _BackendOutcome(
+            backend="parallel",
+            state="circuit_open",
+            elapsed_ms=round((time.monotonic() - started) * 1000, 1),
+            credential_mode=credential_mode,
+            circuit_before=str(circuit_before["state"]),
+            circuit_after=str(circuit_after["state"]),
+            circuit_failures=int(circuit_after["consecutive_failures"]),
+        )
+
+    fetch_count = min(num_results * RESULT_OVERFETCH_FACTOR, MAX_NUM_RESULTS)
+    headers = {
+        "x-api-key": api_key,
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "Accept-Encoding": "identity",
+    }
+    try:
+        client = await _client()
+        async with client.stream(
+            "POST",
+            f"{PARALLEL_BASE_URL}/v1/search",
+            json=_parallel_request_body(query, fetch_count, intent),
+            headers=headers,
+            timeout=PARALLEL_TIMEOUT,
+        ) as response:
+            response.raise_for_status()
+            data = await _limited_json_object(response, provider="Parallel")
+    except asyncio.CancelledError:
+        _breaker.record_aborted("parallel")
+        raise
+    except httpx.TimeoutException:
+        circuit_transition = _breaker.record_failure("parallel")
+        state = "timeout"
+        error = "request timed out"
+        http_status = None
+    except httpx.HTTPStatusError as exc:
+        status_code = exc.response.status_code
+        http_status = status_code
+        # Auth and request errors prove reachability, so they do not trip the circuit.
+        if status_code in {400, 401, 403, 404, 422}:
+            circuit_transition = _breaker.record_success("parallel")
+        else:
+            circuit_transition = _breaker.record_failure("parallel")
+        if status_code in {401, 403}:
+            _parallel_auth_state.record_auth_failure(api_key)
+        state = "error"
+        error = f"HTTP {status_code}"
+    except Exception as exc:
+        circuit_transition = _breaker.record_failure("parallel")
+        state = "error"
+        error = type(exc).__name__
+        http_status = None
+    else:
+        circuit_transition = _breaker.record_success("parallel")
+        _parallel_auth_state.record_success(api_key)
+        circuit_after = _breaker.snapshot("parallel")
+        raw_results = data.get("results") if isinstance(data, dict) else None
+        results = [
+            normalized
+            for item in (raw_results if isinstance(raw_results, list) else [])[:fetch_count]
+            if isinstance(item, dict)
+            and (normalized := _normalize_parallel_result(item)) is not None
+        ]
+        return _BackendOutcome(
+            backend="parallel",
+            results=results,
+            ok=True,
+            state="ok" if results else "empty",
+            elapsed_ms=round((time.monotonic() - started) * 1000, 1),
+            attempts=1,
+            http_status=response.status_code,
+            credential_mode=credential_mode,
+            circuit_before=str(circuit_before["state"]),
+            circuit_after=str(circuit_after["state"]),
+            circuit_transition=circuit_transition,
+            circuit_failures=int(circuit_after["consecutive_failures"]),
+        )
+
+    circuit_after = _breaker.snapshot("parallel")
+    logger.warning("Parallel search failed (%s): %s", credential_mode, error)
+    return _BackendOutcome(
+        backend="parallel",
+        state=state,
+        elapsed_ms=round((time.monotonic() - started) * 1000, 1),
+        attempts=1,
+        error=error,
+        http_status=http_status,
+        credential_mode=credential_mode,
+        circuit_before=str(circuit_before["state"]),
+        circuit_after=str(circuit_after["state"]),
+        circuit_transition=circuit_transition,
+        circuit_failures=int(circuit_after["consecutive_failures"]),
+    )
+
+
+# --------------------------------------------------------------------------- #
+
+def _provider_health(name: str, provider_states: dict[str, Any]) -> dict[str, Any]:
+    provider = _provider_named(name)
+    return {
+        "name": name,
+        "output": getattr(provider, "output", "raw"),
+        "timeout_s": provider.timeout if provider is not None else None,
+        "credential_configured": _provider_credential_configured(name),
+        "credential_usable": _provider_credential_usable(name),
+        "circuit": _breaker.snapshot(name),
+        "last_state": provider_states.get(name),
+    }
+
 
 async def _health_payload() -> dict[str, Any]:
     last_search = _last_search or {}
     provider_states = last_search.get("provider_states", {})
-    brave_breaker = _breaker.snapshot("brave")
-    ready = (
-        brave_breaker["state"] != "open"
-        and _provider_credential_usable("brave")
+    route = _resolve_search_route(allow_override=False)
+    ready = any(
+        _breaker.snapshot(name)["state"] != "open"
+        and _provider_credential_usable(name)
+        for name in route.providers
     )
     last_status = last_search.get("status")
     if ready and last_status not in {"degraded", "error"}:
@@ -2028,6 +2452,7 @@ async def _health_payload() -> dict[str, Any]:
         "policy": {
             "total_timeout_s": SEARCH_TOTAL_TIMEOUT,
             "brave_timeout_s": BRAVE_TIMEOUT,
+            "parallel_timeout_s": PARALLEL_TIMEOUT,
             "fetch_fallbacks": {
                 "decodo": {
                     "enabled": DECODO_FALLBACK_ENABLED,
@@ -2041,18 +2466,9 @@ async def _health_payload() -> dict[str, Any]:
                 "operation_timeout_s": FETCH_OPERATION_TIMEOUT,
             },
         },
-        "provider_stack": "brave",
-        "providers": [
-            {
-                "name": "brave",
-                "output": "raw",
-                "timeout_s": BRAVE_TIMEOUT,
-                "credential_configured": _provider_credential_configured("brave"),
-                "credential_usable": _provider_credential_usable("brave"),
-                "circuit": brave_breaker,
-                "last_state": provider_states.get("brave"),
-            }
-        ],
+        "provider_stack": route.label,
+        "route": route.metadata(),
+        "providers": [_provider_health(name, provider_states) for name in SEARCH_PROVIDERS],
         "telemetry": _get_telemetry().status(),
         "last_search": _last_search,
     }
@@ -2155,9 +2571,16 @@ async def stats(request: Request) -> JSONResponse:
 @mcp.custom_route("/config", methods=["GET"])
 async def config(request: Request) -> JSONResponse:
     """Return resolved non-secret configuration; credentials report presence only."""
+    route = _resolve_search_route(allow_override=False)
     return JSONResponse({
         "service": "mcp-websearch",
-        "provider_stack": _PROVIDER_STACK,
+        "provider_stack": route.label,
+        "route": {
+            **route.metadata(),
+            "choices": list(SEARCH_PROVIDERS),
+            "settings_writable": _INGRESS == "loopback",
+            "override_header": "X-Search-Provider",
+        },
         "search": {
             "mode": _SEARCH_MODE,
             "total_timeout_s": SEARCH_TOTAL_TIMEOUT,
@@ -2174,6 +2597,14 @@ async def config(request: Request) -> JSONResponse:
                 "timeout_s": BRAVE_TIMEOUT,
                 "credential_configured": _provider_credential_configured("brave"),
                 "credential_usable": _provider_credential_usable("brave"),
+                "cost_usd_per_search": _PROVIDER_COST_USD["brave"],
+            },
+            "parallel": {
+                "timeout_s": PARALLEL_TIMEOUT,
+                "mode": PARALLEL_MODE,
+                "credential_configured": _provider_credential_configured("parallel"),
+                "credential_usable": _provider_credential_usable("parallel"),
+                "cost_usd_per_search": _PROVIDER_COST_USD["parallel"],
             },
         },
         "fetch": {
@@ -2199,6 +2630,65 @@ async def config(request: Request) -> JSONResponse:
         },
         "telemetry": {"enabled": TELEMETRY_ENABLED},
     })
+
+
+_SETTINGS_BODY_MAX_BYTES = 1024
+
+
+def _same_origin_write(request: Request) -> bool:
+    """Allow a settings write only from the dashboard's own loopback origin.
+
+    The loopback guard admits requests without an Origin and from any loopback
+    port, which is right for MCP clients but not for a state change: another
+    local web app could post here. A browser always sends Origin on POST, and
+    a JSON body forces a CORS preflight this server never answers.
+    """
+    origins = request.headers.getlist("origin")
+    hosts = request.headers.getlist("host")
+    content_type = request.headers.get("content-type", "").split(";")[0].strip().lower()
+    return (
+        _INGRESS == "loopback"
+        and len(origins) == 1
+        and len(hosts) == 1
+        and origins[0] == f"http://{hosts[0]}"
+        and content_type == "application/json"
+    )
+
+
+@mcp.custom_route("/settings", methods=["POST"])
+async def update_settings(request: Request) -> JSONResponse:
+    """Switch the default search provider (dashboard on/off control)."""
+    if not _same_origin_write(request):
+        return JSONResponse(
+            {"status": "error", "error": "same-origin JSON request from the loopback dashboard required"},
+            status_code=403,
+        )
+    body = await request.body()
+    if len(body) > _SETTINGS_BODY_MAX_BYTES:
+        return JSONResponse({"status": "error", "error": "request too large"}, status_code=413)
+    try:
+        data = json.loads(body)
+    except ValueError:
+        data = None
+    provider = data.get("search_provider") if isinstance(data, dict) else None
+    if not isinstance(data, dict) or set(data) != {"search_provider"} or provider not in SEARCH_PROVIDERS:
+        return JSONResponse(
+            {"status": "error", "error": "body must be {\"search_provider\": \"brave\" | \"parallel\"}"},
+            status_code=400,
+        )
+    if not _provider_credential_configured(provider):
+        return JSONResponse(
+            {"status": "error", "error": f"{provider} has no credential configured"},
+            status_code=409,
+        )
+    try:
+        settings = await asyncio.to_thread(_write_settings, provider)
+    except OSError as exc:
+        logger.warning("Settings write failed (%s)", type(exc).__name__)
+        return JSONResponse({"status": "error", "error": "settings could not be saved"}, status_code=500)
+    logger.info("Default search provider set to %s", settings["search_provider"])
+    route = _resolve_search_route(allow_override=False)
+    return JSONResponse({"status": "ok", "route": route.metadata()})
 
 
 @mcp.custom_route("/activity", methods=["GET"])
@@ -2311,12 +2801,14 @@ def _result_backend(results: list[dict[str, Any]]) -> str:
 
 
 def _timings(
-    started: float, outcomes: list[_BackendOutcome | None]
+    started: float,
+    outcomes: list[_BackendOutcome | None],
+    names: tuple[str, ...] | None = None,
 ) -> dict[str, float | None]:
     timings: dict[str, float | None] = {"total": round((time.monotonic() - started) * 1000, 1)}
-    # Every provider key is always present so callers and tests see a stable shape.
-    for provider in _PROVIDERS:
-        timings[provider.name] = None
+    # Every routed provider key is present so callers see a stable shape.
+    for name in names if names is not None else _active_provider_names():
+        timings[name] = None
     for outcome in outcomes:
         if outcome is not None:
             timings[outcome.backend] = outcome.elapsed_ms
@@ -2329,9 +2821,16 @@ async def _web_search_impl(
     *,
     mode: str | None = None,
     intent: str = "general",
+    route: _SearchRoute | None = None,
 ) -> str:
-    """Execute one web search using the public tool's stable payload contract."""
+    """Execute one web search using the public tool's stable payload contract.
+
+    ``route`` is resolved once per caller request (a batch passes its own) so a
+    settings switch mid-batch never mixes providers.
+    """
     started = time.monotonic()
+    route = route or _resolve_search_route()
+    route_meta = route.metadata()
     query = query.strip()
     requested = min(MAX_NUM_RESULTS, max(1, int(num_results)))
     effective_mode = (mode or _SEARCH_MODE).strip().lower()
@@ -2339,7 +2838,7 @@ async def _web_search_impl(
         effective_mode = "normal"
     effective_intent = str(intent or "general").strip().lower()
     if effective_intent not in SEARCH_INTENTS:
-        timings_ms = _default_timings_ms()
+        timings_ms = _default_timings_ms(route.providers)
         timings_ms["total"] = round((time.monotonic() - started) * 1000, 1)
         return _finish_search(
             _search_error_payload(
@@ -2348,6 +2847,7 @@ async def _web_search_impl(
                 timings_ms=timings_ms,
                 mode=effective_mode,
                 search_mode=effective_mode,
+                route=route_meta,
             ),
             status="error",
             backend="none",
@@ -2357,7 +2857,7 @@ async def _web_search_impl(
             mode=effective_mode,
         )
     if not query:
-        timings_ms = _default_timings_ms()
+        timings_ms = _default_timings_ms(route.providers)
         timings_ms["total"] = round((time.monotonic() - started) * 1000, 1)
         return _finish_search(
             _search_error_payload(
@@ -2366,6 +2866,7 @@ async def _web_search_impl(
                 timings_ms=timings_ms,
                 mode=effective_mode,
                 search_mode=effective_mode,
+                route=route_meta,
             ),
             status="error",
             backend="none",
@@ -2375,7 +2876,7 @@ async def _web_search_impl(
             mode=effective_mode,
         )
     if len(query) > MAX_QUERY_CHARS:
-        timings_ms = _default_timings_ms()
+        timings_ms = _default_timings_ms(route.providers)
         timings_ms["total"] = round((time.monotonic() - started) * 1000, 1)
         return _finish_search(
             _search_error_payload(
@@ -2384,6 +2885,7 @@ async def _web_search_impl(
                 timings_ms=timings_ms,
                 mode=effective_mode,
                 search_mode=effective_mode,
+                route=route_meta,
             ),
             status="error",
             backend="none",
@@ -2397,7 +2899,7 @@ async def _web_search_impl(
     # index is not yet wired, so refuse with a structured error rather than
     # leak the query to any provider.
     if effective_mode == "sensitive":
-        timings_ms = _default_timings_ms()
+        timings_ms = _default_timings_ms(route.providers)
         timings_ms["total"] = round((time.monotonic() - started) * 1000, 1)
         return _finish_search(
             _search_error_payload(
@@ -2408,6 +2910,7 @@ async def _web_search_impl(
                 provider_states={},
                 mode=effective_mode,
                 search_mode=effective_mode,
+                route=route_meta,
             ),
             status="error",
             backend="none",
@@ -2418,7 +2921,7 @@ async def _web_search_impl(
         )
 
     cache_variant = _search_cache_variant(
-        requested, effective_mode, effective_intent
+        requested, effective_mode, effective_intent, route.label
     )
     cache = _get_cache()
     try:
@@ -2450,7 +2953,7 @@ async def _web_search_impl(
             and cached_status in {"ok", "degraded"}
             and (cached_results or bool(cached.get("answer")))
         ):
-            timings_ms = _default_timings_ms()
+            timings_ms = _default_timings_ms(route.providers)
             timings_ms["total"] = round((time.monotonic() - started) * 1000, 1)
             backend = str(cached.get("backend") or _result_backend(cached_results))
             rendered = _format_results(
@@ -2468,6 +2971,7 @@ async def _web_search_impl(
                 citations=cached.get("citations"),
                 mode=effective_mode,
                 search_mode=effective_mode,
+                route=route_meta,
                 cache_hit=True,
                 cache_age_seconds=cache_hit.age_seconds,
             )
@@ -2483,84 +2987,108 @@ async def _web_search_impl(
             )
 
     candidate_limit = min(MAX_NUM_RESULTS, requested * RESULT_OVERFETCH_FACTOR)
-    provider = _PROVIDERS[0]
-    remaining = SEARCH_TOTAL_TIMEOUT - (time.monotonic() - started)
-    if remaining <= 0:
-        circuit = _breaker.snapshot(provider.name)
-        outcome = _BackendOutcome(
-            backend=provider.name,
-            state="timeout",
-            error="total deadline exceeded",
-            circuit_before=str(circuit["state"]),
-            circuit_after=str(circuit["state"]),
-            circuit_failures=int(circuit["consecutive_failures"]),
-        )
-    else:
-        outcome = await _run_backend(
-            provider.name,
-            _provider_search(provider, query, candidate_limit, effective_intent),
-            min(provider.timeout, remaining),
-        )
+    outcomes: list[_BackendOutcome] = []
+    results: list[dict[str, Any]] = []
+    served: _BackendOutcome | None = None
+    # Serial fallback: the next provider runs only when the previous one
+    # returned nothing usable, inside the same total deadline.
+    for name in route.providers:
+        provider = _provider_named(name)
+        if provider is None:
+            continue
+        remaining = SEARCH_TOTAL_TIMEOUT - (time.monotonic() - started)
+        if remaining <= 0:
+            circuit = _breaker.snapshot(name)
+            outcome = _BackendOutcome(
+                backend=name,
+                state="timeout",
+                error="total deadline exceeded",
+                circuit_before=str(circuit["state"]),
+                circuit_after=str(circuit["state"]),
+                circuit_failures=int(circuit["consecutive_failures"]),
+            )
+        else:
+            outcome = await _run_backend(
+                name,
+                _provider_search(provider, query, candidate_limit, effective_intent),
+                min(provider.timeout, remaining),
+            )
+        outcomes.append(outcome)
+        results = _dedupe_and_rank(outcome.results, requested)
+        if results:
+            served = outcome
+            break
 
-    results = _dedupe_and_rank(outcome.results, requested)
-    attempted = _attempted_providers([outcome])
-    provider_states = {outcome.backend: outcome.state}
-    timings_ms = _timings(started, [outcome])
-    backend = outcome.backend if results else "none"
-    fallback_reason: str | None = None
-    if results:
-        status = "degraded" if outcome.state == "degraded" else "ok"
+    first = outcomes[0] if outcomes else _BackendOutcome(backend="none", error="no provider")
+    last = outcomes[-1] if outcomes else first
+    attempted = _attempted_providers(outcomes)
+    provider_states = {outcome.backend: outcome.state for outcome in outcomes}
+    timings_ms = _timings(started, list(outcomes), route.providers)
+    backend = served.backend if served is not None else "none"
+    # A later provider served the results: say why the first one did not.
+    fallback_reason: str | None = (
+        _fallback_reason(first) if served is not None and served is not first else None
+    )
+    if served is not None:
+        status = "degraded" if served.state == "degraded" else "ok"
         rendered = _format_results(
             query,
             results,
-            outcome.suggestions,
+            served.suggestions,
             status=status,
             backend=backend,
             attempted=attempted,
+            fallback_reason=fallback_reason,
             timings_ms=timings_ms,
-            unresponsive_engines=outcome.unresponsive_engines,
+            unresponsive_engines=served.unresponsive_engines,
             provider_states=provider_states,
-            answer=outcome.answer or None,
-            citations=outcome.citations or None,
+            answer=served.answer or None,
+            citations=served.citations or None,
             mode=effective_mode,
             search_mode=effective_mode,
+            route=route_meta,
         )
-    elif outcome.ok:
-        status = "degraded" if outcome.state == "degraded" else "empty"
-        fallback_reason = f"{outcome.backend}_degraded" if status == "degraded" else None
+    elif any(outcome.ok for outcome in outcomes):
+        status = "degraded" if last.state == "degraded" else "empty"
+        if status == "degraded":
+            fallback_reason = f"{last.backend}_degraded"
+        elif len(outcomes) > 1:
+            fallback_reason = _fallback_reason(first)
         rendered = _format_results(
             query,
             [],
-            outcome.suggestions,
+            last.suggestions,
             status=status,
             backend="none",
             attempted=attempted,
             fallback_reason=fallback_reason,
             timings_ms=timings_ms,
-            unresponsive_engines=outcome.unresponsive_engines,
+            unresponsive_engines=last.unresponsive_engines,
             provider_states=provider_states,
             mode=effective_mode,
             search_mode=effective_mode,
+            route=route_meta,
         )
     else:
         status = "error"
-        fallback_reason = _fallback_reason(outcome)
-        error_message = (
-            "Search error: all configured providers failed."
-            if effective_mode == "maximum_recall"
-            else "Search error: Brave search failed and no fallback provider is configured."
-        )
+        fallback_reason = _fallback_reason(first)
+        if effective_mode == "maximum_recall" or len(route.providers) > 1:
+            error_message = "Search error: all configured providers failed."
+        else:
+            name = route.providers[0].capitalize() if route.providers else "Search"
+            error_message = f"Search error: {name} search failed and no fallback provider is configured."
         rendered = _search_error_payload(
             query,
             error_message,
-            outcome.suggestions,
+            last.suggestions,
             attempted=attempted,
             fallback_reason=fallback_reason,
             timings_ms=timings_ms,
-            unresponsive_engines=outcome.unresponsive_engines,
+            unresponsive_engines=last.unresponsive_engines,
             provider_states=provider_states,
             mode=effective_mode,
             search_mode=effective_mode,
+            route=route_meta,
         )
     return _finish_search(
         rendered,
@@ -2570,7 +3098,7 @@ async def _web_search_impl(
         result_count=len(results),
         fallback_reason=fallback_reason,
         timings_ms=timings_ms,
-        outcomes=[outcome],
+        outcomes=list(outcomes),
         mode=effective_mode,
         cache_query=query,
         cache_variant=cache_variant,
@@ -2585,7 +3113,7 @@ async def web_search(
     mode: str | None = None,
     intent: SearchIntent = "general",
 ) -> str:
-    """Search the Brave web index.
+    """Search the web (Brave or Parallel, per the broker's configured route).
 
     Optional `mode` selects the ADR 0002 routing mode: `normal` (default),
     `sensitive` (no external egress; refuses without a local corpus), or
@@ -2598,7 +3126,15 @@ async def web_search(
     )
 
 
-def _batch_error_payload(message: str, started: float, requested: int) -> str:
+def _effective_search_mode(mode: str | None) -> str:
+    effective = (mode or _SEARCH_MODE).strip().lower()
+    return effective if effective in {"normal", "sensitive", "maximum_recall"} else "normal"
+
+
+def _batch_error_payload(
+    message: str, started: float, requested: int, mode: str | None = None
+) -> str:
+    effective_mode = mode or _SEARCH_MODE
     timings_ms = {"total": round((time.monotonic() - started) * 1000, 1)}
     _record_search_telemetry(
         status="error",
@@ -2608,7 +3144,7 @@ def _batch_error_payload(message: str, started: float, requested: int) -> str:
         fallback_reason=None,
         total_latency_ms=float(timings_ms["total"]),
         outcomes=[],
-        mode=_SEARCH_MODE,
+        mode=effective_mode,
     )
     return json.dumps(
         {
@@ -2618,7 +3154,7 @@ def _batch_error_payload(message: str, started: float, requested: int) -> str:
             "duplicates_ignored": 0,
             "results": [],
             "timings_ms": timings_ms,
-            "mode": _SEARCH_MODE,
+            "mode": effective_mode,
         }
     )
 
@@ -2630,7 +3166,14 @@ def _compact_batch_item(rendered: str) -> dict[str, Any]:
     return payload
 
 
-def _batch_timeout_item(query: str, requested: int, elapsed_ms: float) -> dict[str, Any]:
+def _batch_timeout_item(
+    query: str,
+    requested: int,
+    elapsed_ms: float,
+    mode: str | None = None,
+    names: tuple[str, ...] | None = None,
+) -> dict[str, Any]:
+    effective_mode = mode or _SEARCH_MODE
     _record_search_telemetry(
         status="timeout",
         backend="none",
@@ -2639,7 +3182,7 @@ def _batch_timeout_item(query: str, requested: int, elapsed_ms: float) -> dict[s
         fallback_reason="batch_deadline",
         total_latency_ms=elapsed_ms,
         outcomes=[],
-        mode=_SEARCH_MODE,
+        mode=effective_mode,
     )
     return {
         "query": query,
@@ -2649,8 +3192,8 @@ def _batch_timeout_item(query: str, requested: int, elapsed_ms: float) -> dict[s
         "backend": "none",
         "attempted": [],
         "fallback_reason": "batch_deadline",
-        "timings_ms": {**_default_timings_ms(), "total": elapsed_ms},
-        "mode": _SEARCH_MODE,
+        "timings_ms": {**_default_timings_ms(names), "total": elapsed_ms},
+        "mode": effective_mode,
         "unresponsive_engines": [],
         "provider_states": {},
         "error": "Search error: batch deadline exceeded.",
@@ -2659,25 +3202,39 @@ def _batch_timeout_item(query: str, requested: int, elapsed_ms: float) -> dict[s
 
 @mcp.tool()
 async def batch_web_search(
-    queries: BatchQueries, num_results: int = 8, intent: SearchIntent = "general"
+    queries: BatchQueries,
+    num_results: int = 8,
+    intent: SearchIntent = "general",
+    mode: str | None = None,
 ) -> str:
-    """Run up to three searches with one explicit general/current/news intent."""
+    """Run up to three searches with one explicit general/current/news intent.
+
+    Optional `mode` is the same routing mode as web_search; `sensitive` makes no
+    external call.
+    """
     started = time.monotonic()
     requested = min(MAX_NUM_RESULTS, max(1, int(num_results)))
+    effective_mode = _effective_search_mode(mode)
+    # One route for the whole batch, so a settings switch never mixes providers.
+    route = _resolve_search_route()
     effective_intent = str(intent or "general").strip().lower()
     if effective_intent not in SEARCH_INTENTS:
         return _batch_error_payload(
             "Batch search error: intent must be one of: general, current, news.",
             started,
             requested,
+            effective_mode,
         )
     if not queries:
-        return _batch_error_payload("Batch search error: queries must not be empty.", started, requested)
+        return _batch_error_payload(
+            "Batch search error: queries must not be empty.", started, requested, effective_mode
+        )
     if len(queries) > BATCH_MAX_QUERIES:
         return _batch_error_payload(
             f"Batch search error: at most {BATCH_MAX_QUERIES} queries are allowed.",
             started,
             requested,
+            effective_mode,
         )
 
     normalized: list[str] = []
@@ -2690,12 +3247,14 @@ async def batch_web_search(
                 "Batch search error: queries must not contain empty values.",
                 started,
                 requested,
+                effective_mode,
             )
         if len(query) > BATCH_MAX_QUERY_CHARS:
             return _batch_error_payload(
                 f"Batch search error: each query must be at most {BATCH_MAX_QUERY_CHARS} characters.",
                 started,
                 requested,
+                effective_mode,
             )
         key = query.casefold()
         if key in seen:
@@ -2709,12 +3268,13 @@ async def batch_web_search(
     async def run_one(query: str) -> dict[str, Any]:
         try:
             async with semaphore:
-                if effective_intent == "general":
-                    rendered = await _web_search_impl(query, requested)
-                else:
-                    rendered = await _web_search_impl(
-                        query, requested, intent=effective_intent
-                    )
+                rendered = await _web_search_impl(
+                    query,
+                    requested,
+                    mode=effective_mode,
+                    intent=effective_intent,
+                    route=route,
+                )
                 return _compact_batch_item(rendered)
         except asyncio.CancelledError:
             raise
@@ -2729,7 +3289,7 @@ async def batch_web_search(
                 fallback_reason=None,
                 total_latency_ms=elapsed_ms,
                 outcomes=[],
-                mode=_SEARCH_MODE,
+                mode=effective_mode,
             )
             return {
                 "query": query,
@@ -2739,8 +3299,8 @@ async def batch_web_search(
                 "backend": "none",
                 "attempted": [],
                 "fallback_reason": None,
-                "timings_ms": {**_default_timings_ms(), "total": elapsed_ms},
-                "mode": _SEARCH_MODE,
+                "timings_ms": {**_default_timings_ms(route.providers), "total": elapsed_ms},
+                "mode": effective_mode,
                 "unresponsive_engines": [],
                 "provider_states": {},
                 "error": "Search error: internal batch item failure.",
@@ -2766,7 +3326,9 @@ async def batch_web_search(
         if task in done and not task.cancelled():
             items.append(task.result())
         else:
-            items.append(_batch_timeout_item(query, requested, elapsed_ms))
+            items.append(
+                _batch_timeout_item(query, requested, elapsed_ms, effective_mode, route.providers)
+            )
 
     failed = sum(item.get("status") in {"error", "timeout"} for item in items)
     if failed == 0:
@@ -2782,20 +3344,43 @@ async def batch_web_search(
             "duplicates_ignored": duplicates_ignored,
             "results": items,
             "timings_ms": {"total": elapsed_ms},
-            "mode": _SEARCH_MODE,
+            "mode": effective_mode,
         }
     )
 
 
 @mcp.tool()
-async def image_search(query: str, num_results: int = 8) -> str:
-    """Search public image metadata through Brave with strict SafeSearch."""
+async def image_search(query: str, num_results: int = 8, mode: str | None = None) -> str:
+    """Search public image metadata through Brave with strict SafeSearch.
+
+    Optional `mode` is the same routing mode as web_search; `sensitive` makes no
+    external call.
+    """
     started = time.monotonic()
     safe_search = "strict"
     query = query.strip()
     requested = min(MAX_NUM_RESULTS, max(1, int(num_results)))
+    if _effective_search_mode(mode) == "sensitive":
+        timings_ms = {"total": round((time.monotonic() - started) * 1000, 1), "brave": None}
+        return _finish_search(
+            _search_error_payload(
+                query,
+                "Image search error: sensitive/no-egress mode forbids external search.",
+                timings_ms=timings_ms,
+                attempted=[],
+                provider_states={},
+                mode="sensitive",
+                safe_search=safe_search,
+            ),
+            status="error",
+            backend="none",
+            requested_count=requested,
+            result_count=0,
+            timings_ms=timings_ms,
+            mode="sensitive",
+        )
     if not query:
-        timings_ms = _default_timings_ms()
+        timings_ms = _default_timings_ms(("brave",))
         timings_ms["total"] = round((time.monotonic() - started) * 1000, 1)
         return _finish_search(
             _search_error_payload(
@@ -2813,7 +3398,7 @@ async def image_search(query: str, num_results: int = 8) -> str:
             mode="disabled",
         )
     if len(query) > MAX_QUERY_CHARS:
-        timings_ms = _default_timings_ms()
+        timings_ms = _default_timings_ms(("brave",))
         timings_ms["total"] = round((time.monotonic() - started) * 1000, 1)
         return _finish_search(
             _search_error_payload(
@@ -2841,7 +3426,7 @@ async def image_search(query: str, num_results: int = 8) -> str:
         min(BRAVE_TIMEOUT, SEARCH_TOTAL_TIMEOUT),
     )
     results = _dedupe_and_rank_images(outcome.results, requested)
-    timings_ms = _timings(started, [outcome])
+    timings_ms = _timings(started, [outcome], ("brave",))
     provider_states = {outcome.backend: outcome.state}
     attempted = _attempted_providers([outcome])
     fallback_reason: str | None = None

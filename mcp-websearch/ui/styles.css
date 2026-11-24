@@ -302,8 +302,54 @@ nav {
 .tier-card dd { margin: 0; text-align: right; font-family: var(--mono); font-size: 11px; }
 .tier-signals { margin: 14px 0 0; color: var(--amber); font: 10px/1.4 var(--mono); }
 
+/* Search route switch */
+.route { margin-top: 20px; }
+.route-row { display: flex; align-items: center; justify-content: space-between; gap: 24px; }
+.route-detail { margin: 10px 0 0; color: var(--muted); font-size: 13px; line-height: 1.5; }
+.route-note { margin: 16px 0 0; padding-top: 14px; border-top: 1px solid var(--line-soft); color: var(--faint); font: 10px/1.5 var(--mono); }
+.route-note:empty { display: none; }
+
+.switch {
+  display: inline-flex;
+  align-items: center;
+  gap: 12px;
+  flex: none;
+  padding: 6px;
+  border: 0;
+  background: none;
+  color: var(--muted);
+  font: 600 11px/1 var(--mono);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  cursor: pointer;
+}
+.switch .track {
+  position: relative;
+  width: 52px;
+  height: 28px;
+  border: 1px solid var(--line);
+  border-radius: 99px;
+  background: #151916;
+  transition: background 0.2s, border-color 0.2s;
+}
+.switch .thumb {
+  position: absolute;
+  top: 3px;
+  left: 3px;
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  background: var(--faint);
+  transition: transform 0.2s, background 0.2s;
+}
+.switch[aria-checked="true"] { color: var(--green); }
+.switch[aria-checked="true"] .track { background: rgba(131, 224, 143, 0.14); border-color: #315139; }
+.switch[aria-checked="true"] .thumb { transform: translateX(24px); background: var(--green); }
+.switch:focus-visible { outline: 2px solid var(--green); outline-offset: 3px; border-radius: 99px; }
+.switch:disabled { opacity: 0.45; cursor: not-allowed; }
+
 /* Provider details */
-.details { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+.details { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
 .rows { display: grid; grid-template-columns: 1fr 1fr; }
 .rows div { padding: 16px 0; border-bottom: 1px solid var(--line-soft); }
 .rows div:nth-child(odd) { padding-right: 18px; border-right: 1px solid var(--line-soft); }
@@ -396,6 +442,11 @@ footer {
   .panel-head { flex-direction: column; gap: 10px; }
   .hint { text-align: left; }
   footer { flex-direction: column; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .switch .track,
+  .switch .thumb { transition: none; }
 }
 
 @media (prefers-reduced-motion: no-preference) {

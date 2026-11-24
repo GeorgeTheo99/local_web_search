@@ -27,7 +27,7 @@ from typing import Any
 from starlette.middleware import Middleware
 from starlette.responses import PlainTextResponse
 
-from server import _get_telemetry, mcp
+from server import _get_telemetry, mcp, set_ingress
 
 MCP_BIND_HOST = "127.0.0.1"
 MCP_PORT = int(os.environ.get("MCP_PORT", "8889"))
@@ -170,6 +170,8 @@ def main() -> None:
     tailnet_host = None
     if args.tailnet:
         tailnet_host = validate_tailnet_host(os.environ.get("MCP_TAILNET_HOST", ""))
+        # Tailnet callers never pin a provider or change settings.
+        set_ingress("tailnet")
     app = build_app(tailnet_host=tailnet_host)
     # Initialize private SQLite state before accepting search requests.
     _get_telemetry()

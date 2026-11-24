@@ -76,7 +76,7 @@ def _reset_runtime_state(monkeypatch, tmp_path):
 async def test_batch_search_deduplicates_preserves_order_and_compacts(monkeypatch):
     seen: list[str] = []
 
-    async def fake_search(query: str, num_results: int = 8) -> str:
+    async def fake_search(query: str, num_results: int = 8, **_kwargs: Any) -> str:
         seen.append(query)
         await asyncio.sleep(0)
         return _single_payload(query)
@@ -135,7 +135,7 @@ async def test_batch_search_bounds_concurrency(monkeypatch):
     maximum = 0
     lock = asyncio.Lock()
 
-    async def fake_search(query: str, num_results: int = 8) -> str:
+    async def fake_search(query: str, num_results: int = 8, **_kwargs: Any) -> str:
         nonlocal active, maximum
         async with lock:
             active += 1
@@ -159,7 +159,7 @@ async def test_batch_search_returns_partial_results_at_shared_deadline(
     monkeypatch.setattr(srv, "SEARCH_TOTAL_TIMEOUT", 0.05)
     monkeypatch.setattr(srv, "_SEARCH_MODE", "sensitive")
 
-    async def fake_search(query: str, num_results: int = 8) -> str:
+    async def fake_search(query: str, num_results: int = 8, **_kwargs: Any) -> str:
         if query == "fast":
             await asyncio.sleep(0.005)
             return _single_payload(query)
@@ -194,7 +194,7 @@ async def test_batch_search_cancels_children_when_caller_cancels(monkeypatch):
     started = asyncio.Event()
     cancelled = 0
 
-    async def fake_search(query: str, num_results: int = 8) -> str:
+    async def fake_search(query: str, num_results: int = 8, **_kwargs: Any) -> str:
         nonlocal cancelled
         started.set()
         try:

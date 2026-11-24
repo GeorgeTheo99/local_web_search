@@ -5,6 +5,7 @@
 const ENDPOINTS = {
   health: 'health',
   config: 'config',
+  settings: 'settings',
   stats: windowName => `stats?window=${windowName}`,
   activity: windowName => `activity?window=${windowName}`,
 };
@@ -34,6 +35,14 @@ const bytes = value => {
   if (n >= 1024) return `${+(n / 1024).toFixed(1)} KiB`;
   return `${n} B`;
 };
+const usd = value => `$${number(value).toFixed(3)}`;
+const PROVIDER_NAMES = { brave: 'Brave', parallel: 'Parallel' };
+const providerName = name => PROVIDER_NAMES[name] || name;
+const routeText = providers => (providers || []).map(providerName).join(' → ') || 'none';
+// Settings writes are same-origin loopback only; the directory's proxied copy
+// of this page is read-only.
+const LOOPBACK_PAGE = ['127.0.0.1', 'localhost', '[::1]', '::1'].includes(location.hostname);
+let switching = false;
 const yesNo = value => (value ? 'Yes' : 'No');
 const present = value => (value ? 'Configured' : 'Missing');
 const set = (id, value) => { $(id).textContent = value; };
@@ -98,7 +107,11 @@ function providerAlerts(label, m) {
 
 function attentionItems(health, config, stats24) {
   const items = [];
-  if (!health.ready) items.push({ level: 'critical', text: 'Brave is not ready — check the credential or circuit breaker.' });
+  const route = (health.route || {}).providers || ['brave'];
+  if (!health.ready) items.push({ level: 'critical', text: `${routeText(route)} is not ready — check the credential or circuit breaker.` });
+  if ((health.route || {}).default_provider === 'parallel' && !route.includes('parallel')) {
+    items.push({ level: 'warn', text: 'Parallel is switched on but has no credential; searches use Brave.' });
+  }
   else if (health.status === 'degraded') items.push({ level: 'warn', text: 'The most recent search finished degraded or with an error.' });
   const decodoConfig = ((config || {}).fetch || {}).decodo || {};
   // Decodo is optional: without a credential the chain is simply direct → Jina.
@@ -108,10 +121,13 @@ function attentionItems(health, config, stats24) {
   if (!stats24 || !stats24.available) return items;
   const attempts = (stats24.fetches || {}).attempts || {};
   const brave = providerMetrics((stats24.providers || {}).brave, { failureKey: 'attempt_errors' });
+  const parallel = providerMetrics((stats24.providers || {}).parallel, { failureKey: 'attempt_errors' });
   const decodo = providerMetrics(attempts.decodo);
   const jina = providerMetrics(attempts.jina);
   const jinaRecovered = ((config || {}).fetch || {}).jina?.enabled && jina.requests > jina.failures;
   providerAlerts('Brave', brave).forEach(text => items.push({ level: 'critical', text }));
+  // Brave catches Parallel failures, so they are a warning, not an outage.
+  providerAlerts('Parallel', parallel).forEach(text => items.push({ level: 'warn', text }));
   providerAlerts('Decodo', decodo).forEach(text => {
     const recoverable = text.includes('attempts failed') && jinaRecovered;
     items.push({ level: recoverable ? 'info' : 'warn', text: recoverable ? `${text} (Jina recovered later attempts)` : text });
@@ -155,21 +171,78 @@ function renderMetrics(stats) {
   set('cache-detail', `Search ${count(searchCache.hits)} hits · fetch ${percent(fetchCache.hit_rate)}`);
 }
 
-function renderProvider(health, stats) {
-  const provider = (health.providers || []).find(item => item.name === 'brave') || {};
-  const providerStats = (stats.providers || {}).brave || {};
+function renderProvider(name, health, stats, config) {
+  const provider = (health.providers || []).find(item => item.name === name) || {};
+  const providerStats = (stats.providers || {})[name] || {};
   const circuit = provider.circuit || {};
-  const fallback = stats.fallback || {};
-  set('credential', provider.credential_usable ? 'Usable' : provider.credential_configured ? 'Configured · unusable' : 'Missing');
-  set('circuit', circuit.state ? `${circuit.state}${number(circuit.consecutive_failures) ? ` · ${circuit.consecutive_failures} failures` : ''}` : 'Unknown');
-  set('attempts', count(providerStats.attempts));
-  set('provider-errors', count(providerStats.attempt_errors));
-  set('provider-latency', ms((providerStats.latency_ms || {}).average));
-  set('fallback', `${percent(fallback.rate)} · ${count(fallback.searches)} searches`);
-  const badge = $('provider-state');
-  if (provider.credential_usable && circuit.state !== 'open') { badge.textContent = 'Available'; badge.className = 'badge ok'; }
-  else if (provider.credential_configured) { badge.textContent = 'Attention'; badge.className = 'badge warn'; }
-  else { badge.textContent = 'Unavailable'; badge.className = 'badge down'; }
+  const inRoute = ((health.route || {}).providers || []).includes(name);
+  set(`${name}-credential`, provider.credential_usable ? 'Usable' : provider.credential_configured ? 'Configured · unusable' : 'Missing');
+  set(`${name}-circuit`, circuit.state ? `${circuit.state}${number(circuit.consecutive_failures) ? ` · ${circuit.consecutive_failures} failures` : ''}` : 'Unknown');
+  set(`${name}-attempts`, count(providerStats.attempts));
+  set(`${name}-provider-errors`, count(providerStats.attempt_errors));
+  set(`${name}-provider-latency`, ms((providerStats.latency_ms || {}).average));
+  if (name === 'brave') {
+    const fallback = stats.fallback || {};
+    set('fallback', `${percent(fallback.rate)} · ${count(fallback.searches)} searches`);
+  } else {
+    const settings = ((config || {}).search || {})[name] || {};
+    set(`${name}-cost`, settings.cost_usd_per_search === undefined ? '—' : `${usd(settings.cost_usd_per_search)} · ${settings.mode || ''} mode`);
+  }
+  const badge = $(`${name}-provider-state`);
+  if (!provider.credential_configured) { badge.textContent = 'No credential'; badge.className = 'badge down'; }
+  else if (!provider.credential_usable || circuit.state === 'open') { badge.textContent = 'Attention'; badge.className = 'badge warn'; }
+  else if (!inRoute) { badge.textContent = 'Off'; badge.className = 'badge'; }
+  else { badge.textContent = 'In use'; badge.className = 'badge ok'; }
+}
+
+function renderRoute(health, config) {
+  const route = (config && config.route) || health.route || {};
+  const providers = route.providers || [];
+  const on = route.default_provider === 'parallel';
+  const parallelConfig = ((config || {}).search || {}).parallel || {};
+  const braveConfig = ((config || {}).search || {}).brave || {};
+  const hasKey = Boolean(parallelConfig.credential_configured);
+  const toggle = $('parallel-switch');
+  toggle.setAttribute('aria-checked', String(on));
+  set('parallel-switch-label', on ? 'On' : 'Off');
+  set('lede', `${routeText(providers)} search with direct → Decodo → Jina page retrieval. Query text is never stored.`);
+  if (on && providers[0] === 'parallel') {
+    set('route-detail', `Parallel first (${parallelConfig.mode || 'fast'} mode, ${usd(parallelConfig.cost_usd_per_search)} a search), Brave if it fails or finds nothing.`);
+  } else if (on) {
+    set('route-detail', 'Switched on, but Parallel has no credential, so searches use Brave only.');
+  } else {
+    set('route-detail', `Brave only (${usd(braveConfig.cost_usd_per_search)} a search). Image search always uses Brave.`);
+  }
+  let note = '';
+  if (!LOOPBACK_PAGE) note = 'Read-only here. Switch it at http://127.0.0.1:8889/ui on the server, or run: local-search route set parallel';
+  else if (route.settings_writable === false) note = 'This listener cannot change settings.';
+  else if (!on && !hasKey) note = 'Add an owner-only data/parallel_key file to switch Parallel on.';
+  else note = 'Applies to the next search from every client. A client can still pin one provider with the X-Search-Provider header.';
+  set('route-note', note);
+  toggle.disabled = switching || !LOOPBACK_PAGE || route.settings_writable === false || (!on && !hasKey);
+}
+
+async function setParallel(on) {
+  switching = true;
+  $('parallel-switch').disabled = true;
+  try {
+    const response = await fetch(ENDPOINTS.settings, {
+      method: 'POST',
+      cache: 'no-store',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ search_provider: on ? 'parallel' : 'brave' }),
+      signal: AbortSignal.timeout(8000),
+    });
+    if (!response.ok) {
+      const detail = await response.json().catch(() => ({}));
+      throw new Error(detail.error || `settings returned HTTP ${response.status}`);
+    }
+  } catch (error) {
+    showError(`Could not switch the search route: ${error.message}`);
+  } finally {
+    switching = false;
+    await load();
+  }
 }
 
 function renderLastSearch(health) {
@@ -283,13 +356,16 @@ function renderConfig(config) {
   if (!config) return;
   const search = config.search || {};
   const brave = search.brave || {};
+  const parallel = search.parallel || {};
+  const route = config.route || {};
   const breaker = search.circuit_breaker || {};
   const fetchConfig = config.fetch || {};
   const decodo = fetchConfig.decodo || {};
   const jina = fetchConfig.jina || {};
   const groups = [
     ['Search', [
-      ['Provider stack', config.provider_stack],
+      ['Route', routeText(route.providers)],
+      ['Default provider', providerName(route.default_provider)],
       ['Routing mode', search.mode],
       ['Total budget', seconds(search.total_timeout_s)],
       ['Max results', count(search.max_results)],
@@ -298,9 +374,16 @@ function renderConfig(config) {
       ['Batch', `${count(search.batch_max_queries)} queries · ${count(search.batch_max_concurrency)} parallel`],
       ['Circuit breaker', `${count(breaker.failure_threshold)} failures · ${seconds(breaker.cooldown_s)} cooldown`],
     ]],
+    ['Parallel', [
+      ['Credential', parallel.credential_usable ? 'Usable' : present(parallel.credential_configured)],
+      ['Mode', parallel.mode],
+      ['Timeout', seconds(parallel.timeout_s)],
+      ['Cost per search', usd(parallel.cost_usd_per_search)],
+    ]],
     ['Brave', [
       ['Credential', brave.credential_usable ? 'Usable' : present(brave.credential_configured)],
       ['Timeout', seconds(brave.timeout_s)],
+      ['Cost per search', usd(brave.cost_usd_per_search)],
     ]],
     ['Fetch', [
       ['Fallback order', (fetchConfig.fallback_order || []).join(' → ')],
@@ -357,7 +440,9 @@ async function load() {
     renderState(healthData, items);
     renderAttention(items);
     renderMetrics(statsData);
-    renderProvider(healthData, statsData);
+    renderRoute(healthData, configData);
+    renderProvider('parallel', healthData, statsData, configData);
+    renderProvider('brave', healthData, statsData, configData);
     renderLastSearch(healthData);
     renderTiers(statsData, configData);
     renderConfig(configData);
@@ -383,5 +468,8 @@ $('windows').addEventListener('click', event => {
   load();
 });
 $('refresh').addEventListener('click', load);
+$('parallel-switch').addEventListener('click', event => {
+  setParallel(event.currentTarget.getAttribute('aria-checked') !== 'true');
+});
 load();
 setInterval(() => { if (!document.hidden) load(); }, REFRESH_MS);

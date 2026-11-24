@@ -16,7 +16,7 @@
     <div>
       <p class="kicker">Private search infrastructure</p>
       <h1>Local Search</h1>
-      <p class="lede">Brave-backed search with direct → Decodo → Jina page retrieval. Query text is never stored.</p>
+      <p class="lede" id="lede">Web search with direct → Decodo → Jina page retrieval. Query text is never stored.</p>
     </div>
     <div class="state" id="state" aria-live="polite"><i></i><span>Connecting</span></div>
   </header>
@@ -24,6 +24,21 @@
   <section class="attention" id="attention" aria-label="Attention required" hidden>
     <p class="label">Needs attention</p>
     <ul id="attention-list"></ul>
+  </section>
+
+  <section class="panel route" aria-labelledby="route-title">
+    <div class="route-row">
+      <div>
+        <p class="label">Search route</p>
+        <h2 id="route-title">Parallel search</h2>
+        <p class="route-detail" id="route-detail">Checking the configured route…</p>
+      </div>
+      <button type="button" class="switch" id="parallel-switch" role="switch" aria-checked="false" aria-labelledby="route-title" aria-describedby="route-detail route-note" disabled>
+        <span class="track" aria-hidden="true"><span class="thumb"></span></span>
+        <span class="switch-label" id="parallel-switch-label">Off</span>
+      </button>
+    </div>
+    <p class="route-note" id="route-note"></p>
   </section>
 
   <nav aria-label="Telemetry window">
@@ -64,13 +79,24 @@
 
   <section class="details">
     <article class="panel">
-      <div class="panel-head"><div><p class="label">Search provider</p><h2>Brave Search</h2></div><span class="badge" id="provider-state">Checking</span></div>
+      <div class="panel-head"><div><p class="label">Search provider</p><h2>Parallel</h2></div><span class="badge" id="parallel-provider-state">Checking</span></div>
       <div class="rows">
-        <div><span>Credential</span><strong id="credential">—</strong></div>
-        <div><span>Circuit</span><strong id="circuit">—</strong></div>
-        <div><span>Attempts</span><strong id="attempts">—</strong></div>
-        <div><span>Provider errors</span><strong id="provider-errors">—</strong></div>
-        <div><span>Provider latency</span><strong id="provider-latency">—</strong></div>
+        <div><span>Credential</span><strong id="parallel-credential">—</strong></div>
+        <div><span>Circuit</span><strong id="parallel-circuit">—</strong></div>
+        <div><span>Attempts</span><strong id="parallel-attempts">—</strong></div>
+        <div><span>Provider errors</span><strong id="parallel-provider-errors">—</strong></div>
+        <div><span>Provider latency</span><strong id="parallel-provider-latency">—</strong></div>
+        <div><span>Cost per search</span><strong id="parallel-cost">—</strong></div>
+      </div>
+    </article>
+    <article class="panel">
+      <div class="panel-head"><div><p class="label">Search provider</p><h2>Brave Search</h2></div><span class="badge" id="brave-provider-state">Checking</span></div>
+      <div class="rows">
+        <div><span>Credential</span><strong id="brave-credential">—</strong></div>
+        <div><span>Circuit</span><strong id="brave-circuit">—</strong></div>
+        <div><span>Attempts</span><strong id="brave-attempts">—</strong></div>
+        <div><span>Provider errors</span><strong id="brave-provider-errors">—</strong></div>
+        <div><span>Provider latency</span><strong id="brave-provider-latency">—</strong></div>
         <div><span>Search fallback</span><strong id="fallback">—</strong></div>
       </div>
     </article>

@@ -3,7 +3,7 @@
 Local-first web search and page retrieval for macOS (loopback-only by default):
 
 - **FastMCP broker** on `http://127.0.0.1:8889/mcp`
-- **Brave Search API** for ranked web and image search
+- **Brave Search API** and **Parallel Search** for ranked web search (switchable), Brave for images
 - **Direct-first page retrieval** with optional Decodo and Jina recovery
 - **launchd operator CLI** for install, health, logs, telemetry, and upgrades
 
@@ -16,14 +16,15 @@ query-free operational metadata, and estimated search-provider cost.
 MCP client
   │
   └── 127.0.0.1:8889/mcp
-        ├── web_search ───── Brave Search API
-        ├── batch_web_search Brave, bounded concurrency
+        ├── web_search ───── route: Brave, or Parallel → Brave
+        ├── batch_web_search same route, bounded concurrency
         ├── image_search ─── Brave Images API
         ├── web_fetch ────── cache → direct → Decodo → Jina
         └── verify_url ───── same bounded fetch path with provider attribution
 ```
 
-Brave is the only search provider. SearXNG was retired; old
+Brave is the default search provider; Parallel can be switched on (see
+[Search route](#search-route)). SearXNG was retired; old
 `WEBSEARCH_PROVIDER_STACK` values are ignored by the broker and normalized to
 `brave` by the operator CLI. Historical comparison documents remain evidence,
 not active configuration.
@@ -183,11 +184,63 @@ arguments, MCP request headers, logs, telemetry, or operator output. Decodo
 receives the requested public URL and returned page content. Caller headers,
 cookies, and credentials are never forwarded.
 
+## Search route
+
+The default search provider is a runtime setting in the owner-only
+`$LOCAL_SEARCH_DATA_DIR/settings.json`, re-read on every search, so switching
+needs no restart and applies to both the loopback and tailnet listeners:
+
+| Setting | Searches |
+|---|---|
+| `brave` (built-in default) | Brave only |
+| `parallel` | Parallel (fast mode, $0.001/search) first; Brave when Parallel fails or finds nothing |
+
+Switch it with the **Search route** on/off control on the loopback dashboard
+(`http://127.0.0.1:8889/ui`), or from the CLI:
+
+```bash
+scripts/local-search route              # settings file and live route
+scripts/local-search route set parallel
+scripts/local-search route set brave
+```
+
+The dashboard posts to `POST /settings`, which accepts only a same-origin JSON
+request from the loopback page (exact `Origin` match). The directory's proxied
+copy of the dashboard and the tailnet listener are read-only. Parallel can be
+switched on only when its credential exists; without one the route stays on
+Brave.
+
+A loopback MCP caller may pin one provider for a single request with the
+`X-Search-Provider: brave | parallel | auto` header (no fallback when pinned).
+A provider without a credential is ignored (`route.override_ignored`), and the
+tailnet listener ignores the header. Every search response includes a `route`
+object (`providers`, `source`, `default_provider`, `override`,
+`override_ignored`). Cached results are keyed by route, so a switch never
+serves the other provider's results. Image search always uses Brave.
+
+### Parallel credential
+
+Create an API key at [platform.parallel.ai](https://platform.parallel.ai) and
+store it as an owner-only file (it is file-only, like Decodo's):
+
+```bash
+umask 077
+read -r -s -p 'Parallel API key: ' PARALLEL_KEY; printf '\n'
+printf '%s\n' "$PARALLEL_KEY" > "$LOCAL_SEARCH_DATA_DIR/parallel_key"
+unset PARALLEL_KEY
+chmod 600 "$LOCAL_SEARCH_DATA_DIR/parallel_key"
+```
+
+Parallel's standard terms allow it to use queries and results, not linked to
+an individual, to improve its models; zero data retention needs an enterprise
+agreement. Brave keeps query logs for up to 90 days for billing and abuse
+prevention.
+
 ## MCP tools
 
 ### `web_search(query, num_results=8, mode=None, intent="general")`
 
-Searches Brave. Queries are limited to 512 characters and
+Searches the configured [route](#search-route). Queries are limited to 512 characters and
 results to 20. Provider responses, retries, and total latency are bounded.
 `intent` must be explicit: `general` uses no freshness filter, `current` uses a
 recent window, and `news` uses the narrowest freshness window. Intent is never
@@ -197,9 +250,9 @@ Routing modes:
 
 | Mode | Behavior |
 |---|---|
-| `normal` | Query Brave |
+| `normal` | Query the configured route |
 | `sensitive` | Make no external request; return a structured refusal because no local corpus is configured |
-| `maximum_recall` | Query the complete configured provider inventory—which is currently Brave only |
+| `maximum_recall` | Same as `normal` (the route already falls back across its providers) |
 
 The response includes:
 
@@ -209,21 +262,24 @@ The response includes:
 - `estimated_cost_usd`: sum of configured rates for issued requests
 - `provider_states`, `timings_ms`, `fallback_reason`, and circuit diagnostics
 - `mode` and `search_mode`
+- `route`: providers tried in order and why (settings, default, or override)
 
 Missing credentials, open-circuit skips, and providers excluded by the total
 deadline are not counted as billable attempts. Failed HTTP requests are counted
 because the upstream may still bill them.
 
-### `batch_web_search(queries, num_results=8, intent="general")`
+### `batch_web_search(queries, num_results=8, intent="general", mode=None)`
 
 Runs up to three unique queries with at most two active search pipelines and one
-shared deadline. One explicit `general`, `current`, or `news` intent applies to
-the batch. Output ordering follows input ordering. Partial completions and
+shared deadline. One explicit `general`, `current`, or `news` intent and one
+routing mode apply to the batch, and the route is resolved once for the whole
+batch. Output ordering follows input ordering. Partial completions and
 per-item timeouts remain explicit.
 
-### `image_search(query, num_results=8)`
+### `image_search(query, num_results=8, mode=None)`
 
-Uses Brave Images with `safesearch=strict`. The response includes the actual
+Uses Brave Images with `safesearch=strict`. `sensitive` mode (per call or
+`WEBSEARCH_SEARCH_MODE`) refuses without an external request. The response includes the actual
 backend, request attempts, safety policy, and estimated cost.
 
 ### `web_fetch(url, max_chars=20000)`
@@ -328,6 +384,9 @@ Important environment variables:
 | `WEBSEARCH_SEARCH_MODE` | `normal` |
 | `WEBSEARCH_TOTAL_TIMEOUT` | `18` seconds, hard-capped at 18 |
 | `WEBSEARCH_BRAVE_TIMEOUT` | `8` seconds |
+| `WEBSEARCH_SEARCH_PROVIDER` | `brave`; default before `settings.json` exists |
+| `WEBSEARCH_PARALLEL_TIMEOUT` | `8` seconds |
+| `WEBSEARCH_PARALLEL_MODE` | `fast` (`turbo`, `fast`, `basic`, or `advanced`) |
 | `WEBSEARCH_SEARCH_MAX_BYTES` | `2 MiB` per provider response |
 | `WEBSEARCH_FETCH_MAX_BYTES` | `20 MiB` |
 | `WEBSEARCH_FETCH_TIMEOUT` | `20` seconds (direct tier) |

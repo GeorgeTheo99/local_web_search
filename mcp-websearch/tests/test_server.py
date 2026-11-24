@@ -1436,11 +1436,11 @@ async def test_circuit_breaker_resets_on_success(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_provider_list_default_order_and_names(monkeypatch):
-    """The default provider list is Brave (primary, independent index)."""
+    """The registry lists Brave then Parallel; the default route is Brave only."""
     monkeypatch.setattr(srv, "_PROVIDER_STACK", "brave")
     monkeypatch.setattr(srv, "_PROVIDERS", srv._build_provider_stack())
     names = [p.name for p in srv._PROVIDERS]
-    assert names == ["brave"]
+    assert names == ["brave", "parallel"]
     assert all(p.output == "raw" for p in srv._PROVIDERS)
 
 

@@ -126,7 +126,7 @@ async def test_invalid_batch_intent_returns_structured_error_without_children(
 async def test_batch_threads_explicit_intent_to_each_child(monkeypatch):
     seen: list[tuple[str, str]] = []
 
-    async def fake_search(query, num_results=8, *, intent="general"):
+    async def fake_search(query, num_results=8, *, intent="general", **_kwargs):
         seen.append((query, intent))
         return json.dumps(
             {

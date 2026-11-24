@@ -33,7 +33,7 @@ VALID_WINDOWS = {"24h": 24 * 60 * 60, "7d": 7 * 24 * 60 * 60, "30d": 30 * 24 * 6
 ACTIVITY_BUCKET_SECONDS = {"24h": 60 * 60, "7d": 6 * 60 * 60, "30d": 24 * 60 * 60}
 
 _SEARCH_STATUSES = {"ok", "empty", "degraded", "error", "timeout"}
-_BACKENDS = {"none", "brave"}
+_BACKENDS = {"none", "brave", "parallel"}
 _MODES = {"normal", "sensitive", "maximum_recall", "disabled"}
 _FALLBACK_REASONS = {
     "brave_degraded",
@@ -41,6 +41,11 @@ _FALLBACK_REASONS = {
     "brave_timeout",
     "brave_circuit_open",
     "brave_error",
+    "parallel_degraded",
+    "parallel_empty",
+    "parallel_timeout",
+    "parallel_circuit_open",
+    "parallel_error",
     "batch_deadline",
 }
 _PROVIDER_STATES = {"ok", "empty", "degraded", "error", "timeout", "circuit_open"}
