@@ -2,7 +2,8 @@
 
 Covers:
   - _normalize_parallel_result / _parallel_request_body: result shape, bounded
-    snippets, freshness for current/news intent.
+    snippets, freshness for current/news intent, caller objectives, and
+    keyword queries bounded to Parallel's 200-character limit.
   - _parallel_search: missing key short-circuits; success normalizes results;
     auth failures mark the credential unusable.
   - Route: settings.json default (brave | parallel), Parallel -> Brave
@@ -127,6 +128,38 @@ def test_parallel_request_body_shape_and_freshness():
     assert set(news["advanced_settings"]["source_policy"]) == {"after_date"}
 
 
+def test_parallel_request_body_uses_caller_objective():
+    body = srv._parallel_request_body(
+        "python 3.14 release date", 10, "general", "Find when Python 3.14 shipped."
+    )
+    assert body["objective"] == "Find when Python 3.14 shipped."
+    assert body["search_queries"] == ["python 3.14 release date"]
+
+
+def test_parallel_keyword_query_is_bounded_at_word_breaks():
+    long_query = " ".join(["word"] * 100)
+    bounded = srv._parallel_request_body(long_query, 4, "general")["search_queries"][0]
+    assert len(bounded) <= srv.PARALLEL_MAX_QUERY_CHARS
+    assert bounded.split() == ["word"] * len(bounded.split())
+    assert srv._parallel_keyword_query("x" * 300) == "x" * srv.PARALLEL_MAX_QUERY_CHARS
+    # A space near the start does not shrink the query to one word.
+    near_start = srv._parallel_keyword_query("a " + "x" * 300)
+    assert near_start.startswith("a x") and len(near_start) == srv.PARALLEL_MAX_QUERY_CHARS
+    # The objective keeps the full text when the caller sent none.
+    assert srv._parallel_request_body(long_query, 4, "general")["objective"] == long_query
+
+
+def test_parallel_keyword_query_keeps_trailing_qualifiers_distinct():
+    question = "How do " + " ".join(f"topic{i}" for i in range(40)) + " compare?"
+    suffixes = ["official documentation", "analysis comparison", "recent updates",
+                "open data OR government data OR benchmark"]
+    bounded = [srv._parallel_keyword_query(f"{question} {suffix}") for suffix in suffixes]
+    assert all(len(query) <= srv.PARALLEL_MAX_QUERY_CHARS for query in bounded)
+    assert all(query.startswith("How do topic0") for query in bounded)
+    assert all(query.endswith(suffix) for query, suffix in zip(bounded, suffixes))
+    assert len(set(bounded)) == len(suffixes)
+
+
 # --------------------------------------------------------------------------- #
 # _parallel_search.
 # --------------------------------------------------------------------------- #
@@ -188,6 +221,16 @@ async def test_parallel_search_normalizes_results(monkeypatch):
     assert request["method"] == "POST" and request["url"] == "https://api.parallel.ai/v1/search"
     assert request["headers"]["x-api-key"] == "parallel-key"
     assert request["json"]["search_queries"] == ["q"]
+
+
+@pytest.mark.asyncio
+async def test_parallel_search_sends_the_objective(monkeypatch):
+    seen: list[dict[str, Any]] = []
+    payload = {"results": [{"url": "https://example.com/a", "title": "A", "excerpts": ["a"]}]}
+    monkeypatch.setattr(srv, "_client", _client_returning(_FakeStreamResponse(payload), seen))
+    await srv._parallel_search("q", 5, "parallel-key", objective="Find the goal")
+    assert seen[0]["json"]["objective"] == "Find the goal"
+    assert seen[0]["json"]["search_queries"] == ["q"]
 
 
 @pytest.mark.asyncio
@@ -269,6 +312,17 @@ def test_override_to_unconfigured_provider_is_ignored(monkeypatch):
     assert route.override_ignored == "provider_unconfigured"
 
 
+def test_cache_variant_keys_objective_only_on_parallel_routes():
+    plain = srv._search_cache_variant(8, "normal", "general", "parallel+brave")
+    goal = srv._search_cache_variant(8, "normal", "general", "parallel+brave", "goal")
+    assert plain != goal and json.loads(goal)["objective"] == "goal"
+    assert "objective" not in json.loads(plain)
+    # Brave ignores objectives, so a Brave-only route shares one entry.
+    assert srv._search_cache_variant(8, "normal", "general", "brave", "goal") == (
+        srv._search_cache_variant(8, "normal", "general", "brave")
+    )
+
+
 def test_cache_variant_differs_per_route():
     brave = srv._search_cache_variant(8, "normal", "general", "brave")
     parallel = srv._search_cache_variant(8, "normal", "general", "parallel+brave")
@@ -348,6 +402,73 @@ async def test_switching_route_does_not_serve_the_other_routes_cache(providers, 
 # --------------------------------------------------------------------------- #
 # Sensitive mode for image and batch search.
 # --------------------------------------------------------------------------- #
+
+@pytest.fixture
+def recorded(monkeypatch):
+    """Fake both providers and record the arguments each one received."""
+    seen: list[tuple[str, str, str]] = []
+
+    async def fake_brave(query, num_results, api_key, intent="general"):
+        seen.append(("brave", query, ""))
+        return _ok("brave", "https://example.com/brave")
+
+    async def fake_parallel(query, num_results, api_key, intent="general", objective=""):
+        seen.append(("parallel", query, objective))
+        return srv._BackendOutcome(backend="parallel", ok=True, state="empty", attempts=1)
+
+    monkeypatch.setattr(srv, "_brave_search", fake_brave)
+    monkeypatch.setattr(srv, "_parallel_search", fake_parallel)
+    return seen
+
+
+@pytest.mark.asyncio
+async def test_objective_reaches_parallel_but_not_brave(recorded, tmp_path):
+    _write_secret(tmp_path / "parallel_key")
+    srv._write_settings("parallel")
+    payload = json.loads(_result_text(await _call_tool("web_search", {
+        "query": "python release schedule",
+        "objective": "  Find the\nPython 3.15 release schedule  ",
+    })))
+    # Parallel came back empty, so Brave served the same query without it.
+    assert recorded == [
+        ("parallel", "python release schedule", "Find the Python 3.15 release schedule"),
+        ("brave", "python release schedule", ""),
+    ]
+    assert payload["backend"] == "brave" and payload["fallback_reason"] == "parallel_empty"
+
+
+@pytest.mark.asyncio
+async def test_objective_repeating_the_query_is_not_forwarded(recorded, tmp_path):
+    _write_secret(tmp_path / "parallel_key")
+    srv._write_settings("parallel")
+    await _call_tool("web_search", {"query": "Python  Release", "objective": "python release"})
+    assert recorded[0] == ("parallel", "Python  Release", "")
+
+
+@pytest.mark.asyncio
+async def test_overlong_objective_is_refused_before_any_provider(recorded, tmp_path):
+    _write_secret(tmp_path / "parallel_key")
+    srv._write_settings("parallel")
+    objective = "x" * (srv.MAX_OBJECTIVE_CHARS + 1)
+    single = json.loads(_result_text(await _call_tool("web_search", {"query": "q", "objective": objective})))
+    batch = json.loads(_result_text(await _call_tool(
+        "batch_web_search", {"queries": ["a"], "objective": objective}
+    )))
+    assert single["status"] == "error" and "objective" in single["error"]
+    assert batch["status"] == "error" and "objective" in batch["error"]
+    assert recorded == []
+
+
+@pytest.mark.asyncio
+async def test_batch_search_shares_one_objective(recorded, tmp_path):
+    _write_secret(tmp_path / "parallel_key")
+    srv._write_settings("parallel")
+    await _call_tool("batch_web_search", {"queries": ["alpha", "beta"], "objective": "Compare them"})
+    assert sorted(entry for entry in recorded if entry[0] == "parallel") == [
+        ("parallel", "alpha", "Compare them"),
+        ("parallel", "beta", "Compare them"),
+    ]
+
 
 @pytest.mark.asyncio
 async def test_image_search_sensitive_mode_makes_no_external_call(monkeypatch):

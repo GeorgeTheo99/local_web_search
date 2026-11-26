@@ -238,13 +238,22 @@ prevention.
 
 ## MCP tools
 
-### `web_search(query, num_results=8, mode=None, intent="general")`
+### `web_search(query, num_results=8, mode=None, intent="general", objective=None)`
 
 Searches the configured [route](#search-route). Queries are limited to 512 characters and
 results to 20. Provider responses, retries, and total latency are bounded.
 `intent` must be explicit: `general` uses no freshness filter, `current` uses a
 recent window, and `news` uses the narrowest freshness window. Intent is never
 inferred from query text. `batch_web_search` accepts the same three intents.
+
+`objective` is an optional plain-language goal (at most 2000 characters): what
+the caller needs to find and why, with any source or freshness preference.
+Parallel ranks results and picks excerpts against it, with `query` as its
+keyword search, which Parallel's docs recommend over sending one text as both.
+Without an objective, or with one that only repeats the query, the query
+doubles as the objective. Brave ignores it. A keyword query over Parallel's
+200-character limit keeps its leading words and its last few words. Cached results are
+keyed by objective on routes that include Parallel.
 
 Routing modes:
 
@@ -268,13 +277,13 @@ Missing credentials, open-circuit skips, and providers excluded by the total
 deadline are not counted as billable attempts. Failed HTTP requests are counted
 because the upstream may still bill them.
 
-### `batch_web_search(queries, num_results=8, intent="general", mode=None)`
+### `batch_web_search(queries, num_results=8, intent="general", mode=None, objective=None)`
 
 Runs up to three unique queries with at most two active search pipelines and one
-shared deadline. One explicit `general`, `current`, or `news` intent and one
-routing mode apply to the batch, and the route is resolved once for the whole
-batch. Output ordering follows input ordering. Partial completions and
-per-item timeouts remain explicit.
+shared deadline. One explicit `general`, `current`, or `news` intent, one
+routing mode and one optional `objective` apply to the batch, and the route is
+resolved once for the whole batch. Output ordering follows input ordering.
+Partial completions and per-item timeouts remain explicit.
 
 ### `image_search(query, num_results=8, mode=None)`
 

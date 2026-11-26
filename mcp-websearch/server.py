@@ -2,8 +2,8 @@
 """Policy-aware MCP web search broker for Brave Search and Parallel.
 
 Tools:
-  - web_search(query, num_results=8, mode=None, intent="general")
-  - batch_web_search(queries, num_results=8, intent="general", mode=None)
+  - web_search(query, num_results=8, mode=None, intent="general", objective=None)
+  - batch_web_search(queries, num_results=8, intent="general", mode=None, objective=None)
   - image_search(query, num_results=8, mode=None)
   - web_fetch(url, max_chars=20000)           direct fetch with SSRF guard
   - verify_url(url)                           direct-fetch verification
@@ -23,7 +23,8 @@ provider lives in $LOCAL_SEARCH_DATA_DIR/settings.json: `brave` searches Brave
 only; `parallel` searches Parallel first and falls back to Brave. A loopback
 caller may pin one provider per request with the X-Search-Provider header
 (`brave`, `parallel`, or `auto`); the tailnet listener ignores it. Image
-search stays on Brave.
+search stays on Brave. An optional natural-language `objective` reaches
+Parallel only (Brave has no equivalent); without one, the query doubles as it.
 
 Searches use one bounded 18-second-or-less budget, overfetch before URL dedupe,
 and return additive status/backend/fallback/timing metadata. Brave uses the
@@ -178,6 +179,11 @@ _PROVIDER_COST_USD: dict[str, float] = {
 MAX_NUM_RESULTS = 20
 RESULT_OVERFETCH_FACTOR = 2
 MAX_QUERY_CHARS = 512
+# Parallel accepts objectives up to 5000 characters; this matches the longest
+# research question a consumer sends (deep_research's 2000-character bound).
+MAX_OBJECTIVE_CHARS = 2000
+# Parallel rejects or drops keyword queries over 200 characters.
+PARALLEL_MAX_QUERY_CHARS = 200
 SEARCH_INTENT_VALUES = ("general", "current", "news")
 SEARCH_INTENTS = frozenset(SEARCH_INTENT_VALUES)
 SearchIntent = Annotated[
@@ -526,8 +532,13 @@ class _ParallelProvider:
 
     @staticmethod
     def search(
-        query: str, num_results: int, intent: str = "general"
+        query: str, num_results: int, intent: str = "general", objective: str = ""
     ) -> Awaitable[_BackendOutcome]:
+        # Calls without an objective keep the pre-objective signature.
+        if objective:
+            return _parallel_search(
+                query, num_results, _resolve_parallel_key(), intent=intent, objective=objective
+            )
         return _parallel_search(query, num_results, _resolve_parallel_key(), intent=intent)
 
     @staticmethod
@@ -1019,25 +1030,30 @@ _SEARCH_CACHE_PAYLOAD_KEYS = {
 
 
 def _search_cache_variant(
-    requested: int, mode: str, intent: str = "general", providers: str = "brave"
+    requested: int,
+    mode: str,
+    intent: str = "general",
+    providers: str = "brave",
+    objective: str = "",
 ) -> str:
     """Describe every policy input that can change a cached search result.
 
     ``providers`` is the route label (e.g. ``parallel+brave``), so switching
     the default provider or pinning one never serves another route's results.
     The Parallel mode is part of the label because it changes the results.
+    ``objective`` only changes Parallel's results, so a Brave-only route keeps
+    one entry per query; an empty objective keeps the pre-objective key.
     """
     label = providers.replace("parallel", f"parallel:{PARALLEL_MODE}")
-    return json.dumps(
-        {
-            "num_results": requested,
-            "search_mode": mode,
-            "intent": intent,
-            "provider": label,
-        },
-        sort_keys=True,
-        separators=(",", ":"),
-    )
+    variant: dict[str, Any] = {
+        "num_results": requested,
+        "search_mode": mode,
+        "intent": intent,
+        "provider": label,
+    }
+    if objective and "parallel" in providers.split("+"):
+        variant["objective"] = objective
+    return json.dumps(variant, sort_keys=True, separators=(",", ":"))
 
 
 def _put_search_cache(
@@ -2276,20 +2292,54 @@ def _normalize_parallel_result(r: dict) -> dict[str, Any] | None:
     }
 
 
-def _parallel_request_body(query: str, fetch_count: int, intent: str) -> dict[str, Any]:
-    """Build a /v1/search body from the broker's single keyword query.
+# Words kept from the end of an over-long query. Callers such as deep_research
+# append their distinguishing terms ("official documentation", "recent
+# updates") to a long question, so cutting only the end would merge them.
+_PARALLEL_QUERY_TAIL_CHARS = 60
 
-    Consumers send one query, so it serves as both the objective and the only
-    keyword search; Parallel ranks best with a goal-style objective, which a
-    future optional argument can supply.
+
+def _parallel_keyword_query(query: str) -> str:
+    """Bound one keyword query to Parallel's 200-character limit.
+
+    Keeps whole words from the start plus up to 60 characters of trailing
+    words; a single over-long word is hard-cut.
+    """
+    if len(query) <= PARALLEL_MAX_QUERY_CHARS:
+        return query
+    words = query.split()
+    tail_words: list[str] = []
+    while words and len(" ".join([words[-1], *tail_words])) <= _PARALLEL_QUERY_TAIL_CHARS:
+        tail_words.insert(0, words.pop())
+    tail = " ".join(tail_words)
+    budget = PARALLEL_MAX_QUERY_CHARS - len(tail) - (1 if tail else 0)
+    head = ""
+    for word in words:
+        candidate = f"{head} {word}" if head else word
+        if len(candidate) > budget:
+            break
+        head = candidate
+    if len(head) < budget // 2:
+        # A long word near the start: a hard cut keeps more of the query.
+        head = " ".join(words)[:budget].rstrip()
+    return " ".join(part for part in (head, tail) if part)
+
+
+def _parallel_request_body(
+    query: str, fetch_count: int, intent: str, objective: str = ""
+) -> dict[str, Any]:
+    """Build a /v1/search body from the broker's keyword query and objective.
+
+    Parallel ranks best with a goal-style objective plus short keyword
+    queries. A caller's ``objective`` supplies the goal; without one the query
+    doubles as it, which Parallel documents as its most common pitfall.
     """
     advanced: dict[str, Any] = {"max_results": fetch_count}
     if days := _PARALLEL_FRESHNESS_DAYS.get(intent):
         after = time.strftime("%Y-%m-%d", time.gmtime(time.time() - days * 86400))
         advanced["source_policy"] = {"after_date": after}
     return {
-        "objective": query,
-        "search_queries": [query],
+        "objective": objective or query,
+        "search_queries": [_parallel_keyword_query(query)],
         "mode": PARALLEL_MODE,
         "max_chars_total": max(2000, fetch_count * 2 * PARALLEL_SNIPPET_MAX_CHARS),
         "advanced_settings": advanced,
@@ -2297,7 +2347,11 @@ def _parallel_request_body(query: str, fetch_count: int, intent: str) -> dict[st
 
 
 async def _parallel_search(
-    query: str, num_results: int, api_key: str, intent: str = "general"
+    query: str,
+    num_results: int,
+    api_key: str,
+    intent: str = "general",
+    objective: str = "",
 ) -> _BackendOutcome:
     """Search Parallel. Requires an API key (the keyless tier is MCP-only)."""
     started = time.monotonic()
@@ -2340,7 +2394,7 @@ async def _parallel_search(
         async with client.stream(
             "POST",
             f"{PARALLEL_BASE_URL}/v1/search",
-            json=_parallel_request_body(query, fetch_count, intent),
+            json=_parallel_request_body(query, fetch_count, intent, objective),
             headers=headers,
             timeout=PARALLEL_TIMEOUT,
         ) as response:
@@ -2779,12 +2833,27 @@ def _fallback_reason(outcome: _BackendOutcome) -> str:
 
 
 def _provider_search(
-    provider: SearchProvider, query: str, num_results: int, intent: str
+    provider: SearchProvider,
+    query: str,
+    num_results: int,
+    intent: str,
+    objective: str = "",
 ) -> Awaitable[_BackendOutcome]:
-    """Forward explicit intent while preserving the legacy general call shape."""
+    """Forward explicit intent while preserving the legacy general call shape.
+
+    Only Parallel takes an objective; Brave has no equivalent input.
+    """
+    if objective and isinstance(provider, _ParallelProvider):
+        return provider.search(query, num_results, intent, objective)
     if intent == "general":
         return provider.search(query, num_results)
     return provider.search(query, num_results, intent)
+
+
+def _normalize_objective(objective: str | None, query: str) -> str:
+    """Collapse whitespace; an objective that repeats the query adds nothing."""
+    text = " ".join(str(objective or "").split())
+    return "" if text.casefold() == " ".join(query.split()).casefold() else text
 
 
 def _result_backend(results: list[dict[str, Any]]) -> str:
@@ -2822,11 +2891,13 @@ async def _web_search_impl(
     mode: str | None = None,
     intent: str = "general",
     route: _SearchRoute | None = None,
+    objective: str | None = None,
 ) -> str:
     """Execute one web search using the public tool's stable payload contract.
 
     ``route`` is resolved once per caller request (a batch passes its own) so a
-    settings switch mid-batch never mixes providers.
+    settings switch mid-batch never mixes providers. ``objective`` is the
+    caller's natural-language goal, forwarded to Parallel only.
     """
     started = time.monotonic()
     route = route or _resolve_search_route()
@@ -2894,6 +2965,26 @@ async def _web_search_impl(
             timings_ms=timings_ms,
             mode=effective_mode,
         )
+    effective_objective = _normalize_objective(objective, query)
+    if len(effective_objective) > MAX_OBJECTIVE_CHARS:
+        timings_ms = _default_timings_ms(route.providers)
+        timings_ms["total"] = round((time.monotonic() - started) * 1000, 1)
+        return _finish_search(
+            _search_error_payload(
+                query,
+                f"Search error: objective must be at most {MAX_OBJECTIVE_CHARS} characters.",
+                timings_ms=timings_ms,
+                mode=effective_mode,
+                search_mode=effective_mode,
+                route=route_meta,
+            ),
+            status="error",
+            backend="none",
+            requested_count=requested,
+            result_count=0,
+            timings_ms=timings_ms,
+            mode=effective_mode,
+        )
 
     # Sensitive / no-egress mode makes no external call. A local KB/corpus
     # index is not yet wired, so refuse with a structured error rather than
@@ -2921,7 +3012,7 @@ async def _web_search_impl(
         )
 
     cache_variant = _search_cache_variant(
-        requested, effective_mode, effective_intent, route.label
+        requested, effective_mode, effective_intent, route.label, effective_objective
     )
     cache = _get_cache()
     try:
@@ -3010,7 +3101,9 @@ async def _web_search_impl(
         else:
             outcome = await _run_backend(
                 name,
-                _provider_search(provider, query, candidate_limit, effective_intent),
+                _provider_search(
+                    provider, query, candidate_limit, effective_intent, effective_objective
+                ),
                 min(provider.timeout, remaining),
             )
         outcomes.append(outcome)
@@ -3112,8 +3205,15 @@ async def web_search(
     num_results: int = 8,
     mode: str | None = None,
     intent: SearchIntent = "general",
+    objective: str | None = None,
 ) -> str:
     """Search the web (Brave or Parallel, per the broker's configured route).
+
+    Keep `query` to a few keywords. Optional `objective` states the goal in
+    plain language: what you need to find and why, with any source or
+    freshness preference (at most 2000 characters). Parallel uses it to rank
+    results and pick excerpts; Brave ignores it. Without it, the query doubles
+    as the objective.
 
     Optional `mode` selects the ADR 0002 routing mode: `normal` (default),
     `sensitive` (no external egress; refuses without a local corpus), or
@@ -3122,7 +3222,7 @@ async def web_search(
     text is never inspected to infer freshness.
     """
     return await _web_search_impl(
-        query, num_results, mode=mode, intent=intent
+        query, num_results, mode=mode, intent=intent, objective=objective
     )
 
 
@@ -3206,11 +3306,13 @@ async def batch_web_search(
     num_results: int = 8,
     intent: SearchIntent = "general",
     mode: str | None = None,
+    objective: str | None = None,
 ) -> str:
     """Run up to three searches with one explicit general/current/news intent.
 
     Optional `mode` is the same routing mode as web_search; `sensitive` makes no
-    external call.
+    external call. Optional `objective` is one shared plain-language goal for
+    every query, as in web_search (Parallel only).
     """
     started = time.monotonic()
     requested = min(MAX_NUM_RESULTS, max(1, int(num_results)))
@@ -3221,6 +3323,13 @@ async def batch_web_search(
     if effective_intent not in SEARCH_INTENTS:
         return _batch_error_payload(
             "Batch search error: intent must be one of: general, current, news.",
+            started,
+            requested,
+            effective_mode,
+        )
+    if len(_normalize_objective(objective, "")) > MAX_OBJECTIVE_CHARS:
+        return _batch_error_payload(
+            f"Batch search error: objective must be at most {MAX_OBJECTIVE_CHARS} characters.",
             started,
             requested,
             effective_mode,
@@ -3274,6 +3383,7 @@ async def batch_web_search(
                     mode=effective_mode,
                     intent=effective_intent,
                     route=route,
+                    objective=objective,
                 )
                 return _compact_batch_item(rendered)
         except asyncio.CancelledError:
